@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Diagnostics;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using PuppeteerSharp;
 
@@ -9,6 +10,7 @@ await app.RunAsync();
 internal sealed class UnityAssetAutomationApp
 {
     private readonly CliOptions _options;
+    private readonly AppLogger _logger;
     private readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true };
     private readonly string _dataDirectory = Path.Combine(AppContext.BaseDirectory, "data");
     private readonly string _logsDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
@@ -27,115 +29,265 @@ internal sealed class UnityAssetAutomationApp
         _options = options;
         _cookiesPath = Path.Combine(_dataDirectory, "unity_cookies.json");
         _reportPath = Path.Combine(_logsDirectory, $"run-report-{DateTime.Now:yyyyMMdd-HHmmss}.json");
+        var logFilePath = string.IsNullOrWhiteSpace(options.LogFilePath)
+            ? Path.Combine(_logsDirectory, $"run-log-{DateTime.Now:yyyyMMdd-HHmmss}.log")
+            : Path.GetFullPath(options.LogFilePath);
+        _logger = new AppLogger(options.Verbose, options.TraceNetwork, logFilePath);
     }
 
     public async Task RunAsync()
     {
-        Directory.CreateDirectory(_dataDirectory);
-        Directory.CreateDirectory(_logsDirectory);
-
-        Console.WriteLine("Подготовка браузера Chromium...");
-        await new BrowserFetcher().DownloadAsync();
-
-        await using var browser = await Puppeteer.LaunchAsync(new LaunchOptions
+        try
         {
-            Headless = _options.Headless,
-            DefaultViewport = null,
-            Args = ["--start-maximized"]
-        });
+            Directory.CreateDirectory(_dataDirectory);
+            Directory.CreateDirectory(_logsDirectory);
 
-        await using var page = await browser.NewPageAsync();
+            _logger.Info("Подготовка браузера Chromium...");
+            await new BrowserFetcher().DownloadAsync();
 
-        var authenticated = await EnsureAuthenticatedAsync(page);
-        if (!authenticated)
-        {
-            Console.WriteLine("Не удалось подтвердить авторизацию. Завершение.");
-            return;
+            await using var browser = await Puppeteer.LaunchAsync(new LaunchOptions
+            {
+                Headless = _options.Headless,
+                DefaultViewport = null,
+                Args = ["--start-maximized"]
+            });
+
+            await using var page = await browser.NewPageAsync();
+            page.DefaultNavigationTimeout = _options.NavigationTimeoutMs;
+            page.DefaultTimeout = _options.NavigationTimeoutMs;
+            AttachPageDiagnostics(page);
+
+            var authenticated = await EnsureAuthenticatedAsync(page);
+            if (!authenticated)
+            {
+                _logger.Error("Не удалось подтвердить авторизацию. Завершение.");
+                return;
+            }
+
+            if (_options.LoginOnly)
+            {
+                _logger.Info("Режим --login завершен: cookies обновлены.");
+                return;
+            }
+
+            var sources = _options.Sources.Count > 0 ? _options.Sources : DefaultSources.ToList();
+            var assetUrls = await CollectAssetUrlsAsync(sources);
+
+            _logger.Info($"Найдено уникальных ассетов: {assetUrls.Count}");
+            var report = new RunReport
+            {
+                StartedAtUtc = DateTime.UtcNow,
+                DryRun = _options.DryRun,
+                Sources = sources
+            };
+
+            var index = 0;
+            foreach (var assetUrl in assetUrls)
+            {
+                index++;
+                _logger.Info($"[{index}/{assetUrls.Count}] Обработка: {assetUrl}");
+
+                var result = await ProcessAssetAsync(page, assetUrl);
+                report.Items.Add(result);
+
+                await Task.Delay(TimeSpan.FromMilliseconds(_options.DelayMs));
+            }
+
+            report.FinishedAtUtc = DateTime.UtcNow;
+            await File.WriteAllTextAsync(_reportPath, JsonSerializer.Serialize(report, _jsonOptions));
+
+            PrintSummary(report);
+            _logger.Info($"Отчет сохранен: {_reportPath}");
         }
-
-        if (_options.LoginOnly)
+        finally
         {
-            Console.WriteLine("Режим --login завершен: cookies обновлены.");
-            return;
+            _logger.Dispose();
         }
-
-        var sources = _options.Sources.Count > 0 ? _options.Sources : DefaultSources.ToList();
-        var assetUrls = await CollectAssetUrlsAsync(sources);
-
-        Console.WriteLine($"Найдено уникальных ассетов: {assetUrls.Count}");
-        var report = new RunReport
-        {
-            StartedAtUtc = DateTime.UtcNow,
-            DryRun = _options.DryRun,
-            Sources = sources
-        };
-
-        var index = 0;
-        foreach (var assetUrl in assetUrls)
-        {
-            index++;
-            Console.WriteLine($"[{index}/{assetUrls.Count}] Обработка: {assetUrl}");
-
-            var result = await ProcessAssetAsync(page, assetUrl);
-            report.Items.Add(result);
-
-            await Task.Delay(TimeSpan.FromMilliseconds(_options.DelayMs));
-        }
-
-        report.FinishedAtUtc = DateTime.UtcNow;
-        await File.WriteAllTextAsync(_reportPath, JsonSerializer.Serialize(report, _jsonOptions));
-
-        PrintSummary(report);
-        Console.WriteLine($"Отчет сохранен: {_reportPath}");
     }
 
     private async Task<bool> EnsureAuthenticatedAsync(IPage page)
     {
         if (await TryLoadCookiesAsync(page))
         {
-            Console.WriteLine("Cookies загружены, проверка авторизации...");
+            _logger.Info("Cookies загружены, проверка авторизации...");
             if (await IsAuthenticatedAsync(page))
             {
-                Console.WriteLine("Сессия активна.");
+                _logger.Info("Сессия активна.");
                 return true;
             }
         }
 
-        Console.WriteLine("Требуется вход в Unity.");
-        await page.GoToAsync("https://login.unity.com/en/sign-in", WaitUntilNavigation.Networkidle2);
-        Console.WriteLine("Выполните вход вручную в окне браузера и нажмите Enter в консоли...");
+        _logger.Warn("Требуется вход в Unity.");
+        await SafeGoToAsync(page, "https://login.unity.com/en/sign-in");
+        _logger.Info($"Текущий URL перед ручным входом: {page.Url}");
+        _logger.Info("Выполните вход вручную в окне браузера и нажмите Enter в консоли...");
         Console.ReadLine();
+        _logger.Info($"URL после нажатия Enter: {page.Url}");
+
+        var authOnCurrentPage = await HasAuthMarkersAsync(page);
+        if (!authOnCurrentPage)
+        {
+            _logger.Warn("Проверка на текущей странице не подтвердила вход, перепроверяем через Asset Store...");
+        }
 
         if (!await IsAuthenticatedAsync(page))
         {
-            Console.WriteLine("Проверка после ручного входа неуспешна.");
+            _logger.Error("Проверка после ручного входа неуспешна.");
             return false;
         }
 
         await SaveCookiesAsync(page);
-        Console.WriteLine("Авторизация подтверждена, cookies сохранены.");
+        _logger.Info("Авторизация подтверждена, cookies сохранены.");
         return true;
     }
 
     private async Task<bool> IsAuthenticatedAsync(IPage page)
     {
-        await page.GoToAsync("https://assetstore.unity.com", WaitUntilNavigation.Networkidle2);
+        await SafeGoToAsync(page, "https://assetstore.unity.com");
 
         if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        var hasAccountMarkers = await page.EvaluateFunctionAsync<bool>(@"() => {
+        return await HasAuthMarkersAsync(page);
+    }
+
+    private async Task<bool> HasAuthMarkersAsync(IPage page)
+    {
+        if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var rawMarkers = await page.EvaluateFunctionAsync<string>(@"() => {
             const text = document.body?.innerText?.toLowerCase() || '';
-            const myAssetsLink = document.querySelector('a[href*=""/my-assets""], a[href*=""my-assets""]');
-            const signInLink = document.querySelector('a[href*=""login.unity.com""], a[href*=""/sign-in""]');
+            const hasMyAssetsLink = !!document.querySelector('a[href*=""/my-assets""], a[href*=""my-assets""]');
+            const hasSignInLink = !!document.querySelector('a[href*=""login.unity.com""], a[href*=""/sign-in""]');
             const hasMyAssetsText = text.includes('my assets');
             const hasSignInText = text.includes('sign in');
-            return (!!myAssetsLink || hasMyAssetsText) && !(!!signInLink && hasSignInText && !hasMyAssetsText);
+
+            return JSON.stringify({
+                hasMyAssetsLink,
+                hasSignInLink,
+                hasMyAssetsText,
+                hasSignInText
+            });
         }");
 
-        return hasAccountMarkers;
+        var markers = JsonSerializer.Deserialize<AuthUiMarkers>(rawMarkers ?? "{}") ?? new AuthUiMarkers();
+        var hasUiAuthMarkers = (markers.HasMyAssetsLink || markers.HasMyAssetsText) &&
+                               !(markers.HasSignInLink && markers.HasSignInText && !markers.HasMyAssetsText);
+
+        var hasApiAuthMarkers = false;
+        if (page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
+        {
+            hasApiAuthMarkers = await page.EvaluateFunctionAsync<bool>(@"async () => {
+                try {
+                    const res = await fetch('/api/users/organizations', { credentials: 'include' });
+                    if (!res.ok) return false;
+                    const text = (await res.text() || '').trim();
+                    if (!text) return false;
+
+                    const lower = text.toLowerCase();
+                    if (lower.includes('unauthorized') || lower.includes('forbidden') || lower.includes('sign in')) {
+                        return false;
+                    }
+
+                    return text.startsWith('{') || text.startsWith('[');
+                } catch {
+                    return false;
+                }
+            }");
+        }
+
+        _logger.Debug($"Auth markers: UI={hasUiAuthMarkers}, API={hasApiAuthMarkers}, page={page.Url}, myAssetsLink={markers.HasMyAssetsLink}, myAssetsText={markers.HasMyAssetsText}, signInLink={markers.HasSignInLink}, signInText={markers.HasSignInText}");
+
+        return hasUiAuthMarkers || hasApiAuthMarkers;
+    }
+
+    private void AttachPageDiagnostics(IPage page)
+    {
+        page.FrameNavigated += (_, e) => _logger.Debug($"FrameNavigated => {e.Frame.Url}");
+
+        page.Request += (_, e) =>
+        {
+            if (!_options.TraceNetwork)
+            {
+                return;
+            }
+
+            var resourceType = e.Request.ResourceType.ToString().ToLowerInvariant();
+            if (resourceType is "document" or "xhr" or "fetch")
+            {
+                _logger.Debug($"REQUEST [{resourceType}] {e.Request.Method} {e.Request.Url}");
+            }
+        };
+
+        page.Response += (_, e) =>
+        {
+            if (!_options.TraceNetwork)
+            {
+                return;
+            }
+
+            var resourceType = e.Response.Request?.ResourceType.ToString().ToLowerInvariant() ?? string.Empty;
+            if (resourceType is "document" or "xhr" or "fetch")
+            {
+                _logger.Debug($"RESPONSE [{resourceType}] {(int)e.Response.Status} {e.Response.Url}");
+            }
+        };
+
+        page.RequestFailed += (_, e) =>
+        {
+            if (!_options.TraceNetwork)
+            {
+                return;
+            }
+
+            _logger.Warn($"REQUEST FAILED {e.Request?.Url}");
+        };
+
+        page.Console += (_, e) =>
+        {
+            if (_options.Verbose)
+            {
+                _logger.Debug($"BROWSER CONSOLE [{e.Message.Type}] {e.Message.Text}");
+            }
+        };
+
+        page.PageError += (_, e) => _logger.Warn($"PAGE ERROR: {e.Message}");
+    }
+
+    private async Task SafeGoToAsync(IPage page, string url)
+    {
+        var attempts = new[] { WaitUntilNavigation.DOMContentLoaded, WaitUntilNavigation.Load };
+        Exception? lastException = null;
+
+        foreach (var waitUntil in attempts)
+        {
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                _logger.Debug($"GoTo start: {url} | waitUntil={waitUntil} | timeout={_options.NavigationTimeoutMs}ms");
+                await page.GoToAsync(url, new NavigationOptions
+                {
+                    WaitUntil = [waitUntil],
+                    Timeout = _options.NavigationTimeoutMs
+                });
+                sw.Stop();
+                _logger.Debug($"GoTo ok: requested={url}, current={page.Url}, elapsed={sw.ElapsedMilliseconds}ms");
+                return;
+            }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                lastException = ex;
+                _logger.Warn($"Навигация не удалась ({waitUntil}) за {sw.ElapsedMilliseconds}ms: {ex.Message}");
+            }
+        }
+
+        throw new NavigationException($"Не удалось открыть {url} после повторных попыток.", lastException);
     }
 
     private async Task<bool> TryLoadCookiesAsync(IPage page)
@@ -151,14 +303,18 @@ internal sealed class UnityAssetAutomationApp
             var cookies = JsonSerializer.Deserialize<List<SerializableCookie>>(raw) ?? [];
             if (cookies.Count == 0)
             {
+                _logger.Warn("Файл cookies найден, но пустой.");
                 return false;
             }
 
             await page.SetCookieAsync(cookies.Select(c => c.ToCookieParam()).ToArray());
+            _logger.Info($"Загружено cookies: {cookies.Count}");
+            _logger.Debug($"Домены cookies: {string.Join(", ", cookies.Select(c => c.Domain).Where(d => !string.IsNullOrWhiteSpace(d)).Distinct(StringComparer.OrdinalIgnoreCase))}");
             return true;
         }
         catch
         {
+            _logger.Warn("Не удалось загрузить cookies из файла. Будет выполнен ручной вход.");
             return false;
         }
     }
@@ -168,6 +324,8 @@ internal sealed class UnityAssetAutomationApp
         var cookies = await page.GetCookiesAsync("https://assetstore.unity.com", "https://login.unity.com");
         var serializable = cookies.Select(SerializableCookie.FromCookie).ToList();
         await File.WriteAllTextAsync(_cookiesPath, JsonSerializer.Serialize(serializable, _jsonOptions));
+        _logger.Info($"Сохранено cookies: {serializable.Count}");
+        _logger.Debug($"Домены cookies после входа: {string.Join(", ", serializable.Select(c => c.Domain).Where(d => !string.IsNullOrWhiteSpace(d)).Distinct(StringComparer.OrdinalIgnoreCase))}");
     }
 
     private async Task<List<string>> CollectAssetUrlsAsync(IEnumerable<string> sourceUrls)
@@ -178,7 +336,7 @@ internal sealed class UnityAssetAutomationApp
         {
             try
             {
-                Console.WriteLine($"Чтение источника: {source}");
+                _logger.Info($"Чтение источника: {source}");
                 var html = await _httpClient.GetStringAsync(source);
                 foreach (var url in ExtractAssetUrlsFromHtml(html, source))
                 {
@@ -187,7 +345,7 @@ internal sealed class UnityAssetAutomationApp
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Ошибка источника {source}: {ex.Message}");
+                _logger.Warn($"Ошибка источника {source}: {ex.Message}");
             }
         }
 
@@ -238,7 +396,7 @@ internal sealed class UnityAssetAutomationApp
 
         try
         {
-            await page.GoToAsync(assetUrl, WaitUntilNavigation.Networkidle2);
+            await SafeGoToAsync(page, assetUrl);
 
             var status = await DetectStatusAsync(page);
             result.DetectedFree = status.IsFree;
@@ -364,12 +522,74 @@ internal sealed class UnityAssetAutomationApp
     }
 }
 
+internal sealed class AppLogger : IDisposable
+{
+    private readonly bool _verbose;
+    private readonly bool _traceNetwork;
+    private readonly StreamWriter? _writer;
+    private readonly object _sync = new();
+
+    public AppLogger(bool verbose, bool traceNetwork, string? logFilePath)
+    {
+        _verbose = verbose;
+        _traceNetwork = traceNetwork;
+
+        if (!string.IsNullOrWhiteSpace(logFilePath))
+        {
+            var directory = Path.GetDirectoryName(logFilePath);
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            _writer = new StreamWriter(logFilePath, append: true) { AutoFlush = true };
+            Info($"Логирование в файл включено: {logFilePath}");
+        }
+
+        Info($"Verbose={_verbose}; TraceNetwork={_traceNetwork}");
+    }
+
+    public void Info(string message) => Write("INFO", message);
+    public void Warn(string message) => Write("WARN", message);
+    public void Error(string message) => Write("ERROR", message);
+    public void Debug(string message)
+    {
+        if (_verbose || _traceNetwork)
+        {
+            Write("DEBUG", message);
+        }
+    }
+
+    private void Write(string level, string message)
+    {
+        var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [{level}] {message}";
+
+        lock (_sync)
+        {
+            Console.WriteLine(line);
+            _writer?.WriteLine(line);
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_sync)
+        {
+            _writer?.Dispose();
+        }
+    }
+}
+
 internal sealed class CliOptions
 {
     public bool LoginOnly { get; init; }
     public bool DryRun { get; init; }
     public bool Headless { get; init; }
+    public bool Verbose { get; init; }
+    public bool TraceNetwork { get; init; }
+    public string? LogFilePath { get; init; }
     public int DelayMs { get; init; } = 1200;
+    public int NavigationTimeoutMs { get; init; } = 120000;
     public List<string> Sources { get; init; } = [];
 
     public static CliOptions Parse(string[] args)
@@ -377,7 +597,11 @@ internal sealed class CliOptions
         var loginOnly = false;
         var dryRun = false;
         var headless = false;
+        var verbose = false;
+        var traceNetwork = false;
+        string? logFilePath = null;
         var delayMs = 1200;
+        var navigationTimeoutMs = 120000;
         var sources = new List<string>();
 
         for (var i = 0; i < args.Length; i++)
@@ -393,14 +617,40 @@ internal sealed class CliOptions
                     break;
                 case "--headless" when i + 1 < args.Length:
                 {
-                    headless = bool.TryParse(args[++i], out var parsed) && parsed;
+                    var raw = args[++i];
+                    if (!bool.TryParse(raw, out var parsed))
+                    {
+                        Console.WriteLine($"Некорректное значение для --headless: '{raw}'. Используется false.");
+                        parsed = false;
+                    }
+
+                    headless = parsed;
                     break;
                 }
+                case "--verbose":
+                    verbose = true;
+                    break;
+                case "--trace-network":
+                    traceNetwork = true;
+                    verbose = true;
+                    break;
+                case "--log-file" when i + 1 < args.Length:
+                    logFilePath = args[++i];
+                    break;
                 case "--delay-ms" when i + 1 < args.Length:
                 {
                     if (int.TryParse(args[++i], out var delay) && delay > 0)
                     {
                         delayMs = delay;
+                    }
+
+                    break;
+                }
+                case "--nav-timeout-ms" when i + 1 < args.Length:
+                {
+                    if (int.TryParse(args[++i], out var navTimeout) && navTimeout >= 10000)
+                    {
+                        navigationTimeoutMs = navTimeout;
                     }
 
                     break;
@@ -416,7 +666,11 @@ internal sealed class CliOptions
             LoginOnly = loginOnly,
             DryRun = dryRun,
             Headless = headless,
+            Verbose = verbose,
+            TraceNetwork = traceNetwork,
+            LogFilePath = logFilePath,
             DelayMs = delayMs,
+            NavigationTimeoutMs = navigationTimeoutMs,
             Sources = sources
         };
     }
@@ -481,6 +735,14 @@ internal sealed class AssetStatusSnapshot
 {
     public bool IsFree { get; init; }
     public bool IsOwned { get; init; }
+}
+
+internal sealed class AuthUiMarkers
+{
+    public bool HasMyAssetsLink { get; init; }
+    public bool HasSignInLink { get; init; }
+    public bool HasMyAssetsText { get; init; }
+    public bool HasSignInText { get; init; }
 }
 
 internal enum AssetProcessStatus
