@@ -90,9 +90,20 @@ internal sealed class UnityAssetAutomationApp
                 _logger.Info($"Включен лимит по бесплатным ассетам: {_options.MaxAddAttempts.Value}");
             }
 
+            if (_options.MaxVisitedAssets.HasValue)
+            {
+                _logger.Info($"Включен лимит по посещенным ассетам: {_options.MaxVisitedAssets.Value}");
+            }
+
             var index = 0;
             foreach (var assetUrl in assetUrls)
             {
+                if (_options.MaxVisitedAssets.HasValue && index >= _options.MaxVisitedAssets.Value)
+                {
+                    _logger.Warn($"Достигнут лимит посещенных ассетов ({index}/{_options.MaxVisitedAssets.Value}). Обработка остановлена.");
+                    break;
+                }
+
                 if (_options.MaxAddAttempts.HasValue && freeAssetsProcessed >= _options.MaxAddAttempts.Value)
                 {
                     _logger.Warn($"Достигнут лимит бесплатных ассетов ({freeAssetsProcessed}/{_options.MaxAddAttempts.Value}). Обработка остановлена.");
@@ -545,43 +556,106 @@ internal sealed class UnityAssetAutomationApp
 
         try
         {
-            await SafeGoToAsync(page, assetUrl);
-
-            var status = await DetectStatusAsync(page);
-            result.DetectedFree = status.IsFree;
-            result.DetectedOwned = status.IsOwned;
-            result.CountsTowardsAddLimit = status.IsFree;
-
-            if (!status.IsFree)
+            for (var processingAttempt = 1; processingAttempt <= 2; processingAttempt++)
             {
-                result.Status = AssetProcessStatus.PaidSkipped;
+                await SafeGoToAsync(page, assetUrl);
+
+                var status = await DetectStatusAsync(page);
+                result.DetectedFree = status.IsFree;
+                result.DetectedOwned = status.IsOwned;
+                result.CountsTowardsAddLimit = status.IsFree;
+                result.PurchasedOnText = status.PurchasedOnText;
+                result.DetectionSummary = status.DetectionSummary;
+
+                _logger.Debug($"Статус ассета (до действия): {status.DetectionSummary}");
+
+                var needsReAuth = page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase) ||
+                                  (status.RequiresLogin && !status.IsOwned && !status.HasAddToMyAssets);
+
+                if (needsReAuth)
+                {
+                    _logger.Warn($"Обнаружены признаки неавторизованной сессии на странице ассета. Попытка переавторизации {processingAttempt}/2...");
+                    var reAuthOk = await EnsureAuthenticatedAsync(page);
+                    if (!reAuthOk)
+                    {
+                        result.Status = AssetProcessStatus.Failed;
+                        result.Message = "Требуется авторизация, но подтверждение входа не выполнено.";
+                        await SaveErrorScreenshotAsync(page, "reauth-required");
+                        return result;
+                    }
+
+                    await SafeGoToAsync(page, assetUrl);
+                    status = await DetectStatusAsync(page);
+                    result.DetectedFree = status.IsFree;
+                    result.DetectedOwned = status.IsOwned;
+                    result.CountsTowardsAddLimit = status.IsFree;
+                    result.PurchasedOnText = status.PurchasedOnText;
+                    result.DetectionSummary = status.DetectionSummary;
+                    _logger.Debug($"Статус ассета (после переавторизации): {status.DetectionSummary}");
+                }
+
+                if (!status.IsFree)
+                {
+                    result.Status = AssetProcessStatus.PaidSkipped;
+                    return result;
+                }
+
+                if (status.IsOwned)
+                {
+                    result.Status = AssetProcessStatus.AlreadyOwned;
+                    return result;
+                }
+
+                if (_options.DryRun)
+                {
+                    result.Status = AssetProcessStatus.WouldAddInDryRun;
+                    return result;
+                }
+
+                if (!status.HasAddToMyAssets)
+                {
+                    result.Status = AssetProcessStatus.Failed;
+                    result.Message = "Кнопка Add to My Assets не найдена (возможно требуется вход или изменена верстка).";
+                    await SaveErrorScreenshotAsync(page, "add-button-not-found");
+                    return result;
+                }
+
+                var clicked = await TryClickAddButtonAsync(page);
+                if (!clicked)
+                {
+                    result.Status = AssetProcessStatus.Failed;
+                    result.Message = "Кнопка добавления не найдена.";
+                    await SaveErrorScreenshotAsync(page, "add-button-not-found");
+                    return result;
+                }
+
+                var accepted = await TryAcceptAddConfirmationAsync(page);
+                if (accepted)
+                {
+                    _logger.Info("Подтверждение добавления найдено: нажата кнопка Accept.");
+                }
+
+                await Task.Delay(2200);
+                var postStatus = await DetectStatusAsync(page);
+                result.PurchasedOnText = postStatus.PurchasedOnText ?? result.PurchasedOnText;
+                result.DetectionSummary = postStatus.DetectionSummary;
+                _logger.Debug($"Статус ассета (после клика): {postStatus.DetectionSummary}");
+
+                if (postStatus.RequiresLogin || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.Warn("После попытки добавления потребовалась повторная авторизация.");
+                    continue;
+                }
+
+                result.Status = (postStatus.HasOpenInUnity || postStatus.IsOwned)
+                    ? AssetProcessStatus.Added
+                    : AssetProcessStatus.UnknownAfterClick;
                 return result;
             }
 
-            if (status.IsOwned)
-            {
-                result.Status = AssetProcessStatus.AlreadyOwned;
-                return result;
-            }
-
-            if (_options.DryRun)
-            {
-                result.Status = AssetProcessStatus.WouldAddInDryRun;
-                return result;
-            }
-
-            var clicked = await TryClickAddButtonAsync(page);
-            if (!clicked)
-            {
-                result.Status = AssetProcessStatus.Failed;
-                result.Message = "Кнопка добавления не найдена.";
-                await SaveErrorScreenshotAsync(page, "add-button-not-found");
-                return result;
-            }
-
-            await Task.Delay(2000);
-            var postStatus = await DetectStatusAsync(page);
-            result.Status = postStatus.IsOwned ? AssetProcessStatus.Added : AssetProcessStatus.UnknownAfterClick;
+            result.Status = AssetProcessStatus.Failed;
+            result.Message = "Не удалось завершить добавление после переавторизации.";
+            await SaveErrorScreenshotAsync(page, "reauth-loop-failed");
             return result;
         }
         catch (Exception ex)
@@ -595,32 +669,61 @@ internal sealed class UnityAssetAutomationApp
 
     private async Task<AssetStatusSnapshot> DetectStatusAsync(IPage page)
     {
-        var text = await page.EvaluateFunctionAsync<string>("() => document.body?.innerText || ''");
-        var normalized = (text ?? string.Empty).ToLowerInvariant();
+        var raw = await page.EvaluateFunctionAsync<string>(@"() => {
+            const bodyText = document.body?.innerText || '';
+            const normalized = bodyText.toLowerCase();
+            const actionTexts = Array.from(document.querySelectorAll('button, a, span'))
+                .map(x => (x.innerText || '').trim().toLowerCase())
+                .filter(Boolean);
 
-        var actionTexts = await page.EvaluateFunctionAsync<string[]>(@"() =>
-            Array.from(document.querySelectorAll('button, a')).map(x => (x.innerText || '').trim().toLowerCase()).filter(Boolean)");
+            const hasOpenInUnity = actionTexts.some(t => t.includes('open in unity'));
+            const hasAddToMyAssets = actionTexts.some(t => t.includes('add to my assets'));
+            const hasBuySignals = actionTexts.some(t =>
+                t.includes('buy now') ||
+                (t.includes('add to cart') && !t.includes('free')));
+            const hasOwnedSignals = actionTexts.some(t =>
+                t.includes('owned') ||
+                t.includes('in my assets') ||
+                t.includes('download'));
 
-        var isOwned = actionTexts.Any(t => t.Contains("open in unity") ||
-                                           t.Contains("owned") ||
-                                           t.Contains("in my assets") ||
-                                           t.Contains("download"));
+            const purchaseMatch = bodyText.match(/you purchased this item on\s+([^\n\r]+)/i);
+            const purchasedOnText = purchaseMatch?.[1]?.trim() || null;
 
-        var hasFreeSignals = actionTexts.Any(t => t.Contains("add to my assets")) ||
-                             normalized.Contains("free") ||
-                             normalized.Contains("0.00");
+            const hasSignInSignals = actionTexts.some(t =>
+                t === 'sign in' || t === 'log in' || t.includes('sign in to') || t.includes('log in to')) ||
+                normalized.includes('sign in') ||
+                normalized.includes('log in to add') ||
+                normalized.includes('sign in to add');
 
-        var hasPaidSignals = Regex.IsMatch(normalized, "\\$\\s?\\d") ||
-                             Regex.IsMatch(normalized, "€\\s?\\d") ||
-                             Regex.IsMatch(normalized, "£\\s?\\d");
+            const hasFreeSignals = hasAddToMyAssets || normalized.includes('free') || normalized.includes('0.00');
+            const hasPaidSignals = /\$\s?\d|€\s?\d|£\s?\d|\b\d+[\.,]?\d*\s?(usd|eur|gbp)\b/.test(normalized) || hasBuySignals;
 
-        var isFree = hasFreeSignals && !hasPaidSignals;
+            const isOwned = hasOpenInUnity || hasOwnedSignals || !!purchasedOnText;
+            const isFree = (hasAddToMyAssets || hasFreeSignals) && !hasPaidSignals;
 
-        return new AssetStatusSnapshot
-        {
-            IsFree = isFree,
-            IsOwned = isOwned
-        };
+            const detectionSummary = [
+                `free=${isFree}`,
+                `owned=${isOwned}`,
+                `addBtn=${hasAddToMyAssets}`,
+                `openInUnity=${hasOpenInUnity}`,
+                `buySignals=${hasBuySignals}`,
+                `paidSignals=${hasPaidSignals}`,
+                `loginSignals=${hasSignInSignals}`,
+                `purchasedOn=${purchasedOnText ? 'yes' : 'no'}`
+            ].join(', ');
+
+            return JSON.stringify({
+                isFree,
+                isOwned,
+                hasAddToMyAssets,
+                hasOpenInUnity,
+                requiresLogin: hasSignInSignals,
+                purchasedOnText,
+                detectionSummary
+            });
+        }");
+
+        return JsonSerializer.Deserialize<AssetStatusSnapshot>(raw ?? "{}") ?? new AssetStatusSnapshot();
     }
 
     private static async Task<bool> TryClickAddButtonAsync(IPage page)
@@ -642,6 +745,29 @@ internal sealed class UnityAssetAutomationApp
                 clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
                 return true;
             }
+            return false;
+        }");
+    }
+
+    private static async Task<bool> TryAcceptAddConfirmationAsync(IPage page)
+    {
+        return await page.EvaluateFunctionAsync<bool>(@"async () => {
+            const wait = (ms) => new Promise(r => setTimeout(r, ms));
+            for (let i = 0; i < 8; i++) {
+                const candidates = Array.from(document.querySelectorAll('button, a, span'));
+                for (const element of candidates) {
+                    const txt = (element.innerText || '').trim().toLowerCase();
+                    if (!txt) continue;
+                    if (!(txt === 'accept' || txt.includes('accept'))) continue;
+
+                    const clickable = element.closest('button, a') || element;
+                    clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    return true;
+                }
+
+                await wait(250);
+            }
+
             return false;
         }");
     }
@@ -744,6 +870,7 @@ internal sealed class CliOptions
     public int NavigationTimeoutMs { get; init; } = 120000;
     public int AuthTimeoutMs { get; init; } = 300000;
     public int? MaxAddAttempts { get; init; }
+    public int? MaxVisitedAssets { get; init; }
     public List<string> Sources { get; init; } = [];
     public bool HasCredentials => !string.IsNullOrWhiteSpace(UnityEmail) && !string.IsNullOrWhiteSpace(UnityPassword);
 
@@ -761,6 +888,7 @@ internal sealed class CliOptions
         var navigationTimeoutMs = 120000;
         var authTimeoutMs = 300000;
         int? maxAddAttempts = null;
+        int? maxVisitedAssets = null;
         var sources = new List<string>();
 
         for (var i = 0; i < args.Length; i++)
@@ -838,6 +966,15 @@ internal sealed class CliOptions
 
                     break;
                 }
+                case "--max-visited-assets" when i + 1 < args.Length:
+                {
+                    if (int.TryParse(args[++i], out var parsedVisitedLimit) && parsedVisitedLimit > 0)
+                    {
+                        maxVisitedAssets = parsedVisitedLimit;
+                    }
+
+                    break;
+                }
                 case "--source" when i + 1 < args.Length:
                     sources.Add(args[++i]);
                     break;
@@ -869,6 +1006,7 @@ internal sealed class CliOptions
             NavigationTimeoutMs = navigationTimeoutMs,
             AuthTimeoutMs = authTimeoutMs,
             MaxAddAttempts = maxAddAttempts,
+            MaxVisitedAssets = maxVisitedAssets,
             Sources = sources
         };
     }
@@ -927,6 +1065,8 @@ internal sealed class ProcessResult
     public bool DetectedFree { get; set; }
     public bool DetectedOwned { get; set; }
     public bool CountsTowardsAddLimit { get; set; }
+    public string? PurchasedOnText { get; set; }
+    public string? DetectionSummary { get; set; }
     public string? Message { get; set; }
 }
 
@@ -934,6 +1074,11 @@ internal sealed class AssetStatusSnapshot
 {
     public bool IsFree { get; init; }
     public bool IsOwned { get; init; }
+    public bool HasAddToMyAssets { get; init; }
+    public bool HasOpenInUnity { get; init; }
+    public bool RequiresLogin { get; init; }
+    public string? PurchasedOnText { get; init; }
+    public string? DetectionSummary { get; init; }
 }
 
 internal sealed class AuthUiMarkers
