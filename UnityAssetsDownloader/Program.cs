@@ -9,6 +9,9 @@ await app.RunAsync();
 
 internal sealed class UnityAssetAutomationApp
 {
+    private const string AssetStoreHomeUrl = "https://assetstore.unity.com/";
+    private const string AssetStoreSignInUrl = "https://assetstore.unity.com/api/auth/signin/unity-id?callbackUrl=https%3A%2F%2Fassetstore.unity.com%2F";
+
     private readonly CliOptions _options;
     private readonly AppLogger _logger;
     private readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true };
@@ -117,22 +120,11 @@ internal sealed class UnityAssetAutomationApp
             }
         }
 
-        _logger.Warn("Требуется вход в Unity.");
-        await SafeGoToAsync(page, "https://login.unity.com/en/sign-in");
-        _logger.Info($"Текущий URL перед ручным входом: {page.Url}");
-        _logger.Info("Выполните вход вручную в окне браузера и нажмите Enter в консоли...");
-        Console.ReadLine();
-        _logger.Info($"URL после нажатия Enter: {page.Url}");
-
-        var authOnCurrentPage = await HasAuthMarkersAsync(page);
-        if (!authOnCurrentPage)
+        _logger.Warn("Требуется вход в Unity. Запуск SSO через Asset Store...");
+        var authenticated = await AuthenticateViaAssetStoreAsync(page);
+        if (!authenticated)
         {
-            _logger.Warn("Проверка на текущей странице не подтвердила вход, перепроверяем через Asset Store...");
-        }
-
-        if (!await IsAuthenticatedAsync(page))
-        {
-            _logger.Error("Проверка после ручного входа неуспешна.");
+            _logger.Error("Проверка после попытки входа неуспешна.");
             return false;
         }
 
@@ -141,9 +133,145 @@ internal sealed class UnityAssetAutomationApp
         return true;
     }
 
+    private async Task<bool> AuthenticateViaAssetStoreAsync(IPage page)
+    {
+        if (_options.HasCredentials)
+        {
+            _logger.Info("Найдены учетные данные для автовхода. Будет выполнена автоматическая отправка формы.");
+        }
+        else
+        {
+            _logger.Info("Учетные данные для автовхода не заданы. Выполните вход в браузере вручную, скрипт продолжит автоматически.");
+        }
+
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            _logger.Info($"Попытка авторизации {attempt}/3...");
+            await StartAssetStoreSsoAsync(page);
+
+            if (_options.HasCredentials)
+            {
+                await TrySwitchToSignInPageAsync(page);
+                var submitted = await TryCompleteUnityLoginFormAsync(page);
+                if (submitted)
+                {
+                    _logger.Info("Форма входа отправлена автоматически.");
+                }
+            }
+
+            if (await WaitForAuthenticatedSessionAsync(page, TimeSpan.FromMilliseconds(_options.AuthTimeoutMs)))
+            {
+                return true;
+            }
+
+            _logger.Warn("Сессия Asset Store не подтверждена в рамках текущей попытки. Повторяем...");
+        }
+
+        return false;
+    }
+
+    private async Task StartAssetStoreSsoAsync(IPage page)
+    {
+        await SafeGoToAsync(page, AssetStoreSignInUrl);
+        _logger.Info($"SSO запущен, текущий URL: {page.Url}");
+    }
+
+    private async Task<bool> WaitForAuthenticatedSessionAsync(IPage page, TimeSpan timeout)
+    {
+        var stopAt = DateTime.UtcNow.Add(timeout);
+        var iteration = 0;
+
+        while (DateTime.UtcNow < stopAt)
+        {
+            iteration++;
+
+            if (await IsAuthenticatedAsync(page))
+            {
+                return true;
+            }
+
+            if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+            {
+                await TrySwitchToSignInPageAsync(page);
+                if (_options.HasCredentials)
+                {
+                    await TryCompleteUnityLoginFormAsync(page);
+                }
+            }
+            else if (page.Url.Contains("cloud.unity.com", StringComparison.OrdinalIgnoreCase) && iteration % 2 == 0)
+            {
+                _logger.Debug("Обнаружен cloud.unity.com, возвращаемся в Asset Store для завершения SSO...");
+                await StartAssetStoreSsoAsync(page);
+            }
+            else if (!page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase) && iteration % 3 == 0)
+            {
+                await SafeGoToAsync(page, AssetStoreHomeUrl);
+            }
+
+            await Task.Delay(1500);
+        }
+
+        return false;
+    }
+
+    private async Task TrySwitchToSignInPageAsync(IPage page)
+    {
+        if (!page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        if (page.Url.Contains("/sign-up", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.Debug("Обнаружена страница sign-up, переключаемся на sign-in...");
+            await SafeGoToAsync(page, "https://login.unity.com/en/sign-in");
+        }
+    }
+
+    private async Task<bool> TryCompleteUnityLoginFormAsync(IPage page)
+    {
+        if (!_options.HasCredentials)
+        {
+            return false;
+        }
+
+        if (!page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return await page.EvaluateFunctionAsync<bool>(@"async (email, password) => {
+            const emailInput = document.querySelector('input[type=""email""], input[name*=""email"" i], input[id*=""email"" i]');
+            const passInput = document.querySelector('input[type=""password""], input[name*=""password"" i], input[id*=""password"" i]');
+            if (!emailInput || !passInput) {
+                return false;
+            }
+
+            const setValue = (el, value) => {
+                el.focus();
+                el.value = value;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            };
+
+            setValue(emailInput, email);
+            setValue(passInput, password);
+
+            const submit = passInput.form?.querySelector('button[type=""submit""], input[type=""submit""]')
+                || document.querySelector('button[type=""submit""], button[data-testid*=""sign"" i]');
+
+            if (!submit) {
+                return false;
+            }
+
+            submit.click();
+            return true;
+        }", _options.UnityEmail!, _options.UnityPassword!);
+    }
+
     private async Task<bool> IsAuthenticatedAsync(IPage page)
     {
-        await SafeGoToAsync(page, "https://assetstore.unity.com");
+        await SafeGoToAsync(page, AssetStoreHomeUrl);
 
         if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
         {
@@ -588,9 +716,13 @@ internal sealed class CliOptions
     public bool Verbose { get; init; }
     public bool TraceNetwork { get; init; }
     public string? LogFilePath { get; init; }
+    public string? UnityEmail { get; init; }
+    public string? UnityPassword { get; init; }
     public int DelayMs { get; init; } = 1200;
     public int NavigationTimeoutMs { get; init; } = 120000;
+    public int AuthTimeoutMs { get; init; } = 300000;
     public List<string> Sources { get; init; } = [];
+    public bool HasCredentials => !string.IsNullOrWhiteSpace(UnityEmail) && !string.IsNullOrWhiteSpace(UnityPassword);
 
     public static CliOptions Parse(string[] args)
     {
@@ -600,8 +732,11 @@ internal sealed class CliOptions
         var verbose = false;
         var traceNetwork = false;
         string? logFilePath = null;
+        string? unityEmail = null;
+        string? unityPassword = null;
         var delayMs = 1200;
         var navigationTimeoutMs = 120000;
+        var authTimeoutMs = 300000;
         var sources = new List<string>();
 
         for (var i = 0; i < args.Length; i++)
@@ -637,6 +772,12 @@ internal sealed class CliOptions
                 case "--log-file" when i + 1 < args.Length:
                     logFilePath = args[++i];
                     break;
+                case "--unity-email" when i + 1 < args.Length:
+                    unityEmail = args[++i];
+                    break;
+                case "--unity-password" when i + 1 < args.Length:
+                    unityPassword = args[++i];
+                    break;
                 case "--delay-ms" when i + 1 < args.Length:
                 {
                     if (int.TryParse(args[++i], out var delay) && delay > 0)
@@ -655,10 +796,30 @@ internal sealed class CliOptions
 
                     break;
                 }
+                case "--auth-timeout-ms" when i + 1 < args.Length:
+                {
+                    if (int.TryParse(args[++i], out var authTimeout) && authTimeout >= 30000)
+                    {
+                        authTimeoutMs = authTimeout;
+                    }
+
+                    break;
+                }
                 case "--source" when i + 1 < args.Length:
                     sources.Add(args[++i]);
                     break;
             }
+        }
+
+        unityEmail ??= Environment.GetEnvironmentVariable("UNITY_EMAIL");
+        unityPassword ??= Environment.GetEnvironmentVariable("UNITY_PASSWORD");
+
+        if ((string.IsNullOrWhiteSpace(unityEmail) && !string.IsNullOrWhiteSpace(unityPassword)) ||
+            (!string.IsNullOrWhiteSpace(unityEmail) && string.IsNullOrWhiteSpace(unityPassword)))
+        {
+            Console.WriteLine("Для автовхода необходимо задать и UNITY_EMAIL, и UNITY_PASSWORD (или оба через CLI). Будет использован ручной вход.");
+            unityEmail = null;
+            unityPassword = null;
         }
 
         return new CliOptions
@@ -669,8 +830,11 @@ internal sealed class CliOptions
             Verbose = verbose,
             TraceNetwork = traceNetwork,
             LogFilePath = logFilePath,
+            UnityEmail = unityEmail,
+            UnityPassword = unityPassword,
             DelayMs = delayMs,
             NavigationTimeoutMs = navigationTimeoutMs,
+            AuthTimeoutMs = authTimeoutMs,
             Sources = sources
         };
     }
