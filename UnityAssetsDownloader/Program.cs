@@ -84,14 +84,35 @@ internal sealed class UnityAssetAutomationApp
                 Sources = sources
             };
 
+            var freeAssetsProcessed = 0;
+            if (_options.MaxAddAttempts.HasValue)
+            {
+                _logger.Info($"Включен лимит по бесплатным ассетам: {_options.MaxAddAttempts.Value}");
+            }
+
             var index = 0;
             foreach (var assetUrl in assetUrls)
             {
+                if (_options.MaxAddAttempts.HasValue && freeAssetsProcessed >= _options.MaxAddAttempts.Value)
+                {
+                    _logger.Warn($"Достигнут лимит бесплатных ассетов ({freeAssetsProcessed}/{_options.MaxAddAttempts.Value}). Обработка остановлена.");
+                    break;
+                }
+
                 index++;
                 _logger.Info($"[{index}/{assetUrls.Count}] Обработка: {assetUrl}");
 
                 var result = await ProcessAssetAsync(page, assetUrl);
                 report.Items.Add(result);
+
+                if (result.CountsTowardsAddLimit)
+                {
+                    freeAssetsProcessed++;
+                    if (_options.MaxAddAttempts.HasValue)
+                    {
+                        _logger.Info($"Лимит-счетчик бесплатных ассетов: {freeAssetsProcessed}/{_options.MaxAddAttempts.Value} (статус: {result.Status})");
+                    }
+                }
 
                 await Task.Delay(TimeSpan.FromMilliseconds(_options.DelayMs));
             }
@@ -529,6 +550,7 @@ internal sealed class UnityAssetAutomationApp
             var status = await DetectStatusAsync(page);
             result.DetectedFree = status.IsFree;
             result.DetectedOwned = status.IsOwned;
+            result.CountsTowardsAddLimit = status.IsFree;
 
             if (!status.IsFree)
             {
@@ -721,6 +743,7 @@ internal sealed class CliOptions
     public int DelayMs { get; init; } = 1200;
     public int NavigationTimeoutMs { get; init; } = 120000;
     public int AuthTimeoutMs { get; init; } = 300000;
+    public int? MaxAddAttempts { get; init; }
     public List<string> Sources { get; init; } = [];
     public bool HasCredentials => !string.IsNullOrWhiteSpace(UnityEmail) && !string.IsNullOrWhiteSpace(UnityPassword);
 
@@ -737,6 +760,7 @@ internal sealed class CliOptions
         var delayMs = 1200;
         var navigationTimeoutMs = 120000;
         var authTimeoutMs = 300000;
+        int? maxAddAttempts = null;
         var sources = new List<string>();
 
         for (var i = 0; i < args.Length; i++)
@@ -805,6 +829,15 @@ internal sealed class CliOptions
 
                     break;
                 }
+                case "--max-add-attempts" when i + 1 < args.Length:
+                {
+                    if (int.TryParse(args[++i], out var parsedLimit) && parsedLimit > 0)
+                    {
+                        maxAddAttempts = parsedLimit;
+                    }
+
+                    break;
+                }
                 case "--source" when i + 1 < args.Length:
                     sources.Add(args[++i]);
                     break;
@@ -835,6 +868,7 @@ internal sealed class CliOptions
             DelayMs = delayMs,
             NavigationTimeoutMs = navigationTimeoutMs,
             AuthTimeoutMs = authTimeoutMs,
+            MaxAddAttempts = maxAddAttempts,
             Sources = sources
         };
     }
@@ -892,6 +926,7 @@ internal sealed class ProcessResult
     public AssetProcessStatus Status { get; set; }
     public bool DetectedFree { get; set; }
     public bool DetectedOwned { get; set; }
+    public bool CountsTowardsAddLimit { get; set; }
     public string? Message { get; set; }
 }
 

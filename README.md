@@ -96,6 +96,7 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --hea
 | `--delay-ms <int>` | Пауза между обработкой ассетов (мс), по умолчанию 1200 |
 | `--nav-timeout-ms <int>` | Таймаут навигации (мс), по умолчанию 120000 |
 | `--auth-timeout-ms <int>` | Таймаут ожидания авторизации (мс), по умолчанию 300000 |
+| `--max-add-attempts <int>` | Лимит обработки бесплатных ассетов (включая `AlreadyOwned`). После достижения лимита проход останавливается |
 | `--source <url>` | Источник ссылок на ассеты (можно указать несколько раз) |
 
 ---
@@ -128,6 +129,12 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --hea
 dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --headless false --nav-timeout-ms 180000 --auth-timeout-ms 600000 --verbose
 ```
 
+### 6.5 Прогон только top-free, в видимом браузере, с лимитом 25
+
+```powershell
+dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --headless false --source "https://assetstore.unity.com/top-assets/top-free" --max-add-attempts 25 --verbose --trace-network
+```
+
 ---
 
 ## 7. Где лежат файлы после запуска
@@ -156,6 +163,7 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --hea
    - `--login --headless false`
 2. Прогоните `--dry-run`, чтобы проверить распознавание ассетов.
 3. Если всё корректно — запускайте без `--dry-run`.
+4. Для аккуратного старта используйте `--max-add-attempts 25`.
 4. Периодически обновляйте cookies через `--login`.
 
 ---
