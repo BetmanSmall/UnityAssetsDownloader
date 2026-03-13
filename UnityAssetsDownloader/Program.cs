@@ -10,11 +10,12 @@ await app.RunAsync();
 internal sealed class UnityAssetAutomationApp
 {
     private const string AssetStoreHomeUrl = "https://assetstore.unity.com/";
-    private const string AssetStoreSignInUrl = "https://assetstore.unity.com/api/auth/signin/unity-id?callbackUrl=https%3A%2F%2Fassetstore.unity.com%2F";
+    private const string AssetStoreSignInUrl = "https://login.unity.com/en/sign-in";
 
     private readonly CliOptions _options;
     private readonly AppLogger _logger;
     private readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true };
+    private readonly JsonSerializerOptions _runtimeJsonOptions = new() { PropertyNameCaseInsensitive = true };
     private readonly string _dataDirectory = Path.Combine(AppContext.BaseDirectory, "data");
     private readonly string _logsDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
     private readonly string _cookiesPath;
@@ -217,17 +218,32 @@ internal sealed class UnityAssetAutomationApp
         {
             iteration++;
 
-            if (await IsAuthenticatedAsync(page))
-            {
-                return true;
-            }
-
             if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
             {
                 await TrySwitchToSignInPageAsync(page);
                 if (_options.HasCredentials)
                 {
                     await TryCompleteUnityLoginFormAsync(page);
+                }
+
+                await Task.Delay(1500);
+                continue;
+            }
+
+            if (page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
+            {
+                if (await HasAuthMarkersAsync(page))
+                {
+                    return true;
+                }
+
+                if (!_options.HasCredentials)
+                {
+                    var clicked = await TryClickSignInWithUnityAsync(page);
+                    if (clicked)
+                    {
+                        _logger.Info("Обнаружена кнопка 'Sign in with Unity', выполняем переход на страницу входа...");
+                    }
                 }
             }
             else if (page.Url.Contains("cloud.unity.com", StringComparison.OrdinalIgnoreCase) && iteration % 2 == 0)
@@ -326,18 +342,24 @@ internal sealed class UnityAssetAutomationApp
             const hasSignInLink = !!document.querySelector('a[href*=""login.unity.com""], a[href*=""/sign-in""]');
             const hasMyAssetsText = text.includes('my assets');
             const hasSignInText = text.includes('sign in');
+            const hasSignInWithUnityText = text.includes('sign in with unity');
+            const hasSignInWithUnityButton = Array.from(document.querySelectorAll('button, a, span'))
+                .some(el => (el.innerText || '').trim().toLowerCase().includes('sign in with unity'));
 
             return JSON.stringify({
                 hasMyAssetsLink,
                 hasSignInLink,
                 hasMyAssetsText,
-                hasSignInText
+                hasSignInText,
+                hasSignInWithUnityText,
+                hasSignInWithUnityButton
             });
         }");
 
-        var markers = JsonSerializer.Deserialize<AuthUiMarkers>(rawMarkers ?? "{}") ?? new AuthUiMarkers();
+        var markers = JsonSerializer.Deserialize<AuthUiMarkers>(rawMarkers ?? "{}", _runtimeJsonOptions) ?? new AuthUiMarkers();
         var hasUiAuthMarkers = (markers.HasMyAssetsLink || markers.HasMyAssetsText) &&
                                !(markers.HasSignInLink && markers.HasSignInText && !markers.HasMyAssetsText);
+        var hasUiSignInMarkers = markers.HasSignInLink || markers.HasSignInText || markers.HasSignInWithUnityText || markers.HasSignInWithUnityButton;
 
         var hasApiAuthMarkers = false;
         if (page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
@@ -361,9 +383,9 @@ internal sealed class UnityAssetAutomationApp
             }");
         }
 
-        _logger.Debug($"Auth markers: UI={hasUiAuthMarkers}, API={hasApiAuthMarkers}, page={page.Url}, myAssetsLink={markers.HasMyAssetsLink}, myAssetsText={markers.HasMyAssetsText}, signInLink={markers.HasSignInLink}, signInText={markers.HasSignInText}");
+        _logger.Debug($"Auth markers: UI={hasUiAuthMarkers}, API={hasApiAuthMarkers}, signInUi={hasUiSignInMarkers}, page={page.Url}, myAssetsLink={markers.HasMyAssetsLink}, myAssetsText={markers.HasMyAssetsText}, signInLink={markers.HasSignInLink}, signInText={markers.HasSignInText}, signInWithUnityText={markers.HasSignInWithUnityText}, signInWithUnityButton={markers.HasSignInWithUnityButton}");
 
-        return hasUiAuthMarkers || hasApiAuthMarkers;
+        return !hasUiSignInMarkers && (hasUiAuthMarkers || hasApiAuthMarkers);
     }
 
     private void AttachPageDiagnostics(IPage page)
@@ -560,12 +582,18 @@ internal sealed class UnityAssetAutomationApp
             {
                 await SafeGoToAsync(page, assetUrl);
 
+                var ready = await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(_options.AssetUiTimeoutMs));
+                if (!ready)
+                {
+                    _logger.Warn("Не удалось дождаться появления ключевых элементов ассета (Add/Open/Sign in/Buy). Продолжаем с текущими данными страницы.");
+                }
+
                 var status = await DetectStatusAsync(page);
                 result.DetectedFree = status.IsFree;
                 result.DetectedOwned = status.IsOwned;
                 result.CountsTowardsAddLimit = status.IsFree;
                 result.PurchasedOnText = status.PurchasedOnText;
-                result.DetectionSummary = status.DetectionSummary;
+                result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary) ? "no-signals" : status.DetectionSummary;
 
                 _logger.Debug($"Статус ассета (до действия): {status.DetectionSummary}");
 
@@ -585,12 +613,13 @@ internal sealed class UnityAssetAutomationApp
                     }
 
                     await SafeGoToAsync(page, assetUrl);
+                    await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(_options.AssetUiTimeoutMs));
                     status = await DetectStatusAsync(page);
                     result.DetectedFree = status.IsFree;
                     result.DetectedOwned = status.IsOwned;
                     result.CountsTowardsAddLimit = status.IsFree;
                     result.PurchasedOnText = status.PurchasedOnText;
-                    result.DetectionSummary = status.DetectionSummary;
+                    result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary) ? "no-signals" : status.DetectionSummary;
                     _logger.Debug($"Статус ассета (после переавторизации): {status.DetectionSummary}");
                 }
 
@@ -636,9 +665,10 @@ internal sealed class UnityAssetAutomationApp
                 }
 
                 await Task.Delay(2200);
+                await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 12000)));
                 var postStatus = await DetectStatusAsync(page);
                 result.PurchasedOnText = postStatus.PurchasedOnText ?? result.PurchasedOnText;
-                result.DetectionSummary = postStatus.DetectionSummary;
+                result.DetectionSummary = string.IsNullOrWhiteSpace(postStatus.DetectionSummary) ? "no-signals" : postStatus.DetectionSummary;
                 _logger.Debug($"Статус ассета (после клика): {postStatus.DetectionSummary}");
 
                 if (postStatus.RequiresLogin || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
@@ -723,7 +753,60 @@ internal sealed class UnityAssetAutomationApp
             });
         }");
 
-        return JsonSerializer.Deserialize<AssetStatusSnapshot>(raw ?? "{}") ?? new AssetStatusSnapshot();
+        return JsonSerializer.Deserialize<AssetStatusSnapshot>(raw ?? "{}", _runtimeJsonOptions) ?? new AssetStatusSnapshot();
+    }
+
+    private async Task<bool> WaitForAssetSignalsAsync(IPage page, TimeSpan timeout)
+    {
+        var stopAt = DateTime.UtcNow.Add(timeout);
+        while (DateTime.UtcNow < stopAt)
+        {
+            if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            var hasSignals = await page.EvaluateFunctionAsync<bool>(@"() => {
+                const text = (document.body?.innerText || '').toLowerCase();
+                const actions = Array.from(document.querySelectorAll('button, a, span'))
+                    .map(x => (x.innerText || '').trim().toLowerCase())
+                    .filter(Boolean);
+
+                const hasAdd = actions.some(t => t.includes('add to my assets'));
+                const hasOpen = actions.some(t => t.includes('open in unity'));
+                const hasSignIn = actions.some(t => t.includes('sign in')) || text.includes('sign in with unity');
+                const hasBuy = actions.some(t => t.includes('buy now') || t.includes('add to cart'));
+                const hasPrice = /\$\s?\d|€\s?\d|£\s?\d|\b\d+[\.,]?\d*\s?(usd|eur|gbp)\b/.test(text);
+
+                return hasAdd || hasOpen || hasSignIn || hasBuy || hasPrice;
+            }");
+
+            if (hasSignals)
+            {
+                return true;
+            }
+
+            await Task.Delay(400);
+        }
+
+        return false;
+    }
+
+    private static async Task<bool> TryClickSignInWithUnityAsync(IPage page)
+    {
+        return await page.EvaluateFunctionAsync<bool>(@"() => {
+            const actions = Array.from(document.querySelectorAll('button, a, span'));
+            for (const element of actions) {
+                const txt = (element.innerText || '').trim().toLowerCase();
+                if (!txt || !txt.includes('sign in with unity')) continue;
+
+                const clickable = element.closest('button, a') || element;
+                clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                return true;
+            }
+
+            return false;
+        }");
     }
 
     private static async Task<bool> TryClickAddButtonAsync(IPage page)
@@ -869,6 +952,7 @@ internal sealed class CliOptions
     public int DelayMs { get; init; } = 1200;
     public int NavigationTimeoutMs { get; init; } = 120000;
     public int AuthTimeoutMs { get; init; } = 300000;
+    public int AssetUiTimeoutMs { get; init; } = 30000;
     public int? MaxAddAttempts { get; init; }
     public int? MaxVisitedAssets { get; init; }
     public List<string> Sources { get; init; } = [];
@@ -887,6 +971,7 @@ internal sealed class CliOptions
         var delayMs = 1200;
         var navigationTimeoutMs = 120000;
         var authTimeoutMs = 300000;
+        var assetUiTimeoutMs = 30000;
         int? maxAddAttempts = null;
         int? maxVisitedAssets = null;
         var sources = new List<string>();
@@ -957,6 +1042,15 @@ internal sealed class CliOptions
 
                     break;
                 }
+                case "--asset-ui-timeout-ms" when i + 1 < args.Length:
+                {
+                    if (int.TryParse(args[++i], out var assetUiTimeout) && assetUiTimeout >= 5000)
+                    {
+                        assetUiTimeoutMs = assetUiTimeout;
+                    }
+
+                    break;
+                }
                 case "--max-add-attempts" when i + 1 < args.Length:
                 {
                     if (int.TryParse(args[++i], out var parsedLimit) && parsedLimit > 0)
@@ -1005,6 +1099,7 @@ internal sealed class CliOptions
             DelayMs = delayMs,
             NavigationTimeoutMs = navigationTimeoutMs,
             AuthTimeoutMs = authTimeoutMs,
+            AssetUiTimeoutMs = assetUiTimeoutMs,
             MaxAddAttempts = maxAddAttempts,
             MaxVisitedAssets = maxVisitedAssets,
             Sources = sources
@@ -1087,6 +1182,8 @@ internal sealed class AuthUiMarkers
     public bool HasSignInLink { get; init; }
     public bool HasMyAssetsText { get; init; }
     public bool HasSignInText { get; init; }
+    public bool HasSignInWithUnityText { get; init; }
+    public bool HasSignInWithUnityButton { get; init; }
 }
 
 internal enum AssetProcessStatus
