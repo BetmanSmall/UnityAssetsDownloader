@@ -956,15 +956,10 @@ internal sealed class UnityAssetAutomationApp
         var stopAt = DateTime.UtcNow.Add(timeout);
         AssetStatusSnapshot? lastStatus = null;
         var refreshAttempt = 0;
+        var addClickAttempt = 0;
 
         while (DateTime.UtcNow < stopAt)
         {
-            var accepted = await TryAcceptAddConfirmationAsync(page);
-            if (accepted)
-            {
-                _logger.Info("Подтверждение добавления найдено во время проверки: нажата кнопка Accept.");
-            }
-
             await Task.Delay(1200);
             await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 12000)));
             var current = await DetectStatusAsync(page);
@@ -982,6 +977,20 @@ internal sealed class UnityAssetAutomationApp
 
             if (current.HasAddToMyAssets)
             {
+                addClickAttempt++;
+                _logger.Debug($"Повторная попытка добавления ассета (клик Add to My Assets), попытка {addClickAttempt}...");
+
+                var clickedAdd = await TryClickAddButtonAsync(page);
+                if (clickedAdd)
+                {
+                    await Task.Delay(350);
+                    var accepted = await TryAcceptAddConfirmationAsync(page);
+                    if (accepted)
+                    {
+                        _logger.Info("Подтверждение добавления найдено во время проверки: нажата кнопка Accept.");
+                    }
+                }
+
                 refreshAttempt++;
                 _logger.Debug($"После добавления кнопка Add to My Assets все еще видна. Обновляем страницу ассета (попытка {refreshAttempt})...");
                 await SafeGoToAsync(page, assetUrl);
@@ -1008,9 +1017,22 @@ internal sealed class UnityAssetAutomationApp
             };
 
             const bodyText = document.body?.innerText || '';
-            const ctaRoots = Array.from(document.querySelectorAll(
-                '[data-testid*=""cta"" i], [class*=""cta"" i], [class*=""purchase"" i], [class*=""buy"" i], aside[class*=""sidebar"" i], div[class*=""sidebar"" i]'
-            )).filter(visible);
+            const ctaRootSelectors = [
+                '[data-testid*=""cta"" i]',
+                '[data-testid*=""purchase"" i]',
+                '[class*=""cta"" i]',
+                '[class*=""purchase"" i]',
+                '[class*=""buy"" i]',
+                'aside[class*=""sidebar"" i]',
+                'div[class*=""sidebar"" i]'
+            ].join(', ');
+
+            const ctaRoots = Array.from(document.querySelectorAll(ctaRootSelectors))
+                .filter(visible)
+                .filter(root => {
+                    const txt = normalize(root.innerText || '');
+                    return txt.includes('add to my assets') || txt.includes('open in unity') || txt.includes('buy now') || txt.includes('add to cart') || txt.includes('free');
+                });
 
             const extractTexts = (root) => Array.from(root.querySelectorAll('button, a, [role=""button""]'))
                 .filter(visible)
@@ -1115,9 +1137,22 @@ internal sealed class UnityAssetAutomationApp
                     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
                 };
 
-                const roots = Array.from(document.querySelectorAll(
-                    '[data-testid*=""cta"" i], [class*=""cta"" i], [class*=""purchase"" i], [class*=""buy"" i], aside[class*=""sidebar"" i], div[class*=""sidebar"" i]'
-                )).filter(visible);
+                const rootSelectors = [
+                    '[data-testid*=""cta"" i]',
+                    '[data-testid*=""purchase"" i]',
+                    '[class*=""cta"" i]',
+                    '[class*=""purchase"" i]',
+                    '[class*=""buy"" i]',
+                    'aside[class*=""sidebar"" i]',
+                    'div[class*=""sidebar"" i]'
+                ].join(', ');
+
+                const roots = Array.from(document.querySelectorAll(rootSelectors))
+                    .filter(visible)
+                    .filter(root => {
+                        const txt = normalize(root.innerText || '');
+                        return txt.includes('add to my assets') || txt.includes('open in unity') || txt.includes('buy now') || txt.includes('add to cart') || txt.includes('free');
+                    });
 
                 let actions = roots.flatMap(root =>
                     Array.from(root.querySelectorAll('button, a, [role=""button""]'))
@@ -1184,23 +1219,61 @@ internal sealed class UnityAssetAutomationApp
     private static async Task<bool> TryClickAddButtonAsync(IPage page)
     {
         return await page.EvaluateFunctionAsync<bool>(@"() => {
-            const targets = [
-                'add to my assets',
-                'add to my assets for free',
-                'add to cart'
-            ];
+            const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
 
-            const elements = Array.from(document.querySelectorAll('button, a, span'));
-            for (const element of elements) {
-                const txt = (element.innerText || '').trim().toLowerCase();
-                if (!txt) continue;
-                if (!targets.some(t => txt.includes(t))) continue;
+            const rootSelectors = [
+                '[data-testid*=""cta"" i]',
+                '[data-testid*=""purchase"" i]',
+                '[class*=""cta"" i]',
+                '[class*=""purchase"" i]',
+                '[class*=""buy"" i]',
+                'aside[class*=""sidebar"" i]',
+                'div[class*=""sidebar"" i]'
+            ].join(', ');
 
-                const clickable = element.closest('button, a') || element;
-                clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            const roots = Array.from(document.querySelectorAll(rootSelectors))
+                .filter(visible)
+                .filter(root => {
+                    const txt = normalize(root.innerText || '');
+                    return txt.includes('add to my assets') || txt.includes('open in unity') || txt.includes('buy now') || txt.includes('add to cart') || txt.includes('free');
+                });
+
+            const collectClickables = (root) => Array.from(root.querySelectorAll('button, a, [role=""button""]'))
+                .filter(visible)
+                .map(el => ({
+                    element: el,
+                    text: normalize(el.innerText)
+                }))
+                .filter(x => !!x.text);
+
+            const clickFrom = (items) => {
+                const exactAdd = items.find(x => x.text === 'add to my assets' || x.text === 'add to my assets for free');
+                const containsAdd = items.find(x => x.text.includes('add to my assets'));
+                const fallbackAddToCart = items.find(x => x.text.includes('add to cart') && x.text.includes('free'));
+                const target = exactAdd || containsAdd || fallbackAddToCart;
+
+                if (!target) return false;
+                target.element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
                 return true;
+            };
+
+            for (const root of roots) {
+                const items = collectClickables(root);
+                if (clickFrom(items)) return true;
             }
-            return false;
+
+            const fallback = Array.from(document.querySelectorAll('button, a, [role=""button""]'))
+                .filter(visible)
+                .map(el => ({ element: el, text: normalize(el.innerText) }))
+                .filter(x => !!x.text);
+
+            return clickFrom(fallback);
         }");
     }
 
@@ -1208,16 +1281,38 @@ internal sealed class UnityAssetAutomationApp
     {
         return await page.EvaluateFunctionAsync<bool>(@"async () => {
             const wait = (ms) => new Promise(r => setTimeout(r, ms));
-            for (let i = 0; i < 8; i++) {
-                const candidates = Array.from(document.querySelectorAll('button, a, span'));
-                for (const element of candidates) {
-                    const txt = (element.innerText || '').trim().toLowerCase();
-                    if (!txt) continue;
-                    if (!(txt === 'accept' || txt.includes('accept'))) continue;
+            const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
 
-                    const clickable = element.closest('button, a') || element;
-                    clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                    return true;
+            for (let i = 0; i < 8; i++) {
+                const dialogs = Array.from(document.querySelectorAll('[role=""dialog""], [aria-modal=""true""], [class*=""modal"" i], [class*=""dialog"" i], [class*=""popup"" i], [class*=""overlay"" i]'))
+                    .filter(visible);
+
+                for (const dialog of dialogs) {
+                    const dialogText = normalize(dialog.innerText || '');
+                    const candidates = Array.from(dialog.querySelectorAll('button, a, [role=""button""]')).filter(visible);
+                    const candidateTexts = candidates.map(x => normalize(x.innerText));
+
+                    const hasAccept = candidateTexts.some(t => t === 'accept' || t.startsWith('accept '));
+                    const hasCancelLike = candidateTexts.some(t => t.includes('cancel') || t.includes('decline') || t.includes('close') || t.includes('back'));
+                    const looksLikeAssetConfirmation = dialogText.includes('license') || dialogText.includes('agreement') || dialogText.includes('terms') || dialogText.includes('eula') || dialogText.includes('unity') || dialogText.includes('asset');
+
+                    if (!hasAccept) continue;
+                    if (!hasCancelLike && !looksLikeAssetConfirmation) continue;
+
+                    for (const element of candidates) {
+                        const txt = normalize(element.innerText);
+                        if (!txt) continue;
+                        if (txt !== 'accept' && !txt.startsWith('accept ')) continue;
+
+                        element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        return true;
+                    }
                 }
 
                 await wait(250);
