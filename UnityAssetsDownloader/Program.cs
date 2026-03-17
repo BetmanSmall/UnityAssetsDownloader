@@ -205,7 +205,30 @@ internal sealed class UnityAssetAutomationApp
 
     private async Task StartAssetStoreSsoAsync(IPage page)
     {
-        await SafeGoToAsync(page, AssetStoreSignInUrl);
+        _logger.Info("AuthStep: open-home");
+        await SafeGoToAsync(page, AssetStoreHomeUrl);
+
+        var clickedSignInFromMenu = await TryTriggerSignInFromHomeUiAsync(page);
+        if (!clickedSignInFromMenu)
+        {
+            _logger.Warn("Не удалось перейти к Sign In через меню профиля. Пробуем альтернативный путь входа...");
+        }
+
+        if (!page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+        {
+            var clickedSignInWithUnity = await TryClickSignInWithUnityAsync(page);
+            if (clickedSignInWithUnity)
+            {
+                _logger.Info("AuthStep: click-sign-in-with-unity");
+            }
+        }
+
+        if (!page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.Warn("Не удалось перейти на login.unity.com через UI. Используем прямой переход как fallback.");
+            await SafeGoToAsync(page, AssetStoreSignInUrl);
+        }
+
         _logger.Info($"SSO запущен, текущий URL: {page.Url}");
     }
 
@@ -234,15 +257,16 @@ internal sealed class UnityAssetAutomationApp
             {
                 if (await HasAuthMarkersAsync(page))
                 {
+                    _logger.Info("AuthStep: auth-confirmed");
                     return true;
                 }
 
                 if (!_options.HasCredentials)
                 {
-                    var clicked = await TryClickSignInWithUnityAsync(page);
+                    var clicked = await TryTriggerSignInFromHomeUiAsync(page) || await TryClickSignInWithUnityAsync(page);
                     if (clicked)
                     {
-                        _logger.Info("Обнаружена кнопка 'Sign in with Unity', выполняем переход на страницу входа...");
+                        _logger.Info("AuthStep: wait-user-login");
                     }
                 }
             }
@@ -336,7 +360,7 @@ internal sealed class UnityAssetAutomationApp
             return false;
         }
 
-        var rawMarkers = await page.EvaluateFunctionAsync<string>(@"() => {
+        var rawMarkers = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<string>(@"() => {
             const text = document.body?.innerText?.toLowerCase() || '';
             const hasMyAssetsLink = !!document.querySelector('a[href*=""/my-assets""], a[href*=""my-assets""]');
             const hasSignInLink = !!document.querySelector('a[href*=""login.unity.com""], a[href*=""/sign-in""]');
@@ -354,17 +378,18 @@ internal sealed class UnityAssetAutomationApp
                 hasSignInWithUnityText,
                 hasSignInWithUnityButton
             });
-        }");
+        }"), "HasAuthMarkers(rawMarkers)");
 
         var markers = JsonSerializer.Deserialize<AuthUiMarkers>(rawMarkers ?? "{}", _runtimeJsonOptions) ?? new AuthUiMarkers();
         var hasUiAuthMarkers = (markers.HasMyAssetsLink || markers.HasMyAssetsText) &&
                                !(markers.HasSignInLink && markers.HasSignInText && !markers.HasMyAssetsText);
         var hasUiSignInMarkers = markers.HasSignInLink || markers.HasSignInText || markers.HasSignInWithUnityText || markers.HasSignInWithUnityButton;
+        var profileState = await GetProfileMenuAuthStateAsync(page);
 
         var hasApiAuthMarkers = false;
         if (page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
         {
-            hasApiAuthMarkers = await page.EvaluateFunctionAsync<bool>(@"async () => {
+            hasApiAuthMarkers = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<bool>(@"async () => {
                 try {
                     const res = await fetch('/api/users/organizations', { credentials: 'include' });
                     if (!res.ok) return false;
@@ -380,12 +405,218 @@ internal sealed class UnityAssetAutomationApp
                 } catch {
                     return false;
                 }
-            }");
+            }"), "HasAuthMarkers(api)");
         }
 
-        _logger.Debug($"Auth markers: UI={hasUiAuthMarkers}, API={hasApiAuthMarkers}, signInUi={hasUiSignInMarkers}, page={page.Url}, myAssetsLink={markers.HasMyAssetsLink}, myAssetsText={markers.HasMyAssetsText}, signInLink={markers.HasSignInLink}, signInText={markers.HasSignInText}, signInWithUnityText={markers.HasSignInWithUnityText}, signInWithUnityButton={markers.HasSignInWithUnityButton}");
+        _logger.Debug($"Auth markers: UI={hasUiAuthMarkers}, API={hasApiAuthMarkers}, signInUi={hasUiSignInMarkers}, profileMenuFound={profileState.ProfileMenuFound}, profileMenuSignIn={profileState.HasSignInItem}, profileMenuSignedIn={profileState.HasSignedInItem}, page={page.Url}, myAssetsLink={markers.HasMyAssetsLink}, myAssetsText={markers.HasMyAssetsText}, signInLink={markers.HasSignInLink}, signInText={markers.HasSignInText}, signInWithUnityText={markers.HasSignInWithUnityText}, signInWithUnityButton={markers.HasSignInWithUnityButton}");
 
-        return !hasUiSignInMarkers && (hasUiAuthMarkers || hasApiAuthMarkers);
+        if (profileState.HasSignInItem)
+        {
+            return false;
+        }
+
+        if (profileState.HasSignedInItem)
+        {
+            return true;
+        }
+
+        return !hasUiSignInMarkers && hasUiAuthMarkers;
+    }
+
+    private static async Task<bool> TryOpenUserProfileMenuAsync(IPage page)
+    {
+        return await page.EvaluateFunctionAsync<bool>(@"() => {
+            const button = document.querySelector('[aria-label=""Open user profile menu""], button[aria-label*=""profile"" i], button[aria-label*=""user"" i]');
+            if (!button) return false;
+
+            button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            return true;
+        }");
+    }
+
+    private async Task<bool> WaitForProfileMenuReadyAsync(IPage page, TimeSpan timeout)
+    {
+        var stopAt = DateTime.UtcNow.Add(timeout);
+        while (DateTime.UtcNow < stopAt)
+        {
+            var menuReady = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<bool>(@"() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+
+                const menuLike = Array.from(document.querySelectorAll('[role=""menu""], [role=""dialog""], [class*=""menu"" i], [class*=""popover"" i], [class*=""dropdown"" i]'));
+                const hasSignInInMenu = menuLike.some(container => {
+                    if (!visible(container)) return false;
+                    const text = (container.innerText || '').toLowerCase();
+                    return text.includes('sign in') || text.includes('log in') || text.includes('my assets') || text.includes('sign out');
+                });
+
+                if (hasSignInInMenu) return true;
+
+                const fallbackTexts = Array.from(document.querySelectorAll('a, button')).map(x => (x.innerText || '').trim().toLowerCase());
+                return fallbackTexts.some(t => t === 'sign in' || t.includes('sign in') || t.includes('log in'));
+            }"), "WaitForProfileMenuReady");
+
+            if (menuReady)
+            {
+                return true;
+            }
+
+            await Task.Delay(250);
+        }
+
+        return false;
+    }
+
+    private static async Task<bool> TryClickSignInFromProfileMenuAsync(IPage page)
+    {
+        return await page.EvaluateFunctionAsync<bool>(@"() => {
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+
+            const menuLike = Array.from(document.querySelectorAll('[role=""menu""], [role=""dialog""], [class*=""menu"" i], [class*=""popover"" i], [class*=""dropdown"" i]'))
+                .filter(visible);
+
+            const clickFrom = (root) => {
+                const clickableItems = Array.from(root.querySelectorAll('a, button, [role=""menuitem""]'));
+                for (const el of clickableItems) {
+                    const text = (el.innerText || '').trim().toLowerCase();
+                    if (!text) continue;
+                    if (!(text === 'sign in' || text.includes('sign in') || text.includes('log in'))) continue;
+
+                    el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    return true;
+                }
+
+                return false;
+            };
+
+            for (const container of menuLike) {
+                if (clickFrom(container)) return true;
+            }
+
+            // fallback: если контейнер не найден, пробуем только по интерактивным элементам страницы
+            const fallback = Array.from(document.querySelectorAll('a, button'));
+            for (const el of fallback) {
+                if (!visible(el)) continue;
+                const text = (el.innerText || '').trim().toLowerCase();
+                if (!(text === 'sign in' || text.includes('sign in') || text.includes('log in'))) continue;
+                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                return true;
+            }
+
+            return false;
+        }");
+    }
+
+    private async Task<bool> TryTriggerSignInFromHomeUiAsync(IPage page)
+    {
+        for (var attempt = 1; attempt <= 2; attempt++)
+        {
+            var openedProfileMenu = await TryOpenUserProfileMenuAsync(page);
+            if (!openedProfileMenu)
+            {
+                await Task.Delay(300);
+                continue;
+            }
+
+            _logger.Info("AuthStep: open-profile-menu");
+            var menuReady = await WaitForProfileMenuReadyAsync(page, TimeSpan.FromSeconds(12));
+            if (!menuReady)
+            {
+                _logger.Warn("Меню профиля открыто, но пункты не успели загрузиться. Повторяем...");
+                await Task.Delay(350);
+                continue;
+            }
+
+            var clickedSignIn = await TryClickSignInFromProfileMenuAsync(page);
+            if (clickedSignIn)
+            {
+                _logger.Info("AuthStep: click-sign-in");
+                return true;
+            }
+
+            await Task.Delay(300);
+        }
+
+        return false;
+    }
+
+    private async Task<ProfileMenuAuthState> GetProfileMenuAuthStateAsync(IPage page)
+    {
+        try
+        {
+            var raw = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<string>(@"async () => {
+                const wait = (ms) => new Promise(r => setTimeout(r, ms));
+                const profileButton = document.querySelector('[aria-label=""Open user profile menu""], button[aria-label*=""profile"" i], button[aria-label*=""user"" i]');
+                if (!profileButton) {
+                    return JSON.stringify({ profileMenuFound: false, hasSignInItem: false, hasSignedInItem: false });
+                }
+
+                profileButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                await wait(250);
+
+                const texts = Array.from(document.querySelectorAll('a, button, span, div'))
+                    .map(x => (x.innerText || '').trim().toLowerCase())
+                    .filter(Boolean);
+
+                const hasSignInItem = texts.some(t => t === 'sign in' || t.includes('sign in') || t.includes('log in'));
+                const hasSignedInItem = texts.some(t =>
+                    t.includes('my assets') ||
+                    t.includes('sign out') ||
+                    t.includes('log out') ||
+                    t.includes('account settings') ||
+                    t.includes('organization'));
+
+                return JSON.stringify({ profileMenuFound: true, hasSignInItem, hasSignedInItem });
+            }"), "GetProfileMenuAuthState");
+
+            return JsonSerializer.Deserialize<ProfileMenuAuthState>(raw ?? "{}", _runtimeJsonOptions) ?? new ProfileMenuAuthState();
+        }
+        catch
+        {
+            return new ProfileMenuAuthState();
+        }
+    }
+
+    private async Task<T> EvaluateWithRetryAsync<T>(Func<Task<T>> action, string operationName, int attempts = 3, int delayMs = 250)
+    {
+        Exception? last = null;
+        for (var i = 1; i <= attempts; i++)
+        {
+            try
+            {
+                return await action();
+            }
+            catch (Exception ex) when (IsTransientEvaluateError(ex) && i < attempts)
+            {
+                last = ex;
+                _logger.Debug($"{operationName}: transient evaluate error, retry {i}/{attempts} => {ex.Message}");
+                await Task.Delay(delayMs);
+            }
+            catch (Exception ex)
+            {
+                last = ex;
+                break;
+            }
+        }
+
+        throw new InvalidOperationException($"{operationName}: evaluate failed after retries.", last);
+    }
+
+    private static bool IsTransientEvaluateError(Exception ex)
+    {
+        var msg = ex.Message ?? string.Empty;
+        return msg.Contains("Execution context was destroyed", StringComparison.OrdinalIgnoreCase) ||
+               msg.Contains("Cannot find context with specified id", StringComparison.OrdinalIgnoreCase) ||
+               msg.Contains("Target closed", StringComparison.OrdinalIgnoreCase);
     }
 
     private void AttachPageDiagnostics(IPage page)
@@ -1184,6 +1415,13 @@ internal sealed class AuthUiMarkers
     public bool HasSignInText { get; init; }
     public bool HasSignInWithUnityText { get; init; }
     public bool HasSignInWithUnityButton { get; init; }
+}
+
+internal sealed class ProfileMenuAuthState
+{
+    public bool ProfileMenuFound { get; init; }
+    public bool HasSignInItem { get; init; }
+    public bool HasSignedInItem { get; init; }
 }
 
 internal enum AssetProcessStatus
