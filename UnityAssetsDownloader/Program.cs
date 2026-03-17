@@ -666,11 +666,37 @@ internal sealed class UnityAssetAutomationApp
         {
             if (_options.Verbose)
             {
+                if (IsKnownNoiseConsoleMessage(e.Message))
+                {
+                    return;
+                }
+
                 _logger.Debug($"BROWSER CONSOLE [{e.Message.Type}] {e.Message.Text}");
             }
         };
 
         page.PageError += (_, e) => _logger.Warn($"PAGE ERROR: {e.Message}");
+    }
+
+    private static bool IsKnownNoiseConsoleMessage(ConsoleMessage message)
+    {
+        var text = message.Text ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        return text.Contains("As of Atomic version 3.0.0", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Because analytics are disabled", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Refused to connect to 'https://s.clarity.ms/collect'", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Amplitude snippet has been loaded", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Amplitude Logger [Error]: Failed to fetch", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Amplitude Logger [Warn]", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Load failed, error in settings", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("No visitor ID available. Load may have failed", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("/api/carts 404", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("the server responded with a status of 451", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Action dispatch error analytics/interface/load/rejected", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task SafeGoToAsync(IPage page, string url)
@@ -1090,6 +1116,7 @@ internal sealed class UnityAssetAutomationApp
         AssetStatusSnapshot? lastStatus = null;
         var refreshAttempt = 0;
         var addClickAttempt = 0;
+        var nextAllowedAddClickAt = DateTime.UtcNow;
 
         while (DateTime.UtcNow < stopAt)
         {
@@ -1110,18 +1137,29 @@ internal sealed class UnityAssetAutomationApp
 
             if (current.HasAddToMyAssets)
             {
-                addClickAttempt++;
-                _logger.Debug($"Повторная попытка добавления ассета (клик Add to My Assets), попытка {addClickAttempt}...");
-
-                var clickedAdd = await TryClickAddButtonAsync(page);
-                if (clickedAdd)
+                if (DateTime.UtcNow >= nextAllowedAddClickAt)
                 {
-                    await Task.Delay(350);
-                    var accepted = await TryAcceptAddConfirmationAsync(page);
-                    if (accepted)
+                    addClickAttempt++;
+                    _logger.Debug($"Повторная попытка добавления ассета (клик Add to My Assets), попытка {addClickAttempt}...");
+
+                    var clickedAdd = await TryClickAddButtonAsync(page);
+                    if (clickedAdd)
                     {
-                        _logger.Info("Подтверждение добавления найдено во время проверки: нажата кнопка Accept.");
+                        await Task.Delay(350);
+                        var accepted = await TryAcceptAddConfirmationAsync(page);
+                        if (accepted)
+                        {
+                            _logger.Info("Подтверждение добавления найдено во время проверки: нажата кнопка Accept.");
+                        }
                     }
+
+                    // Даем UI и бэкенду время синхронизироваться, чтобы не кликать Add лишний раз.
+                    nextAllowedAddClickAt = DateTime.UtcNow.AddSeconds(5);
+                }
+                else
+                {
+                    var waitLeft = (nextAllowedAddClickAt - DateTime.UtcNow).TotalSeconds;
+                    _logger.Debug($"Кнопка Add to My Assets еще видна, но повторный клик отложен на {Math.Max(1, (int)Math.Ceiling(waitLeft))}с для стабилизации статуса.");
                 }
 
                 refreshAttempt++;
