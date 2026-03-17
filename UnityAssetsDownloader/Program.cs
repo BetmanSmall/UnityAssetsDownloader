@@ -25,7 +25,8 @@ internal sealed class UnityAssetAutomationApp
     private static readonly string[] DefaultSources =
     [
         "https://vanquish3r.github.io/greater-china-unity-assets/",
-        "https://assetstore.unity.com/top-assets/top-free"
+        "https://assetstore.unity.com/top-assets/top-free",
+        "https://assetstore.unity.com/search#nf-ec_price_filter=0...0"
     ];
 
     public UnityAssetAutomationApp(CliOptions options)
@@ -75,7 +76,7 @@ internal sealed class UnityAssetAutomationApp
             }
 
             var sources = _options.Sources.Count > 0 ? _options.Sources : DefaultSources.ToList();
-            var assetUrls = await CollectAssetUrlsAsync(sources);
+            var assetUrls = await CollectAssetUrlsAsync(page, sources);
 
             _logger.Info($"Найдено уникальных ассетов: {assetUrls.Count}");
             var report = new RunReport
@@ -741,7 +742,7 @@ internal sealed class UnityAssetAutomationApp
         _logger.Debug($"Домены cookies после входа: {string.Join(", ", serializable.Select(c => c.Domain).Where(d => !string.IsNullOrWhiteSpace(d)).Distinct(StringComparer.OrdinalIgnoreCase))}");
     }
 
-    private async Task<List<string>> CollectAssetUrlsAsync(IEnumerable<string> sourceUrls)
+    private async Task<List<string>> CollectAssetUrlsAsync(IPage page, IEnumerable<string> sourceUrls)
     {
         var all = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -750,11 +751,25 @@ internal sealed class UnityAssetAutomationApp
             try
             {
                 _logger.Info($"Чтение источника: {source}");
-                var html = await _httpClient.GetStringAsync(source);
-                foreach (var url in ExtractAssetUrlsFromHtml(html, source))
+                List<string> sourceUrlsExtracted;
+
+                if (Uri.TryCreate(source, UriKind.Absolute, out var sourceUri) &&
+                    sourceUri.Host.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
+                {
+                    sourceUrlsExtracted = await CollectAssetUrlsFromAssetStorePageAsync(page, source);
+                }
+                else
+                {
+                    var html = await _httpClient.GetStringAsync(source);
+                    sourceUrlsExtracted = ExtractAssetUrlsFromHtml(html, source).ToList();
+                }
+
+                foreach (var url in sourceUrlsExtracted)
                 {
                     all.Add(url);
                 }
+
+                _logger.Info($"Источник обработан: добавлено ссылок {sourceUrlsExtracted.Count} (после фильтра PURCHASED/You own this asset).");
             }
             catch (Exception ex)
             {
@@ -765,14 +780,132 @@ internal sealed class UnityAssetAutomationApp
         return all.ToList();
     }
 
+    private async Task<List<string>> CollectAssetUrlsFromAssetStorePageAsync(IPage page, string sourceUrl)
+    {
+        await SafeGoToAsync(page, sourceUrl);
+
+        await ScrollSourcePageAsync(page, TimeSpan.FromSeconds(20));
+
+        var raw = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<string>(@"() => {
+            const normalizeUrl = (href) => {
+                try {
+                    const u = new URL(href, window.location.origin);
+                    if (!u.hostname.includes('assetstore.unity.com')) return null;
+                    if (!u.pathname.includes('/packages/')) return null;
+                    return `${u.protocol}//${u.host}${u.pathname}`.replace(/\/+$/, '');
+                } catch {
+                    return null;
+                }
+            };
+
+            const toLower = (x) => (x || '').toLowerCase();
+            const hasOwnedSignals = (text) =>
+                text.includes('purchased') ||
+                text.includes('you own this asset') ||
+                text.includes('open in unity');
+
+            const hasAssetSignals = (text) =>
+                text.includes('add to my assets') ||
+                text.includes('open in unity') ||
+                text.includes('purchased') ||
+                text.includes('you own this asset') ||
+                text.includes('free') ||
+                text.includes('$0');
+
+            const links = Array.from(document.querySelectorAll('a[href*=""/packages/""]'));
+            const unique = new Map();
+
+            for (const link of links) {
+                const url = normalizeUrl(link.getAttribute('href') || link.href || '');
+                if (!url) continue;
+
+                const card = link.closest('article, li, [class*=""card"" i], [class*=""product"" i], [data-testid*=""product"" i], [data-testid*=""asset"" i]') || link.parentElement;
+                const cardText = toLower(card?.innerText || '');
+                const linkText = toLower(link.innerText || '');
+                const context = `${cardText}\n${linkText}`;
+
+                if (!hasAssetSignals(context)) continue;
+
+                const isOwned = hasOwnedSignals(context);
+                if (!unique.has(url)) {
+                    unique.set(url, { url, isOwned });
+                } else if (isOwned) {
+                    unique.get(url).isOwned = true;
+                }
+            }
+
+            const items = Array.from(unique.values());
+            const ownedSkipped = items.filter(x => x.isOwned).length;
+            const urls = items.filter(x => !x.isOwned).map(x => x.url);
+
+            return JSON.stringify({
+                totalFound: items.length,
+                ownedSkipped,
+                urls
+            });
+        }"), "CollectAssetUrlsFromAssetStorePage");
+
+        var parsed = JsonSerializer.Deserialize<SourceCollectionSnapshot>(raw ?? "{}", _runtimeJsonOptions) ?? new SourceCollectionSnapshot();
+        _logger.Info($"Источник Asset Store: найдено карточек={parsed.TotalFound}, пропущено как owned={parsed.OwnedSkipped}, к обработке={parsed.Urls.Count}");
+        return parsed.Urls;
+    }
+
+    private async Task ScrollSourcePageAsync(IPage page, TimeSpan timeout)
+    {
+        var stopAt = DateTime.UtcNow.Add(timeout);
+        var stableIterations = 0;
+        var lastCount = -1;
+
+        while (DateTime.UtcNow < stopAt && stableIterations < 4)
+        {
+            var currentCount = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<int>(@"() => document.querySelectorAll('a[href*=""/packages/""]').length"), "ScrollSourcePage(count)");
+
+            if (currentCount <= lastCount)
+            {
+                stableIterations++;
+            }
+            else
+            {
+                stableIterations = 0;
+                lastCount = currentCount;
+            }
+
+            await page.EvaluateFunctionAsync(@"() => window.scrollBy(0, window.innerHeight * 1.6)");
+            await Task.Delay(900);
+        }
+    }
+
     private static IEnumerable<string> ExtractAssetUrlsFromHtml(string html, string baseUrl)
     {
         var regex = new Regex(@"(?:https?:\/\/assetstore\.unity\.com)?\/packages\/[\w\-\/%\.~]+", RegexOptions.IgnoreCase);
         var baseUri = new Uri(baseUrl);
 
+        static bool HasOwnedSignalsNearUrl(string content, int index)
+        {
+            var start = Math.Max(0, index - 1400);
+            var length = Math.Min(content.Length - start, 2800);
+            if (length <= 0)
+            {
+                return false;
+            }
+
+            var context = content.Substring(start, length);
+
+            return context.Contains("You own this asset", StringComparison.OrdinalIgnoreCase) ||
+                   context.Contains(">PURCHASED<", StringComparison.OrdinalIgnoreCase) ||
+                   context.Contains("\"PURCHASED\"", StringComparison.OrdinalIgnoreCase) ||
+                   context.Contains("purchased", StringComparison.OrdinalIgnoreCase) &&
+                   context.Contains("/packages/", StringComparison.OrdinalIgnoreCase);
+        }
+
         foreach (Match match in regex.Matches(html))
         {
             if (string.IsNullOrWhiteSpace(match.Value))
+            {
+                continue;
+            }
+
+            if (HasOwnedSignalsNearUrl(html, match.Index))
             {
                 continue;
             }
@@ -1658,6 +1791,13 @@ internal sealed class ProfileMenuAuthState
     public bool ProfileMenuFound { get; init; }
     public bool HasSignInItem { get; init; }
     public bool HasSignedInItem { get; init; }
+}
+
+internal sealed class SourceCollectionSnapshot
+{
+    public int TotalFound { get; init; }
+    public int OwnedSkipped { get; init; }
+    public List<string> Urls { get; init; } = [];
 }
 
 internal enum AssetProcessStatus
