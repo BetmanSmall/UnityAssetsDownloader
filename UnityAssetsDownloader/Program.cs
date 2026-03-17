@@ -916,9 +916,11 @@ internal sealed class UnityAssetAutomationApp
                     _logger.Info("Подтверждение добавления найдено: нажата кнопка Accept.");
                 }
 
-                await Task.Delay(2200);
-                await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 12000)));
-                var postStatus = await DetectStatusAsync(page);
+                var postStatus = await VerifyPostAddStatusAsync(
+                    page,
+                    assetUrl,
+                    TimeSpan.FromMilliseconds(Math.Max(12000, Math.Min(_options.AssetUiTimeoutMs, 45000))));
+
                 result.PurchasedOnText = postStatus.PurchasedOnText ?? result.PurchasedOnText;
                 result.DetectionSummary = string.IsNullOrWhiteSpace(postStatus.DetectionSummary) ? "no-signals" : postStatus.DetectionSummary;
                 _logger.Debug($"Статус ассета (после клика): {postStatus.DetectionSummary}");
@@ -947,6 +949,51 @@ internal sealed class UnityAssetAutomationApp
             await SaveErrorScreenshotAsync(page, "processing-error");
             return result;
         }
+    }
+
+    private async Task<AssetStatusSnapshot> VerifyPostAddStatusAsync(IPage page, string assetUrl, TimeSpan timeout)
+    {
+        var stopAt = DateTime.UtcNow.Add(timeout);
+        AssetStatusSnapshot? lastStatus = null;
+        var refreshAttempt = 0;
+
+        while (DateTime.UtcNow < stopAt)
+        {
+            var accepted = await TryAcceptAddConfirmationAsync(page);
+            if (accepted)
+            {
+                _logger.Info("Подтверждение добавления найдено во время проверки: нажата кнопка Accept.");
+            }
+
+            await Task.Delay(1200);
+            await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 12000)));
+            var current = await DetectStatusAsync(page);
+            lastStatus = current;
+
+            if (current.RequiresLogin || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+            {
+                return current;
+            }
+
+            if (current.HasOpenInUnity || current.IsOwned)
+            {
+                return current;
+            }
+
+            if (current.HasAddToMyAssets)
+            {
+                refreshAttempt++;
+                _logger.Debug($"После добавления кнопка Add to My Assets все еще видна. Обновляем страницу ассета (попытка {refreshAttempt})...");
+                await SafeGoToAsync(page, assetUrl);
+                await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 15000)));
+            }
+            else
+            {
+                await Task.Delay(800);
+            }
+        }
+
+        return lastStatus ?? await DetectStatusAsync(page);
     }
 
     private async Task<AssetStatusSnapshot> DetectStatusAsync(IPage page)
@@ -1001,9 +1048,8 @@ internal sealed class UnityAssetAutomationApp
 
             const hasOpenInUnity = actionTexts.some(t => t.includes('open in unity'));
             const hasAddToMyAssets = actionTexts.some(t => t.includes('add to my assets'));
-            const hasBuySignals = actionTexts.some(t =>
-                t.includes('buy now') ||
-                (t.includes('add to cart') && !t.includes('free')));
+            const hasBuyNow = actionTexts.some(t => t.includes('buy now'));
+            const hasAddToCart = actionTexts.some(t => t.includes('add to cart'));
             const hasOwnedSignals = actionTexts.some(t =>
                 t.includes('owned') ||
                 t.includes('in my assets') ||
@@ -1014,11 +1060,11 @@ internal sealed class UnityAssetAutomationApp
 
             const hasSignInSignals = actionTexts.some(t =>
                 t === 'sign in' || t === 'log in' || t.includes('sign in to') || t.includes('log in to')) ||
-                normalized.includes('sign in') ||
                 ctaCombined.includes('sign in with unity');
 
             const hasFreeSignals = hasAddToMyAssets ||
                 actionTexts.some(t => t.includes('free') || t.includes('$0') || t.includes('0.00'));
+            const hasBuySignals = hasBuyNow || (hasAddToCart && !hasAddToMyAssets && !hasFreeSignals);
             const hasPaidSignals = hasBuySignals;
 
             const isOwned = hasOpenInUnity || hasOwnedSignals || !!purchasedOnText;
