@@ -71,6 +71,20 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- [па
 
 ## 4. Быстрый старт
 
+### 4.0 Универсальный запуск через `run.bat` (рекомендуется для Windows)
+
+В корне проекта есть `run.bat` с интерактивным меню.
+Первый пункт — самый простой запуск по умолчанию:
+- `--headless false --verbose`
+
+Запуск:
+
+```bat
+.\run.bat
+```
+
+Примечание для PowerShell: запуск из текущей папки выполняйте именно через `./` или `.\`.
+
 ### 4.1 Только вход и сохранение cookies (ручной)
 
 ```powershell
