@@ -21,8 +21,25 @@ internal sealed class UnityAssetAutomationApp
     private readonly string _dataDirectory = Path.Combine(AppContext.BaseDirectory, "data");
     private readonly string _logsDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
     private readonly string _cookiesPath;
+    private readonly string _sessionStatePath;
     private readonly string _reportPath;
     private readonly HttpClient _httpClient = new();
+    private DateTime? _lastFullAuthAttemptUtc;
+
+    private static readonly TimeSpan FullAuthCooldown = TimeSpan.FromSeconds(25);
+    private static readonly string[] SessionOrigins =
+    [
+        "https://assetstore.unity.com",
+        "https://login.unity.com",
+        "https://api.unity.com",
+        "https://cloud.unity.com"
+    ];
+
+    private static readonly string[] LocalStorageOrigins =
+    [
+        "https://assetstore.unity.com",
+        "https://login.unity.com"
+    ];
 
     private static readonly string[] ExtendedSources =
     [
@@ -86,6 +103,7 @@ internal sealed class UnityAssetAutomationApp
     {
         _options = options;
         _cookiesPath = Path.Combine(_dataDirectory, "unity_cookies.json");
+        _sessionStatePath = Path.Combine(_dataDirectory, "unity_session_state.json");
         _reportPath = Path.Combine(_logsDirectory, $"run-report-{DateTime.Now:yyyyMMdd-HHmmss}.json");
         var logFilePath = string.IsNullOrWhiteSpace(options.LogFilePath)
             ? Path.Combine(_logsDirectory, $"run-log-{DateTime.Now:yyyyMMdd-HHmmss}.log")
@@ -197,17 +215,59 @@ internal sealed class UnityAssetAutomationApp
 
     private async Task<bool> EnsureAuthenticatedAsync(IPage page)
     {
-        if (await TryLoadCookiesAsync(page))
+        if (await TryLoadSessionStateAsync(page))
         {
-            _logger.Info("Cookies загружены, проверка авторизации...");
-            if (await IsAuthenticatedAsync(page))
+            _logger.Info("Состояние сессии загружено (cookies + localStorage), проверка авторизации...");
+            if (await TryCheckAuthFastAsync(page, "restored-state"))
             {
-                _logger.Info("Сессия активна.");
+                var stable = await ValidateSessionForAssetStoreAsync(page, "restored-state");
+                if (stable)
+                {
+                    _logger.Info("Сессия активна.");
+                    return true;
+                }
+
+                _logger.Warn("Восстановленная сессия нестабильна для Asset Store. Требуется повторная авторизация.");
+            }
+        }
+
+        if (await TryCheckAuthFastAsync(page, "current-page"))
+        {
+            var stable = await ValidateSessionForAssetStoreAsync(page, "current-page");
+            if (stable)
+            {
+                _logger.Info("Сессия уже активна на текущей странице.");
+                await SaveSessionStateAsync(page);
                 return true;
             }
         }
 
+        _logger.Info("Быстрая проверка не подтвердила сессию. Выполняем одну контрольную навигацию на Asset Store...");
+        await SafeGoToAsync(page, AssetStoreHomeUrl);
+        if (await TryCheckAuthFastAsync(page, "home-check"))
+        {
+            var stable = await ValidateSessionForAssetStoreAsync(page, "home-check");
+            if (stable)
+            {
+                _logger.Info("Сессия подтверждена после контрольной навигации.");
+                await SaveSessionStateAsync(page);
+                return true;
+            }
+        }
+
+        if (_lastFullAuthAttemptUtc.HasValue)
+        {
+            var elapsed = DateTime.UtcNow - _lastFullAuthAttemptUtc.Value;
+            if (elapsed < FullAuthCooldown)
+            {
+                var waitLeft = (int)Math.Ceiling((FullAuthCooldown - elapsed).TotalSeconds);
+                _logger.Warn($"Полный SSO-вход запрашивается слишком часто. Выжидаем cooldown: {Math.Max(1, waitLeft)}с...");
+                await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, waitLeft)));
+            }
+        }
+
         _logger.Warn("Требуется вход в Unity. Запуск SSO через Asset Store...");
+        _lastFullAuthAttemptUtc = DateTime.UtcNow;
         var authenticated = await AuthenticateViaAssetStoreAsync(page);
         if (!authenticated)
         {
@@ -215,9 +275,74 @@ internal sealed class UnityAssetAutomationApp
             return false;
         }
 
-        await SaveCookiesAsync(page);
-        _logger.Info("Авторизация подтверждена, cookies сохранены.");
+        await SaveSessionStateAsync(page);
+        _logger.Info("Авторизация подтверждена, состояние сессии сохранено.");
         return true;
+    }
+
+    private async Task<bool> ValidateSessionForAssetStoreAsync(IPage page, string stage)
+    {
+        try
+        {
+            _logger.Debug($"AuthProbe[{stage}]: проверка стабильности сессии на {BaseTopFreeSource}");
+            await SafeGoToAsync(page, BaseTopFreeSource);
+            await WaitForDocumentReadySoftAsync(page, TimeSpan.FromSeconds(6));
+
+            if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase) || IsLikelySignOutFlowUrl(page.Url))
+            {
+                _logger.Warn($"AuthProbe[{stage}]: редирект в login/logout ({page.Url}).");
+                return false;
+            }
+
+            if (!await TryCheckAuthFastAsync(page, $"{stage}-probe"))
+            {
+                _logger.Warn($"AuthProbe[{stage}]: auth markers не подтверждены на боевой странице.");
+                return false;
+            }
+
+            for (var i = 0; i < 6; i++)
+            {
+                await Task.Delay(400);
+                if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase) || IsLikelySignOutFlowUrl(page.Url))
+                {
+                    _logger.Warn($"AuthProbe[{stage}]: во время стабилизации пойман logout/login ({page.Url}).");
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"AuthProbe[{stage}] не выполнен: {ex.Message}");
+            return false;
+        }
+    }
+
+    private async Task<bool> TryCheckAuthFastAsync(IPage page, string stage)
+    {
+        for (var i = 1; i <= 3; i++)
+        {
+            if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.Debug($"AuthFast[{stage}] итерация {i}: на login.unity.com, сессия не подтверждена.");
+                return false;
+            }
+
+            if (page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
+            {
+                await WaitForDocumentReadySoftAsync(page, TimeSpan.FromSeconds(4));
+                if (await HasAuthMarkersAsync(page))
+                {
+                    _logger.Debug($"AuthFast[{stage}] итерация {i}: auth markers подтверждены.");
+                    return true;
+                }
+            }
+
+            await Task.Delay(650);
+        }
+
+        return false;
     }
 
     private async Task<bool> AuthenticateViaAssetStoreAsync(IPage page)
@@ -289,12 +414,10 @@ internal sealed class UnityAssetAutomationApp
     private async Task<bool> WaitForAuthenticatedSessionAsync(IPage page, TimeSpan timeout)
     {
         var stopAt = DateTime.UtcNow.Add(timeout);
-        var iteration = 0;
+        var redirectedToAssetStore = false;
 
         while (DateTime.UtcNow < stopAt)
         {
-            iteration++;
-
             if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
             {
                 await TrySwitchToSignInPageAsync(page);
@@ -309,6 +432,7 @@ internal sealed class UnityAssetAutomationApp
 
             if (page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
             {
+                redirectedToAssetStore = false;
                 if (await HasAuthMarkersAsync(page))
                 {
                     _logger.Info("AuthStep: auth-confirmed");
@@ -324,14 +448,11 @@ internal sealed class UnityAssetAutomationApp
                     }
                 }
             }
-            else if (page.Url.Contains("cloud.unity.com", StringComparison.OrdinalIgnoreCase) && iteration % 2 == 0)
+            else if (!redirectedToAssetStore)
             {
-                _logger.Debug("Обнаружен cloud.unity.com, возвращаемся в Asset Store для завершения SSO...");
-                await StartAssetStoreSsoAsync(page);
-            }
-            else if (!page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase) && iteration % 3 == 0)
-            {
+                _logger.Debug($"AuthWait: сторонний URL '{page.Url}'. Возвращаемся в Asset Store для проверки статуса...");
                 await SafeGoToAsync(page, AssetStoreHomeUrl);
+                redirectedToAssetStore = true;
             }
 
             await Task.Delay(1500);
@@ -414,7 +535,9 @@ internal sealed class UnityAssetAutomationApp
             return false;
         }
 
-        var rawMarkers = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<string>(@"() => {
+        try
+        {
+            var rawMarkers = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<string>(@"() => {
             const text = document.body?.innerText?.toLowerCase() || '';
             const hasMyAssetsLink = !!document.querySelector('a[href*=""/my-assets""], a[href*=""my-assets""]');
             const hasSignInLink = !!document.querySelector('a[href*=""login.unity.com""], a[href*=""/sign-in""]');
@@ -434,16 +557,16 @@ internal sealed class UnityAssetAutomationApp
             });
         }"), "HasAuthMarkers(rawMarkers)");
 
-        var markers = JsonSerializer.Deserialize<AuthUiMarkers>(rawMarkers ?? "{}", _runtimeJsonOptions) ?? new AuthUiMarkers();
-        var hasUiAuthMarkers = (markers.HasMyAssetsLink || markers.HasMyAssetsText) &&
-                               !(markers.HasSignInLink && markers.HasSignInText && !markers.HasMyAssetsText);
-        var hasUiSignInMarkers = markers.HasSignInLink || markers.HasSignInText || markers.HasSignInWithUnityText || markers.HasSignInWithUnityButton;
-        var profileState = await GetProfileMenuAuthStateAsync(page);
+            var markers = JsonSerializer.Deserialize<AuthUiMarkers>(rawMarkers ?? "{}", _runtimeJsonOptions) ?? new AuthUiMarkers();
+            var hasUiAuthMarkers = (markers.HasMyAssetsLink || markers.HasMyAssetsText) &&
+                                   !(markers.HasSignInLink && markers.HasSignInText && !markers.HasMyAssetsText);
+            var hasUiSignInMarkers = markers.HasSignInLink || markers.HasSignInText || markers.HasSignInWithUnityText || markers.HasSignInWithUnityButton;
+            var profileState = await GetProfileMenuAuthStateAsync(page);
 
-        var hasApiAuthMarkers = false;
-        if (page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
-        {
-            hasApiAuthMarkers = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<bool>(@"async () => {
+            var hasApiAuthMarkers = false;
+            if (page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
+            {
+                hasApiAuthMarkers = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<bool>(@"async () => {
                 try {
                     const res = await fetch('/api/users/organizations', { credentials: 'include' });
                     if (!res.ok) return false;
@@ -460,21 +583,32 @@ internal sealed class UnityAssetAutomationApp
                     return false;
                 }
             }"), "HasAuthMarkers(api)");
+            }
+
+            _logger.Debug($"Auth markers: UI={hasUiAuthMarkers}, API={hasApiAuthMarkers}, signInUi={hasUiSignInMarkers}, profileMenuFound={profileState.ProfileMenuFound}, profileMenuSignIn={profileState.HasSignInItem}, profileMenuSignedIn={profileState.HasSignedInItem}, page={page.Url}, myAssetsLink={markers.HasMyAssetsLink}, myAssetsText={markers.HasMyAssetsText}, signInLink={markers.HasSignInLink}, signInText={markers.HasSignInText}, signInWithUnityText={markers.HasSignInWithUnityText}, signInWithUnityButton={markers.HasSignInWithUnityButton}");
+
+            if (profileState.HasSignedInItem)
+            {
+                return true;
+            }
+
+            if (profileState.ProfileMenuFound && profileState.HasSignInItem && !profileState.HasSignedInItem)
+            {
+                return false;
+            }
+
+            if (hasUiSignInMarkers)
+            {
+                return false;
+            }
+
+            return hasApiAuthMarkers || hasUiAuthMarkers;
         }
-
-        _logger.Debug($"Auth markers: UI={hasUiAuthMarkers}, API={hasApiAuthMarkers}, signInUi={hasUiSignInMarkers}, profileMenuFound={profileState.ProfileMenuFound}, profileMenuSignIn={profileState.HasSignInItem}, profileMenuSignedIn={profileState.HasSignedInItem}, page={page.Url}, myAssetsLink={markers.HasMyAssetsLink}, myAssetsText={markers.HasMyAssetsText}, signInLink={markers.HasSignInLink}, signInText={markers.HasSignInText}, signInWithUnityText={markers.HasSignInWithUnityText}, signInWithUnityButton={markers.HasSignInWithUnityButton}");
-
-        if (profileState.HasSignInItem)
+        catch (Exception ex)
         {
+            _logger.Debug($"HasAuthMarkers: ошибка проверки авторизации ({ex.Message}). Считаем сессию невалидной.");
             return false;
         }
-
-        if (profileState.HasSignedInItem)
-        {
-            return true;
-        }
-
-        return !hasUiSignInMarkers && hasUiAuthMarkers;
     }
 
     private static async Task<bool> TryOpenUserProfileMenuAsync(IPage page)
@@ -609,17 +743,40 @@ internal sealed class UnityAssetAutomationApp
         {
             var raw = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<string>(@"async () => {
                 const wait = (ms) => new Promise(r => setTimeout(r, ms));
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+
                 const profileButton = document.querySelector('[aria-label=""Open user profile menu""], button[aria-label*=""profile"" i], button[aria-label*=""user"" i]');
                 if (!profileButton) {
                     return JSON.stringify({ profileMenuFound: false, hasSignInItem: false, hasSignedInItem: false });
                 }
 
                 profileButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                await wait(250);
+                await wait(350);
 
-                const texts = Array.from(document.querySelectorAll('a, button, span, div'))
+                const menuLike = Array.from(document.querySelectorAll('[role=""menu""], [role=""dialog""], [class*=""menu"" i], [class*=""popover"" i], [class*=""dropdown"" i], [class*=""account"" i]'))
+                    .filter(visible)
+                    .filter(x => {
+                        const text = (x.innerText || '').toLowerCase();
+                        return text.includes('sign in') || text.includes('log in') || text.includes('my assets') || text.includes('sign out') || text.includes('log out') || text.includes('account settings');
+                    });
+
+                if (menuLike.length === 0) {
+                    return JSON.stringify({ profileMenuFound: false, hasSignInItem: false, hasSignedInItem: false });
+                }
+
+                const roots = menuLike;
+
+                const texts = roots
+                    .flatMap(root => Array.from(root.querySelectorAll('a, button, [role=""menuitem""], [role=""button""]')))
+                    .filter(visible)
                     .map(x => (x.innerText || '').trim().toLowerCase())
-                    .filter(Boolean);
+                    .filter(Boolean)
+                    .filter(x => x.length <= 120);
 
                 const hasSignInItem = texts.some(t => t === 'sign in' || t.includes('sign in') || t.includes('log in'));
                 const hasSignedInItem = texts.some(t =>
@@ -653,7 +810,9 @@ internal sealed class UnityAssetAutomationApp
             {
                 last = ex;
                 _logger.Debug($"{operationName}: transient evaluate error, retry {i}/{attempts} => {ex.Message}");
-                await Task.Delay(delayMs);
+
+                var backoff = delayMs + (int)Math.Pow(i, 2) * 180;
+                await Task.Delay(backoff);
             }
             catch (Exception ex)
             {
@@ -670,7 +829,40 @@ internal sealed class UnityAssetAutomationApp
         var msg = ex.Message ?? string.Empty;
         return msg.Contains("Execution context was destroyed", StringComparison.OrdinalIgnoreCase) ||
                msg.Contains("Cannot find context with specified id", StringComparison.OrdinalIgnoreCase) ||
-               msg.Contains("Target closed", StringComparison.OrdinalIgnoreCase);
+               msg.Contains("Target closed", StringComparison.OrdinalIgnoreCase) ||
+               msg.Contains("Cannot find object with id", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task WaitForDocumentReadySoftAsync(IPage page, TimeSpan timeout)
+    {
+        var stopAt = DateTime.UtcNow.Add(timeout);
+        while (DateTime.UtcNow < stopAt)
+        {
+            if (page.IsClosed)
+            {
+                return;
+            }
+
+            try
+            {
+                var ready = await EvaluateWithRetryAsync(
+                    () => page.EvaluateFunctionAsync<bool>("() => ['interactive','complete'].includes(document.readyState)"),
+                    "WaitForDocumentReadySoft",
+                    attempts: 2,
+                    delayMs: 180);
+
+                if (ready)
+                {
+                    return;
+                }
+            }
+            catch
+            {
+                // мягкое ожидание, игнорируем единичные ошибки
+            }
+
+            await Task.Delay(120);
+        }
     }
 
     private void AttachPageDiagnostics(IPage page)
@@ -812,6 +1004,137 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
+    private async Task<bool> TryLoadSessionStateAsync(IPage page)
+    {
+        if (File.Exists(_sessionStatePath))
+        {
+            try
+            {
+                var raw = await File.ReadAllTextAsync(_sessionStatePath);
+                var state = JsonSerializer.Deserialize<SessionStateSnapshot>(raw, _runtimeJsonOptions) ?? new SessionStateSnapshot();
+                if (state.Cookies.Count > 0)
+                {
+                    await page.SetCookieAsync(state.Cookies.Select(c => c.ToCookieParam()).ToArray());
+                    _logger.Info($"Загружено cookies из session state: {state.Cookies.Count}");
+                }
+
+                if (state.LocalStorageByOrigin.Count > 0)
+                {
+                    foreach (var origin in LocalStorageOrigins)
+                    {
+                        if (!state.LocalStorageByOrigin.TryGetValue(origin, out var storage) || storage.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        await RestoreLocalStorageInIsolatedPageAsync(page, origin, storage);
+                    }
+
+                    await SafeGoToAsync(page, AssetStoreHomeUrl);
+                }
+
+                _logger.Info("Session state успешно восстановлен.");
+                return state.Cookies.Count > 0 || state.LocalStorageByOrigin.Count > 0;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"Не удалось восстановить session state: {ex.Message}");
+            }
+        }
+
+        return await TryLoadCookiesAsync(page);
+    }
+
+    private async Task SaveSessionStateAsync(IPage page)
+    {
+        var state = new SessionStateSnapshot
+        {
+            SavedAtUtc = DateTime.UtcNow
+        };
+
+        var cookies = await page.GetCookiesAsync(SessionOrigins);
+        state.Cookies = cookies.Select(SerializableCookie.FromCookie).ToList();
+
+        foreach (var origin in LocalStorageOrigins)
+        {
+            try
+            {
+                var localStorage = await CaptureLocalStorageInIsolatedPageAsync(page, origin);
+                if (localStorage.Count > 0)
+                {
+                    state.LocalStorageByOrigin[origin] = localStorage;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug($"Не удалось сохранить localStorage для {origin}: {ex.Message}");
+            }
+        }
+
+        await File.WriteAllTextAsync(_sessionStatePath, JsonSerializer.Serialize(state, _jsonOptions));
+
+        await File.WriteAllTextAsync(_cookiesPath, JsonSerializer.Serialize(state.Cookies, _jsonOptions));
+        _logger.Info($"Сохранено состояние сессии: cookies={state.Cookies.Count}, originsLocalStorage={state.LocalStorageByOrigin.Count}");
+    }
+
+    private async Task<Dictionary<string, string>> CaptureLocalStorageForOriginAsync(IPage page, string origin)
+    {
+        var raw = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<string>(@"(expectedOrigin) => {
+            const actual = window.location.origin;
+            if (actual !== expectedOrigin) {
+                return JSON.stringify({});
+            }
+
+            const result = {};
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (!key) continue;
+                result[key] = localStorage.getItem(key) ?? '';
+            }
+            return JSON.stringify(result);
+        }", origin), $"CaptureLocalStorage[{origin}]");
+
+        return JsonSerializer.Deserialize<Dictionary<string, string>>(raw ?? "{}", _runtimeJsonOptions)
+               ?? new Dictionary<string, string>(StringComparer.Ordinal);
+    }
+
+    private async Task<Dictionary<string, string>> CaptureLocalStorageInIsolatedPageAsync(IPage anchorPage, string origin)
+    {
+        await using var tempPage = await anchorPage.Browser.NewPageAsync();
+        tempPage.DefaultNavigationTimeout = _options.NavigationTimeoutMs;
+        tempPage.DefaultTimeout = _options.NavigationTimeoutMs;
+
+        await SafeGoToAsync(tempPage, origin);
+        await WaitForDocumentReadySoftAsync(tempPage, TimeSpan.FromSeconds(6));
+        return await CaptureLocalStorageForOriginAsync(tempPage, origin);
+    }
+
+    private async Task RestoreLocalStorageForOriginAsync(IPage page, string origin, Dictionary<string, string> values)
+    {
+        await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<bool>(@"(expectedOrigin, source) => {
+            const actual = window.location.origin;
+            if (actual !== expectedOrigin) {
+                return false;
+            }
+
+            for (const key of Object.keys(source || {})) {
+                localStorage.setItem(key, source[key] ?? '');
+            }
+            return true;
+        }", origin, values), $"RestoreLocalStorage[{origin}]");
+    }
+
+    private async Task RestoreLocalStorageInIsolatedPageAsync(IPage anchorPage, string origin, Dictionary<string, string> values)
+    {
+        await using var tempPage = await anchorPage.Browser.NewPageAsync();
+        tempPage.DefaultNavigationTimeout = _options.NavigationTimeoutMs;
+        tempPage.DefaultTimeout = _options.NavigationTimeoutMs;
+
+        await SafeGoToAsync(tempPage, origin);
+        await WaitForDocumentReadySoftAsync(tempPage, TimeSpan.FromSeconds(6));
+        await RestoreLocalStorageForOriginAsync(tempPage, origin, values);
+    }
+
     private async Task SaveCookiesAsync(IPage page)
     {
         var cookies = await page.GetCookiesAsync("https://assetstore.unity.com", "https://login.unity.com");
@@ -937,11 +1260,40 @@ internal sealed class UnityAssetAutomationApp
 
     private async Task<List<string>> CollectAssetUrlsFromAssetStorePageAsync(IPage page, string sourceUrl)
     {
-        await SafeGoToAsync(page, sourceUrl);
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            await SafeGoToAsync(page, sourceUrl);
+            await WaitForDocumentReadySoftAsync(page, TimeSpan.FromSeconds(8));
 
-        await ScrollSourcePageAsync(page, TimeSpan.FromSeconds(20));
+            if (IsLikelySignOutFlowUrl(page.Url) || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.Warn($"Источник {sourceUrl}: обнаружен редирект в logout/login ({page.Url}). Выполняем переавторизацию, попытка {attempt}/3...");
+                var authOk = await EnsureAuthenticatedAsync(page);
+                if (!authOk)
+                {
+                    _logger.Warn($"Источник {sourceUrl}: переавторизация не удалась.");
+                    return [];
+                }
 
-        var raw = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<string>(@"() => {
+                continue;
+            }
+
+            await ScrollSourcePageAsync(page, TimeSpan.FromSeconds(20));
+
+            if (IsLikelySignOutFlowUrl(page.Url) || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.Warn($"Источник {sourceUrl}: во время скролла произошел редирект в logout/login ({page.Url}). Повторяем источник...");
+                var authOk = await EnsureAuthenticatedAsync(page);
+                if (!authOk)
+                {
+                    _logger.Warn($"Источник {sourceUrl}: переавторизация после logout-flow не удалась.");
+                    return [];
+                }
+
+                continue;
+            }
+
+            var raw = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<string>(@"() => {
             const normalizeUrl = (href) => {
                 try {
                     const u = new URL(href, window.location.origin);
@@ -1000,9 +1352,32 @@ internal sealed class UnityAssetAutomationApp
             });
         }"), "CollectAssetUrlsFromAssetStorePage");
 
-        var parsed = JsonSerializer.Deserialize<SourceCollectionSnapshot>(raw ?? "{}", _runtimeJsonOptions) ?? new SourceCollectionSnapshot();
-        _logger.Info($"Источник Asset Store: найдено карточек={parsed.TotalFound}, пропущено как owned={parsed.OwnedSkipped}, к обработке={parsed.Urls.Count}");
-        return parsed.Urls;
+            var parsed = JsonSerializer.Deserialize<SourceCollectionSnapshot>(raw ?? "{}", _runtimeJsonOptions) ?? new SourceCollectionSnapshot();
+            _logger.Info($"Источник Asset Store: найдено карточек={parsed.TotalFound}, пропущено как owned={parsed.OwnedSkipped}, к обработке={parsed.Urls.Count}");
+
+            if (parsed.TotalFound == 0 && attempt < 3)
+            {
+                _logger.Warn($"Источник {sourceUrl}: карточки не обнаружены (0). Повторяем чтение источника ({attempt}/3)...");
+                await Task.Delay(1200);
+                continue;
+            }
+
+            return parsed.Urls;
+        }
+
+        _logger.Warn($"Источник {sourceUrl}: не удалось стабильно собрать карточки после повторов.");
+        return [];
+    }
+
+    private static bool IsLikelySignOutFlowUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return false;
+        }
+
+        return url.Contains("/oauth2/end-session", StringComparison.OrdinalIgnoreCase) ||
+               url.Contains("post_logout_redirect_uri", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task ScrollSourcePageAsync(IPage page, TimeSpan timeout)
@@ -1013,6 +1388,12 @@ internal sealed class UnityAssetAutomationApp
 
         while (DateTime.UtcNow < stopAt && stableIterations < 4)
         {
+            if (IsLikelySignOutFlowUrl(page.Url) || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.Debug($"ScrollSourcePage: обнаружен logout/login URL ({page.Url}), досрочно останавливаем скролл.");
+                return;
+            }
+
             var currentCount = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<int>(@"() => document.querySelectorAll('a[href*=""/packages/""]').length"), "ScrollSourcePage(count)");
 
             if (currentCount <= lastCount)
@@ -1025,7 +1406,9 @@ internal sealed class UnityAssetAutomationApp
                 lastCount = currentCount;
             }
 
-            await page.EvaluateFunctionAsync(@"() => window.scrollBy(0, window.innerHeight * 1.6)");
+            await EvaluateWithRetryAsync(
+                () => page.EvaluateFunctionAsync<int>(@"() => { window.scrollBy(0, window.innerHeight * 1.6); return document.querySelectorAll(""a[href*='/packages/']"").length; }"),
+                "ScrollSourcePage(scroll)");
             await Task.Delay(900);
         }
     }
@@ -2103,6 +2486,13 @@ internal sealed class SerializableCookie
         Secure = Secure,
         SameSite = SameSite
     };
+}
+
+internal sealed class SessionStateSnapshot
+{
+    public DateTime SavedAtUtc { get; set; }
+    public List<SerializableCookie> Cookies { get; set; } = [];
+    public Dictionary<string, Dictionary<string, string>> LocalStorageByOrigin { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
 internal sealed class RunReport
