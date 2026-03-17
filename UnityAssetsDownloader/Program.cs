@@ -826,6 +826,19 @@ internal sealed class UnityAssetAutomationApp
                 result.PurchasedOnText = status.PurchasedOnText;
                 result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary) ? "no-signals" : status.DetectionSummary;
 
+                if (!status.HasAddToMyAssets && !status.HasOpenInUnity && !status.RequiresLogin)
+                {
+                    _logger.Debug("Не найдены ключевые CTA-сигналы (Add/Open/SignIn). Выполняем расширенное ожидание и повторную детекцию...");
+                    await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Max(_options.AssetUiTimeoutMs, 45000)));
+
+                    status = await DetectStatusAsync(page);
+                    result.DetectedFree = status.IsFree;
+                    result.DetectedOwned = status.IsOwned;
+                    result.CountsTowardsAddLimit = status.IsFree;
+                    result.PurchasedOnText = status.PurchasedOnText;
+                    result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary) ? "no-signals" : status.DetectionSummary;
+                }
+
                 _logger.Debug($"Статус ассета (до действия): {status.DetectionSummary}");
 
                 var needsReAuth = page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase) ||
@@ -846,6 +859,14 @@ internal sealed class UnityAssetAutomationApp
                     await SafeGoToAsync(page, assetUrl);
                     await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(_options.AssetUiTimeoutMs));
                     status = await DetectStatusAsync(page);
+
+                    if (!status.HasAddToMyAssets && !status.HasOpenInUnity && !status.RequiresLogin)
+                    {
+                        _logger.Debug("После переавторизации CTA-сигналы все еще не готовы. Выполняем расширенное ожидание и повторную детекцию...");
+                        await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Max(_options.AssetUiTimeoutMs, 45000)));
+                        status = await DetectStatusAsync(page);
+                    }
+
                     result.DetectedFree = status.IsFree;
                     result.DetectedOwned = status.IsOwned;
                     result.CountsTowardsAddLimit = status.IsFree;
@@ -930,12 +951,53 @@ internal sealed class UnityAssetAutomationApp
 
     private async Task<AssetStatusSnapshot> DetectStatusAsync(IPage page)
     {
-        var raw = await page.EvaluateFunctionAsync<string>(@"() => {
+        var raw = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<string>(@"() => {
+            const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+
             const bodyText = document.body?.innerText || '';
-            const normalized = bodyText.toLowerCase();
-            const actionTexts = Array.from(document.querySelectorAll('button, a, span'))
-                .map(x => (x.innerText || '').trim().toLowerCase())
-                .filter(Boolean);
+            const ctaRoots = Array.from(document.querySelectorAll(
+                '[data-testid*=""cta"" i], [class*=""cta"" i], [class*=""purchase"" i], [class*=""buy"" i], aside[class*=""sidebar"" i], div[class*=""sidebar"" i]'
+            )).filter(visible);
+
+            const extractTexts = (root) => Array.from(root.querySelectorAll('button, a, [role=""button""]'))
+                .filter(visible)
+                .map(x => normalize(x.innerText))
+                .filter(Boolean)
+                .filter(t => t.length <= 80);
+
+            let actionTexts = ctaRoots.flatMap(extractTexts);
+            if (actionTexts.length === 0) {
+                actionTexts = Array.from(document.querySelectorAll('button, a, [role=""button""]'))
+                    .filter(visible)
+                    .map(x => normalize(x.innerText))
+                    .filter(Boolean)
+                    .filter(t => t.length <= 80);
+            }
+
+            const isLikelyAction = (t) =>
+                t.includes('add to my assets') ||
+                t.includes('open in unity') ||
+                t.includes('buy now') ||
+                t.includes('add to cart') ||
+                t === 'sign in' ||
+                t === 'log in' ||
+                t.includes('sign in to') ||
+                t.includes('log in to') ||
+                t.includes('owned') ||
+                t.includes('in my assets') ||
+                t.includes('already owned') ||
+                t.includes('already in your assets') ||
+                t.includes('free');
+
+            actionTexts = actionTexts.filter(isLikelyAction);
+            actionTexts = Array.from(new Set(actionTexts));
+            const ctaCombined = actionTexts.join(' | ');
 
             const hasOpenInUnity = actionTexts.some(t => t.includes('open in unity'));
             const hasAddToMyAssets = actionTexts.some(t => t.includes('add to my assets'));
@@ -945,7 +1007,7 @@ internal sealed class UnityAssetAutomationApp
             const hasOwnedSignals = actionTexts.some(t =>
                 t.includes('owned') ||
                 t.includes('in my assets') ||
-                t.includes('download'));
+                t.includes('already in your assets'));
 
             const purchaseMatch = bodyText.match(/you purchased this item on\s+([^\n\r]+)/i);
             const purchasedOnText = purchaseMatch?.[1]?.trim() || null;
@@ -953,11 +1015,11 @@ internal sealed class UnityAssetAutomationApp
             const hasSignInSignals = actionTexts.some(t =>
                 t === 'sign in' || t === 'log in' || t.includes('sign in to') || t.includes('log in to')) ||
                 normalized.includes('sign in') ||
-                normalized.includes('log in to add') ||
-                normalized.includes('sign in to add');
+                ctaCombined.includes('sign in with unity');
 
-            const hasFreeSignals = hasAddToMyAssets || normalized.includes('free') || normalized.includes('0.00');
-            const hasPaidSignals = /\$\s?\d|€\s?\d|£\s?\d|\b\d+[\.,]?\d*\s?(usd|eur|gbp)\b/.test(normalized) || hasBuySignals;
+            const hasFreeSignals = hasAddToMyAssets ||
+                actionTexts.some(t => t.includes('free') || t.includes('$0') || t.includes('0.00'));
+            const hasPaidSignals = hasBuySignals;
 
             const isOwned = hasOpenInUnity || hasOwnedSignals || !!purchasedOnText;
             const isFree = (hasAddToMyAssets || hasFreeSignals) && !hasPaidSignals;
@@ -970,7 +1032,8 @@ internal sealed class UnityAssetAutomationApp
                 `buySignals=${hasBuySignals}`,
                 `paidSignals=${hasPaidSignals}`,
                 `loginSignals=${hasSignInSignals}`,
-                `purchasedOn=${purchasedOnText ? 'yes' : 'no'}`
+                `purchasedOn=${purchasedOnText ? 'yes' : 'no'}`,
+                `ctaButtons=[${actionTexts.join(' || ')}]`
             ].join(', ');
 
             return JSON.stringify({
@@ -982,7 +1045,7 @@ internal sealed class UnityAssetAutomationApp
                 purchasedOnText,
                 detectionSummary
             });
-        }");
+        }"), "DetectStatus");
 
         return JsonSerializer.Deserialize<AssetStatusSnapshot>(raw ?? "{}", _runtimeJsonOptions) ?? new AssetStatusSnapshot();
     }
@@ -997,27 +1060,59 @@ internal sealed class UnityAssetAutomationApp
                 return true;
             }
 
-            var hasSignals = await page.EvaluateFunctionAsync<bool>(@"() => {
-                const text = (document.body?.innerText || '').toLowerCase();
-                const actions = Array.from(document.querySelectorAll('button, a, span'))
-                    .map(x => (x.innerText || '').trim().toLowerCase())
-                    .filter(Boolean);
+            var hasSignals = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<bool>(@"() => {
+                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+
+                const roots = Array.from(document.querySelectorAll(
+                    '[data-testid*=""cta"" i], [class*=""cta"" i], [class*=""purchase"" i], [class*=""buy"" i], aside[class*=""sidebar"" i], div[class*=""sidebar"" i]'
+                )).filter(visible);
+
+                let actions = roots.flatMap(root =>
+                    Array.from(root.querySelectorAll('button, a, [role=""button""]'))
+                        .filter(visible)
+                        .map(x => normalize(x.innerText)));
+                if (actions.length === 0) {
+                    actions = Array.from(document.querySelectorAll('button, a, [role=""button""]'))
+                        .filter(visible)
+                        .map(x => normalize(x.innerText));
+                }
+
+                actions = actions
+                    .filter(Boolean)
+                    .filter(t => t.length <= 80)
+                    .filter(t =>
+                        t.includes('add to my assets') ||
+                        t.includes('open in unity') ||
+                        t.includes('buy now') ||
+                        t.includes('add to cart') ||
+                        t.includes('sign in') ||
+                        t.includes('log in') ||
+                        t.includes('owned') ||
+                        t.includes('in my assets') ||
+                        t.includes('already owned') ||
+                        t.includes('already in your assets') ||
+                        t.includes('free'));
 
                 const hasAdd = actions.some(t => t.includes('add to my assets'));
                 const hasOpen = actions.some(t => t.includes('open in unity'));
-                const hasSignIn = actions.some(t => t.includes('sign in')) || text.includes('sign in with unity');
+                const hasSignIn = actions.some(t => t.includes('sign in') || t.includes('log in'));
                 const hasBuy = actions.some(t => t.includes('buy now') || t.includes('add to cart'));
-                const hasPrice = /\$\s?\d|€\s?\d|£\s?\d|\b\d+[\.,]?\d*\s?(usd|eur|gbp)\b/.test(text);
 
-                return hasAdd || hasOpen || hasSignIn || hasBuy || hasPrice;
-            }");
+                return hasAdd || hasOpen || hasSignIn || hasBuy;
+            }"), "WaitForAssetSignals");
 
             if (hasSignals)
             {
                 return true;
             }
 
-            await Task.Delay(400);
+            await Task.Delay(450);
         }
 
         return false;
