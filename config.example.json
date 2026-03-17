@@ -1,0 +1,21 @@
+{
+  "loginOnly": false,
+  "dryRun": false,
+  "headless": false,
+  "verbose": true,
+  "traceNetwork": false,
+  "extendedSources": false,
+  "extraSourceFiles": [
+    "extra_asset_urls.example.txt"
+  ],
+  "logFilePath": "",
+  "unityEmail": "",
+  "unityPassword": "",
+  "delayMs": 1200,
+  "navigationTimeoutMs": 120000,
+  "authTimeoutMs": 300000,
+  "assetUiTimeoutMs": 30000,
+  "maxAddAttempts": null,
+  "maxVisitedAssets": null,
+  "sources": []
+}
