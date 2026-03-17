@@ -1158,7 +1158,15 @@ internal sealed class UnityAssetAutomationApp
                 if (Uri.TryCreate(source, UriKind.Absolute, out var sourceUri) &&
                     sourceUri.Host.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
                 {
-                    sourceUrlsExtracted = await CollectAssetUrlsFromAssetStorePageAsync(page, source);
+                    if (TryNormalizeDirectAssetUrl(sourceUri, out var directAssetUrl))
+                    {
+                        _logger.Info($"Источник является прямой ссылкой на ассет, добавляем без парсинга карточек: {directAssetUrl}");
+                        sourceUrlsExtracted = [directAssetUrl];
+                    }
+                    else
+                    {
+                        sourceUrlsExtracted = await CollectAssetUrlsFromAssetStorePageAsync(page, source);
+                    }
                 }
                 else
                 {
@@ -1256,6 +1264,24 @@ internal sealed class UnityAssetAutomationApp
         }
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    private static bool TryNormalizeDirectAssetUrl(Uri uri, out string normalized)
+    {
+        normalized = string.Empty;
+
+        if (!uri.Host.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!uri.AbsolutePath.Contains("/packages/", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        normalized = $"{uri.Scheme}://{uri.Host}{uri.AbsolutePath}".TrimEnd('/');
+        return true;
     }
 
     private async Task<List<string>> CollectAssetUrlsFromAssetStorePageAsync(IPage page, string sourceUrl)
@@ -1496,6 +1522,7 @@ internal sealed class UnityAssetAutomationApp
                 result.CountsTowardsAddLimit = status.IsFree;
                 result.PurchasedOnText = status.PurchasedOnText;
                 result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary) ? "no-signals" : status.DetectionSummary;
+                _logger.Debug($"CTA snapshot: openInUnity={status.HasOpenInUnity}, addToMyAssets={status.HasAddToMyAssets}, requiresLogin={status.RequiresLogin}, free={status.IsFree}, owned={status.IsOwned}");
 
                 if (!status.HasAddToMyAssets && !status.HasOpenInUnity && !status.RequiresLogin)
                 {
@@ -1508,6 +1535,7 @@ internal sealed class UnityAssetAutomationApp
                     result.CountsTowardsAddLimit = status.IsFree;
                     result.PurchasedOnText = status.PurchasedOnText;
                     result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary) ? "no-signals" : status.DetectionSummary;
+                    _logger.Debug($"CTA snapshot (after extra wait): openInUnity={status.HasOpenInUnity}, addToMyAssets={status.HasAddToMyAssets}, requiresLogin={status.RequiresLogin}, free={status.IsFree}, owned={status.IsOwned}");
                 }
 
                 _logger.Debug($"Статус ассета (до действия): {status.DetectionSummary}");
@@ -1544,17 +1572,18 @@ internal sealed class UnityAssetAutomationApp
                     result.PurchasedOnText = status.PurchasedOnText;
                     result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary) ? "no-signals" : status.DetectionSummary;
                     _logger.Debug($"Статус ассета (после переавторизации): {status.DetectionSummary}");
+                    _logger.Debug($"CTA snapshot (after re-auth): openInUnity={status.HasOpenInUnity}, addToMyAssets={status.HasAddToMyAssets}, requiresLogin={status.RequiresLogin}, free={status.IsFree}, owned={status.IsOwned}");
                 }
 
-                if (!status.IsFree)
+                if (status.HasOpenInUnity || status.IsOwned)
                 {
-                    result.Status = AssetProcessStatus.PaidSkipped;
+                    result.Status = AssetProcessStatus.AlreadyOwned;
                     return result;
                 }
 
-                if (status.IsOwned)
+                if (!status.IsFree && !status.HasAddToMyAssets)
                 {
-                    result.Status = AssetProcessStatus.AlreadyOwned;
+                    result.Status = AssetProcessStatus.PaidSkipped;
                     return result;
                 }
 
@@ -1582,6 +1611,7 @@ internal sealed class UnityAssetAutomationApp
                 }
 
                 var accepted = await TryAcceptAddConfirmationAsync(page);
+                _logger.Debug($"AcceptFound={accepted}");
                 if (accepted)
                 {
                     _logger.Info("Подтверждение добавления найдено: нажата кнопка Accept.");
@@ -1595,6 +1625,7 @@ internal sealed class UnityAssetAutomationApp
                 result.PurchasedOnText = postStatus.PurchasedOnText ?? result.PurchasedOnText;
                 result.DetectionSummary = string.IsNullOrWhiteSpace(postStatus.DetectionSummary) ? "no-signals" : postStatus.DetectionSummary;
                 _logger.Debug($"Статус ассета (после клика): {postStatus.DetectionSummary}");
+                _logger.Debug($"PostAddOpenInUnity={(postStatus.HasOpenInUnity || postStatus.IsOwned)}");
 
                 if (postStatus.RequiresLogin || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
                 {
@@ -1627,15 +1658,17 @@ internal sealed class UnityAssetAutomationApp
         var stopAt = DateTime.UtcNow.Add(timeout);
         AssetStatusSnapshot? lastStatus = null;
         var refreshAttempt = 0;
-        var addClickAttempt = 0;
-        var nextAllowedAddClickAt = DateTime.UtcNow;
+        var cycle = 0;
 
         while (DateTime.UtcNow < stopAt)
         {
-            await Task.Delay(1200);
+            cycle++;
+            await Task.Delay(900);
             await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 12000)));
             var current = await DetectStatusAsync(page);
             lastStatus = current;
+
+            _logger.Debug($"PostAddCycle[{cycle}]: openInUnity={current.HasOpenInUnity}, addToMyAssets={current.HasAddToMyAssets}, requiresLogin={current.RequiresLogin}, owned={current.IsOwned}");
 
             if (current.RequiresLogin || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
             {
@@ -1649,39 +1682,34 @@ internal sealed class UnityAssetAutomationApp
 
             if (current.HasAddToMyAssets)
             {
-                if (DateTime.UtcNow >= nextAllowedAddClickAt)
+                _logger.Debug($"PostAddCycle[{cycle}]: кнопка Add to My Assets всё ещё видна, повторяем клик...");
+                var clickedAdd = await TryClickAddButtonAsync(page);
+                if (clickedAdd)
                 {
-                    addClickAttempt++;
-                    _logger.Debug($"Повторная попытка добавления ассета (клик Add to My Assets), попытка {addClickAttempt}...");
-
-                    var clickedAdd = await TryClickAddButtonAsync(page);
-                    if (clickedAdd)
+                    await Task.Delay(350);
+                    var accepted = await TryAcceptAddConfirmationAsync(page);
+                    _logger.Debug($"PostAddCycle[{cycle}]: AcceptFound={accepted}");
+                    if (accepted)
                     {
-                        await Task.Delay(350);
-                        var accepted = await TryAcceptAddConfirmationAsync(page);
-                        if (accepted)
-                        {
-                            _logger.Info("Подтверждение добавления найдено во время проверки: нажата кнопка Accept.");
-                        }
+                        _logger.Info("Подтверждение добавления найдено во время проверки: нажата кнопка Accept.");
                     }
-
-                    // Даем UI и бэкенду время синхронизироваться, чтобы не кликать Add лишний раз.
-                    nextAllowedAddClickAt = DateTime.UtcNow.AddSeconds(5);
                 }
                 else
                 {
-                    var waitLeft = (nextAllowedAddClickAt - DateTime.UtcNow).TotalSeconds;
-                    _logger.Debug($"Кнопка Add to My Assets еще видна, но повторный клик отложен на {Math.Max(1, (int)Math.Ceiling(waitLeft))}с для стабилизации статуса.");
+                    _logger.Debug($"PostAddCycle[{cycle}]: не удалось кликнуть Add на текущем шаге.");
                 }
 
                 refreshAttempt++;
-                _logger.Debug($"После добавления кнопка Add to My Assets все еще видна. Обновляем страницу ассета (попытка {refreshAttempt})...");
+                _logger.Debug($"PostAddCycle[{cycle}]: Open in Unity ещё не появился. Обновляем страницу ассета (refresh={refreshAttempt})...");
                 await SafeGoToAsync(page, assetUrl);
                 await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 15000)));
             }
             else
             {
-                await Task.Delay(800);
+                refreshAttempt++;
+                _logger.Debug($"PostAddCycle[{cycle}]: Add/Open не видны, выполняем контрольный refresh (refresh={refreshAttempt})...");
+                await SafeGoToAsync(page, assetUrl);
+                await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 15000)));
             }
         }
 
