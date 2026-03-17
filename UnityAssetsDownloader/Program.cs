@@ -11,6 +11,8 @@ internal sealed class UnityAssetAutomationApp
 {
     private const string AssetStoreHomeUrl = "https://assetstore.unity.com/";
     private const string AssetStoreSignInUrl = "https://login.unity.com/en/sign-in";
+    private const string BaseTopFreeSource = "https://assetstore.unity.com/top-assets/top-free";
+    private const string BaseFreeListFileName = "free_list_GreaterChinaUnityAssetArchiveLinks.txt";
 
     private readonly CliOptions _options;
     private readonly AppLogger _logger;
@@ -22,10 +24,9 @@ internal sealed class UnityAssetAutomationApp
     private readonly string _reportPath;
     private readonly HttpClient _httpClient = new();
 
-    private static readonly string[] DefaultSources =
+    private static readonly string[] ExtendedSources =
     [
         "https://vanquish3r.github.io/greater-china-unity-assets/",
-        "https://assetstore.unity.com/top-assets/top-free",
         "https://assetstore.unity.com/search#nf-ec_price_filter=0...0",
         "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=96",
         "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=192",
@@ -127,7 +128,7 @@ internal sealed class UnityAssetAutomationApp
                 return;
             }
 
-            var sources = _options.Sources.Count > 0 ? _options.Sources : DefaultSources.ToList();
+            var sources = ResolveSources();
             var assetUrls = await CollectAssetUrlsAsync(page, sources);
 
             _logger.Info($"Найдено уникальных ассетов: {assetUrls.Count}");
@@ -856,6 +857,82 @@ internal sealed class UnityAssetAutomationApp
         }
 
         return all.ToList();
+    }
+
+    private List<string> ResolveSources()
+    {
+        var sources = _options.Sources.Count > 0
+            ? _options.Sources
+            : new List<string> { BaseTopFreeSource };
+
+        if (_options.Sources.Count == 0)
+        {
+            sources.AddRange(LoadSourcesFromFile(BaseFreeListFileName, "Файл базового списка бесплатных ассетов не найден"));
+        }
+
+        foreach (var extraFile in _options.ExtraSourceFiles)
+        {
+            sources.AddRange(LoadSourcesFromFile(extraFile, "Дополнительный файл ссылок не найден"));
+        }
+
+        if (_options.UseExtendedSources)
+        {
+            _logger.Info("Включены расширенные источники (--extended-sources). Добавляем дополнительные страницы поиска.");
+            sources.AddRange(ExtendedSources);
+        }
+
+        return sources
+            .Select(x => x.Trim())
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private List<string> LoadSourcesFromFile(string fileName, string notFoundMessagePrefix)
+    {
+        var candidates = BuildFileCandidates(fileName);
+
+        var path = candidates.FirstOrDefault(File.Exists);
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            _logger.Warn($"{notFoundMessagePrefix}: {fileName}");
+            return [];
+        }
+
+        try
+        {
+            var urls = File.ReadAllLines(path)
+                .Select(x => x.Trim())
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Where(x => Uri.TryCreate(x, UriKind.Absolute, out var uri) && uri.Host.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            _logger.Info($"Загружено ссылок из {Path.GetFileName(path)}: {urls.Count}");
+            return urls;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"Не удалось прочитать файл {path}: {ex.Message}");
+            return [];
+        }
+    }
+
+    private static List<string> BuildFileCandidates(string fileName)
+    {
+        if (Path.IsPathRooted(fileName))
+        {
+            return new List<string> { Path.GetFullPath(fileName) };
+        }
+
+        return new List<string>
+        {
+            Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), fileName)),
+            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, fileName)),
+            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", fileName))
+        }
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 
     private async Task<List<string>> CollectAssetUrlsFromAssetStorePageAsync(IPage page, string sourceUrl)
@@ -1636,6 +1713,8 @@ internal sealed class CliOptions
     public bool Headless { get; init; }
     public bool Verbose { get; init; }
     public bool TraceNetwork { get; init; }
+    public bool UseExtendedSources { get; init; }
+    public List<string> ExtraSourceFiles { get; init; } = [];
     public string? LogFilePath { get; init; }
     public string? UnityEmail { get; init; }
     public string? UnityPassword { get; init; }
@@ -1650,32 +1729,39 @@ internal sealed class CliOptions
 
     public static CliOptions Parse(string[] args)
     {
-        var loginOnly = false;
-        var dryRun = false;
-        var headless = false;
-        var verbose = false;
-        var traceNetwork = false;
-        string? logFilePath = null;
-        string? unityEmail = null;
-        string? unityPassword = null;
-        var delayMs = 1200;
-        var navigationTimeoutMs = 120000;
-        var authTimeoutMs = 300000;
-        var assetUiTimeoutMs = 30000;
-        int? maxAddAttempts = null;
-        int? maxVisitedAssets = null;
-        var sources = new List<string>();
+        string? configPath = null;
+
+        var cliLoginOnly = false;
+        var cliDryRun = false;
+        bool? cliHeadless = null;
+        var cliVerbose = false;
+        var cliTraceNetwork = false;
+        var cliUseExtendedSources = false;
+        string? cliLogFilePath = null;
+        string? cliUnityEmail = null;
+        string? cliUnityPassword = null;
+        int? cliDelayMs = null;
+        int? cliNavigationTimeoutMs = null;
+        int? cliAuthTimeoutMs = null;
+        int? cliAssetUiTimeoutMs = null;
+        int? cliMaxAddAttempts = null;
+        int? cliMaxVisitedAssets = null;
+        var cliSources = new List<string>();
+        var cliExtraSourceFiles = new List<string>();
 
         for (var i = 0; i < args.Length; i++)
         {
             var arg = args[i].Trim();
             switch (arg)
             {
+                case "--config" when i + 1 < args.Length:
+                    configPath = args[++i];
+                    break;
                 case "--login":
-                    loginOnly = true;
+                    cliLoginOnly = true;
                     break;
                 case "--dry-run":
-                    dryRun = true;
+                    cliDryRun = true;
                     break;
                 case "--headless" when i + 1 < args.Length:
                 {
@@ -1686,30 +1772,33 @@ internal sealed class CliOptions
                         parsed = false;
                     }
 
-                    headless = parsed;
+                    cliHeadless = parsed;
                     break;
                 }
                 case "--verbose":
-                    verbose = true;
+                    cliVerbose = true;
                     break;
                 case "--trace-network":
-                    traceNetwork = true;
-                    verbose = true;
+                    cliTraceNetwork = true;
+                    cliVerbose = true;
+                    break;
+                case "--extended-sources":
+                    cliUseExtendedSources = true;
                     break;
                 case "--log-file" when i + 1 < args.Length:
-                    logFilePath = args[++i];
+                    cliLogFilePath = args[++i];
                     break;
                 case "--unity-email" when i + 1 < args.Length:
-                    unityEmail = args[++i];
+                    cliUnityEmail = args[++i];
                     break;
                 case "--unity-password" when i + 1 < args.Length:
-                    unityPassword = args[++i];
+                    cliUnityPassword = args[++i];
                     break;
                 case "--delay-ms" when i + 1 < args.Length:
                 {
                     if (int.TryParse(args[++i], out var delay) && delay > 0)
                     {
-                        delayMs = delay;
+                        cliDelayMs = delay;
                     }
 
                     break;
@@ -1718,7 +1807,7 @@ internal sealed class CliOptions
                 {
                     if (int.TryParse(args[++i], out var navTimeout) && navTimeout >= 10000)
                     {
-                        navigationTimeoutMs = navTimeout;
+                        cliNavigationTimeoutMs = navTimeout;
                     }
 
                     break;
@@ -1727,7 +1816,7 @@ internal sealed class CliOptions
                 {
                     if (int.TryParse(args[++i], out var authTimeout) && authTimeout >= 30000)
                     {
-                        authTimeoutMs = authTimeout;
+                        cliAuthTimeoutMs = authTimeout;
                     }
 
                     break;
@@ -1736,7 +1825,7 @@ internal sealed class CliOptions
                 {
                     if (int.TryParse(args[++i], out var assetUiTimeout) && assetUiTimeout >= 5000)
                     {
-                        assetUiTimeoutMs = assetUiTimeout;
+                        cliAssetUiTimeoutMs = assetUiTimeout;
                     }
 
                     break;
@@ -1745,7 +1834,7 @@ internal sealed class CliOptions
                 {
                     if (int.TryParse(args[++i], out var parsedLimit) && parsedLimit > 0)
                     {
-                        maxAddAttempts = parsedLimit;
+                        cliMaxAddAttempts = parsedLimit;
                     }
 
                     break;
@@ -1754,19 +1843,141 @@ internal sealed class CliOptions
                 {
                     if (int.TryParse(args[++i], out var parsedVisitedLimit) && parsedVisitedLimit > 0)
                     {
-                        maxVisitedAssets = parsedVisitedLimit;
+                        cliMaxVisitedAssets = parsedVisitedLimit;
                     }
 
                     break;
                 }
                 case "--source" when i + 1 < args.Length:
-                    sources.Add(args[++i]);
+                    cliSources.Add(args[++i]);
+                    break;
+                case "--extra-source-file" when i + 1 < args.Length:
+                    cliExtraSourceFiles.Add(args[++i]);
                     break;
             }
         }
 
-        unityEmail ??= Environment.GetEnvironmentVariable("UNITY_EMAIL");
-        unityPassword ??= Environment.GetEnvironmentVariable("UNITY_PASSWORD");
+        var config = AppConfig.Load(configPath, out var usedConfigPath, out var configError);
+        if (!string.IsNullOrWhiteSpace(configError))
+        {
+            Console.WriteLine(configError);
+        }
+        else if (!string.IsNullOrWhiteSpace(usedConfigPath))
+        {
+            Console.WriteLine($"Загружен конфиг: {usedConfigPath}");
+        }
+
+        var loginOnly = cliLoginOnly || (config?.LoginOnly ?? false);
+        var dryRun = cliDryRun || (config?.DryRun ?? false);
+
+        var headless = cliHeadless ?? config?.Headless ?? false;
+        var verbose = cliVerbose || (config?.Verbose ?? false);
+        var traceNetwork = cliTraceNetwork || (config?.TraceNetwork ?? false);
+        var useExtendedSources = cliUseExtendedSources || (config?.ExtendedSources ?? false);
+        if (traceNetwork)
+        {
+            verbose = true;
+        }
+
+        var logFilePath = string.IsNullOrWhiteSpace(cliLogFilePath)
+            ? config?.LogFilePath
+            : cliLogFilePath;
+
+        var delayMs = cliDelayMs ?? config?.DelayMs ?? 1200;
+        if (delayMs <= 0)
+        {
+            delayMs = 1200;
+        }
+
+        var navigationTimeoutMs = cliNavigationTimeoutMs ?? config?.NavigationTimeoutMs ?? 120000;
+        if (navigationTimeoutMs < 10000)
+        {
+            navigationTimeoutMs = 120000;
+        }
+
+        var authTimeoutMs = cliAuthTimeoutMs ?? config?.AuthTimeoutMs ?? 300000;
+        if (authTimeoutMs < 30000)
+        {
+            authTimeoutMs = 300000;
+        }
+
+        var assetUiTimeoutMs = cliAssetUiTimeoutMs ?? config?.AssetUiTimeoutMs ?? 30000;
+        if (assetUiTimeoutMs < 5000)
+        {
+            assetUiTimeoutMs = 30000;
+        }
+
+        var maxAddAttempts = cliMaxAddAttempts ?? config?.MaxAddAttempts;
+        if (maxAddAttempts <= 0)
+        {
+            maxAddAttempts = null;
+        }
+
+        var maxVisitedAssets = cliMaxVisitedAssets ?? config?.MaxVisitedAssets;
+        if (maxVisitedAssets <= 0)
+        {
+            maxVisitedAssets = null;
+        }
+
+        var sources = new List<string>();
+        if (config?.Sources?.Count > 0)
+        {
+            sources.AddRange(config.Sources.Where(x => !string.IsNullOrWhiteSpace(x)));
+        }
+
+        if (cliSources.Count > 0)
+        {
+            sources = cliSources;
+        }
+
+        sources = sources
+            .Select(x => x.Trim())
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var extraSourceFiles = new List<string>();
+        if (config?.ExtraSourceFiles?.Count > 0)
+        {
+            extraSourceFiles.AddRange(config.ExtraSourceFiles.Where(x => !string.IsNullOrWhiteSpace(x)));
+        }
+
+        if (cliExtraSourceFiles.Count > 0)
+        {
+            extraSourceFiles.AddRange(cliExtraSourceFiles);
+        }
+
+        extraSourceFiles = extraSourceFiles
+            .Select(x => x.Trim())
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var unityEmail = config?.UnityEmail;
+        var unityPassword = config?.UnityPassword;
+
+        var envUnityEmail = Environment.GetEnvironmentVariable("UNITY_EMAIL");
+        var envUnityPassword = Environment.GetEnvironmentVariable("UNITY_PASSWORD");
+
+        if (!string.IsNullOrWhiteSpace(envUnityEmail))
+        {
+            unityEmail = envUnityEmail;
+        }
+
+        if (!string.IsNullOrWhiteSpace(envUnityPassword))
+        {
+            unityPassword = envUnityPassword;
+        }
+
+        if (!string.IsNullOrWhiteSpace(cliUnityEmail))
+        {
+            unityEmail = cliUnityEmail;
+        }
+
+        if (!string.IsNullOrWhiteSpace(cliUnityPassword))
+        {
+            unityPassword = cliUnityPassword;
+        }
 
         if ((string.IsNullOrWhiteSpace(unityEmail) && !string.IsNullOrWhiteSpace(unityPassword)) ||
             (!string.IsNullOrWhiteSpace(unityEmail) && string.IsNullOrWhiteSpace(unityPassword)))
@@ -1783,6 +1994,8 @@ internal sealed class CliOptions
             Headless = headless,
             Verbose = verbose,
             TraceNetwork = traceNetwork,
+            UseExtendedSources = useExtendedSources,
+            ExtraSourceFiles = extraSourceFiles,
             LogFilePath = logFilePath,
             UnityEmail = unityEmail,
             UnityPassword = unityPassword,
@@ -1794,6 +2007,65 @@ internal sealed class CliOptions
             MaxVisitedAssets = maxVisitedAssets,
             Sources = sources
         };
+    }
+}
+
+internal sealed class AppConfig
+{
+    public bool? LoginOnly { get; init; }
+    public bool? DryRun { get; init; }
+    public bool? Headless { get; init; }
+    public bool? Verbose { get; init; }
+    public bool? TraceNetwork { get; init; }
+    public bool? ExtendedSources { get; init; }
+    public List<string> ExtraSourceFiles { get; init; } = [];
+    public string? LogFilePath { get; init; }
+    public string? UnityEmail { get; init; }
+    public string? UnityPassword { get; init; }
+    public int? DelayMs { get; init; }
+    public int? NavigationTimeoutMs { get; init; }
+    public int? AuthTimeoutMs { get; init; }
+    public int? AssetUiTimeoutMs { get; init; }
+    public int? MaxAddAttempts { get; init; }
+    public int? MaxVisitedAssets { get; init; }
+    public List<string> Sources { get; init; } = [];
+
+    public static AppConfig? Load(string? explicitConfigPath, out string? usedConfigPath, out string? error)
+    {
+        usedConfigPath = null;
+        error = null;
+
+        var resolvedPath = !string.IsNullOrWhiteSpace(explicitConfigPath)
+            ? Path.GetFullPath(explicitConfigPath)
+            : Path.Combine(Directory.GetCurrentDirectory(), "config.json");
+
+        var explicitPathProvided = !string.IsNullOrWhiteSpace(explicitConfigPath);
+        if (!File.Exists(resolvedPath))
+        {
+            if (explicitPathProvided)
+            {
+                error = $"Конфигурационный файл не найден: {resolvedPath}";
+            }
+
+            return null;
+        }
+
+        try
+        {
+            var json = File.ReadAllText(resolvedPath);
+            var parsed = JsonSerializer.Deserialize<AppConfig>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+
+            usedConfigPath = resolvedPath;
+            return parsed;
+        }
+        catch (Exception ex)
+        {
+            error = $"Не удалось прочитать конфигурационный файл {resolvedPath}: {ex.Message}";
+            return null;
+        }
     }
 }
 

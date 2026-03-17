@@ -24,9 +24,13 @@
 3. Поддерживает:
    - **ручной вход** в открытом браузере,
    - **автовход** (если переданы email/password).
-4. Собирает ссылки на ассеты из источников (по умолчанию):
-   - https://vanquish3r.github.io/greater-china-unity-assets/
+4. Собирает ссылки на ассеты из источников.
+   По умолчанию используются:
    - https://assetstore.unity.com/top-assets/top-free
+   - все ссылки из файла `free_list_GreaterChinaUnityAssetArchiveLinks.txt`
+   - ссылки из дополнительных файлов `extraSourceFiles` (из `config.json`) и/или `--extra-source-file`
+   
+   Расширенный набор источников включается отдельным флагом `--extended-sources`.
 5. Для каждого ассета:
    - определяет, бесплатный ли он,
    - проверяет, есть ли уже в аккаунте,
@@ -93,10 +97,12 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --hea
 | Параметр | Описание |
 |---|---|
 | `--login` | Только авторизация и сохранение cookies, без обработки ассетов |
+| `--config <path>` | Путь к JSON-конфигу (если не указан, приложение попробует `config.json` в корне рабочего каталога) |
 | `--dry-run` | Проверка без нажатия кнопки добавления (без изменений аккаунта) |
 | `--headless true/false` | Режим браузера без UI или с UI |
 | `--verbose` | Подробные логи |
 | `--trace-network` | Сетевые логи (включает verbose) |
+| `--extended-sources` | Добавить расширенный список источников (страницы search + archive URL) к базовым источникам по умолчанию |
 | `--log-file <path>` | Путь к файлу лога |
 | `--unity-email <email>` | Email для автовхода |
 | `--unity-password <password>` | Пароль для автовхода |
@@ -106,7 +112,8 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --hea
 | `--asset-ui-timeout-ms <int>` | Сколько ждать загрузки элементов на странице ассета (`Add to My Assets` / `Open in Unity` / `Sign in` / `Buy`), по умолчанию 30000 |
 | `--max-add-attempts <int>` | Лимит обработки бесплатных ассетов (включая `AlreadyOwned`). После достижения лимита проход останавливается |
 | `--max-visited-assets <int>` | Лимит по количеству посещённых страниц ассетов (защитный стоп при нестабильной детекции) |
-| `--source <url>` | Источник ссылок на ассеты (можно указать несколько раз) |
+| `--source <url>` | Явный источник ссылок на ассеты (можно указать несколько раз). Если указан хотя бы один `--source`, используются только эти источники |
+| `--extra-source-file <path>` | Дополнительный файл со списком URL (по одному на строку). Можно указывать несколько раз; добавляется к базовым источникам или к `--source` |
 
 ---
 
@@ -117,6 +124,39 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --hea
 ```powershell
 dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --dry-run --headless false --verbose
 ```
+
+### 6.0 Запуск через конфигурационный файл
+
+1) Скопируйте шаблон:
+
+```powershell
+copy config.example.json config.json
+```
+
+2) Заполните `config.json` (при необходимости).
+
+3) Запустите приложение:
+
+```powershell
+dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj --
+```
+
+Либо укажите явный путь:
+
+```powershell
+dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --config "C:\Code\RiderProjects\UnityAssetsDownloader\config.json"
+```
+
+Приоритет значений:
+1. CLI параметры
+2. Переменные окружения (`UNITY_EMAIL`, `UNITY_PASSWORD`)
+3. Конфиг (`config.json` / `--config`)
+4. Встроенные значения по умолчанию
+
+По источникам по умолчанию:
+- базовый режим: `top-free` + `free_list_GreaterChinaUnityAssetArchiveLinks.txt`
+- дополнительно можно подключить файлы через `extraSourceFiles` (config) и/или `--extra-source-file`
+- расширенный режим: базовый + все расширенные источники (`"extendedSources": true` или `--extended-sources`)
 
 ### 6.2 Автовход через переменные окружения (рекомендуется вместо пароля в CLI)
 
@@ -132,16 +172,28 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --log
 dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --headless false --source "https://vanquish3r.github.io/greater-china-unity-assets/" --source "https://assetstore.unity.com/top-assets/top-free"
 ```
 
-### 6.4 Увеличенные таймауты
+### 6.4 Расширенные источники (дополнительно к базовым)
+
+```powershell
+dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --headless false --extended-sources --verbose
+```
+
+### 6.5 Увеличенные таймауты
 
 ```powershell
 dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --headless false --nav-timeout-ms 180000 --auth-timeout-ms 600000 --verbose
 ```
 
-### 6.5 Прогон только top-free, в видимом браузере, с лимитом 25
+### 6.6 Прогон только top-free, в видимом браузере, с лимитом 25
 
 ```powershell
 dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --headless false --source "https://assetstore.unity.com/top-assets/top-free" --max-add-attempts 25 --verbose --trace-network
+```
+
+### 6.7 Дополнительные файлы ссылок
+
+```powershell
+dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --headless false --extra-source-file "free_list_GreaterChinaUnityAssetArchiveLinks.txt" --extra-source-file "extra_asset_urls.example.txt" --verbose
 ```
 
 ---
@@ -228,6 +280,7 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --hea
 - Unity Asset Store может менять HTML/поведение без предупреждения — автоматизацию нужно периодически поддерживать.
 - Учитывайте ограничения/правила использования сервиса Unity.
 - Не храните реальные пароли в репозитории или в командной строке истории shell.
+- `config.json` добавлен в `.gitignore`; используйте `config.example.json` как шаблон.
 
 ---
 
