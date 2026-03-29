@@ -12,7 +12,9 @@ internal sealed class UnityAssetAutomationApp
     private const string AssetStoreHomeUrl = "https://assetstore.unity.com/";
     private const string AssetStoreSignInUrl = "https://login.unity.com/en/sign-in";
     private const string BaseTopFreeSource = "https://assetstore.unity.com/top-assets/top-free";
-    private const string BaseFreeListFileName = "free_list_GreaterChinaUnityAssetArchiveLinks.txt";
+
+    private const string BaseFreeListFileName =
+        "GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt";
 
     private readonly CliOptions _options;
     private readonly AppLogger _logger;
@@ -27,6 +29,7 @@ internal sealed class UnityAssetAutomationApp
     private DateTime? _lastFullAuthAttemptUtc;
 
     private static readonly TimeSpan FullAuthCooldown = TimeSpan.FromSeconds(25);
+
     private static readonly string[] SessionOrigins =
     [
         "https://assetstore.unity.com",
@@ -173,13 +176,15 @@ internal sealed class UnityAssetAutomationApp
             {
                 if (_options.MaxVisitedAssets.HasValue && index >= _options.MaxVisitedAssets.Value)
                 {
-                    _logger.Warn($"Достигнут лимит посещенных ассетов ({index}/{_options.MaxVisitedAssets.Value}). Обработка остановлена.");
+                    _logger.Warn(
+                        $"Достигнут лимит посещенных ассетов ({index}/{_options.MaxVisitedAssets.Value}). Обработка остановлена.");
                     break;
                 }
 
                 if (_options.MaxAddAttempts.HasValue && freeAssetsProcessed >= _options.MaxAddAttempts.Value)
                 {
-                    _logger.Warn($"Достигнут лимит бесплатных ассетов ({freeAssetsProcessed}/{_options.MaxAddAttempts.Value}). Обработка остановлена.");
+                    _logger.Warn(
+                        $"Достигнут лимит бесплатных ассетов ({freeAssetsProcessed}/{_options.MaxAddAttempts.Value}). Обработка остановлена.");
                     break;
                 }
 
@@ -194,7 +199,8 @@ internal sealed class UnityAssetAutomationApp
                     freeAssetsProcessed++;
                     if (_options.MaxAddAttempts.HasValue)
                     {
-                        _logger.Info($"Лимит-счетчик бесплатных ассетов: {freeAssetsProcessed}/{_options.MaxAddAttempts.Value} (статус: {result.Status})");
+                        _logger.Info(
+                            $"Лимит-счетчик бесплатных ассетов: {freeAssetsProcessed}/{_options.MaxAddAttempts.Value} (статус: {result.Status})");
                     }
                 }
 
@@ -261,7 +267,8 @@ internal sealed class UnityAssetAutomationApp
             if (elapsed < FullAuthCooldown)
             {
                 var waitLeft = (int)Math.Ceiling((FullAuthCooldown - elapsed).TotalSeconds);
-                _logger.Warn($"Полный SSO-вход запрашивается слишком часто. Выжидаем cooldown: {Math.Max(1, waitLeft)}с...");
+                _logger.Warn(
+                    $"Полный SSO-вход запрашивается слишком часто. Выжидаем cooldown: {Math.Max(1, waitLeft)}с...");
                 await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, waitLeft)));
             }
         }
@@ -288,7 +295,8 @@ internal sealed class UnityAssetAutomationApp
             await SafeGoToAsync(page, BaseTopFreeSource);
             await WaitForDocumentReadySoftAsync(page, TimeSpan.FromSeconds(6));
 
-            if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase) || IsLikelySignOutFlowUrl(page.Url))
+            if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase) ||
+                IsLikelySignOutFlowUrl(page.Url))
             {
                 _logger.Warn($"AuthProbe[{stage}]: редирект в login/logout ({page.Url}).");
                 return false;
@@ -303,7 +311,8 @@ internal sealed class UnityAssetAutomationApp
             for (var i = 0; i < 6; i++)
             {
                 await Task.Delay(400);
-                if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase) || IsLikelySignOutFlowUrl(page.Url))
+                if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase) ||
+                    IsLikelySignOutFlowUrl(page.Url))
                 {
                     _logger.Warn($"AuthProbe[{stage}]: во время стабилизации пойман logout/login ({page.Url}).");
                     return false;
@@ -353,7 +362,8 @@ internal sealed class UnityAssetAutomationApp
         }
         else
         {
-            _logger.Info("Учетные данные для автовхода не заданы. Выполните вход в браузере вручную, скрипт продолжит автоматически.");
+            _logger.Info(
+                "Учетные данные для автовхода не заданы. Выполните вход в браузере вручную, скрипт продолжит автоматически.");
         }
 
         for (var attempt = 1; attempt <= 3; attempt++)
@@ -441,7 +451,8 @@ internal sealed class UnityAssetAutomationApp
 
                 if (!_options.HasCredentials)
                 {
-                    var clicked = await TryTriggerSignInFromHomeUiAsync(page) || await TryClickSignInWithUnityAsync(page);
+                    var clicked = await TryTriggerSignInFromHomeUiAsync(page) ||
+                                  await TryClickSignInWithUnityAsync(page);
                     if (clicked)
                     {
                         _logger.Info("AuthStep: wait-user-login");
@@ -450,7 +461,8 @@ internal sealed class UnityAssetAutomationApp
             }
             else if (!redirectedToAssetStore)
             {
-                _logger.Debug($"AuthWait: сторонний URL '{page.Url}'. Возвращаемся в Asset Store для проверки статуса...");
+                _logger.Debug(
+                    $"AuthWait: сторонний URL '{page.Url}'. Возвращаемся в Asset Store для проверки статуса...");
                 await SafeGoToAsync(page, AssetStoreHomeUrl);
                 redirectedToAssetStore = true;
             }
@@ -557,10 +569,12 @@ internal sealed class UnityAssetAutomationApp
             });
         }"), "HasAuthMarkers(rawMarkers)");
 
-            var markers = JsonSerializer.Deserialize<AuthUiMarkers>(rawMarkers ?? "{}", _runtimeJsonOptions) ?? new AuthUiMarkers();
+            var markers = JsonSerializer.Deserialize<AuthUiMarkers>(rawMarkers ?? "{}", _runtimeJsonOptions) ??
+                          new AuthUiMarkers();
             var hasUiAuthMarkers = (markers.HasMyAssetsLink || markers.HasMyAssetsText) &&
                                    !(markers.HasSignInLink && markers.HasSignInText && !markers.HasMyAssetsText);
-            var hasUiSignInMarkers = markers.HasSignInLink || markers.HasSignInText || markers.HasSignInWithUnityText || markers.HasSignInWithUnityButton;
+            var hasUiSignInMarkers = markers.HasSignInLink || markers.HasSignInText || markers.HasSignInWithUnityText ||
+                                     markers.HasSignInWithUnityButton;
             var profileState = await GetProfileMenuAuthStateAsync(page);
 
             var hasApiAuthMarkers = false;
@@ -585,7 +599,8 @@ internal sealed class UnityAssetAutomationApp
             }"), "HasAuthMarkers(api)");
             }
 
-            _logger.Debug($"Auth markers: UI={hasUiAuthMarkers}, API={hasApiAuthMarkers}, signInUi={hasUiSignInMarkers}, profileMenuFound={profileState.ProfileMenuFound}, profileMenuSignIn={profileState.HasSignInItem}, profileMenuSignedIn={profileState.HasSignedInItem}, page={page.Url}, myAssetsLink={markers.HasMyAssetsLink}, myAssetsText={markers.HasMyAssetsText}, signInLink={markers.HasSignInLink}, signInText={markers.HasSignInText}, signInWithUnityText={markers.HasSignInWithUnityText}, signInWithUnityButton={markers.HasSignInWithUnityButton}");
+            _logger.Debug(
+                $"Auth markers: UI={hasUiAuthMarkers}, API={hasApiAuthMarkers}, signInUi={hasUiSignInMarkers}, profileMenuFound={profileState.ProfileMenuFound}, profileMenuSignIn={profileState.HasSignInItem}, profileMenuSignedIn={profileState.HasSignedInItem}, page={page.Url}, myAssetsLink={markers.HasMyAssetsLink}, myAssetsText={markers.HasMyAssetsText}, signInLink={markers.HasSignInLink}, signInText={markers.HasSignInText}, signInWithUnityText={markers.HasSignInWithUnityText}, signInWithUnityButton={markers.HasSignInWithUnityButton}");
 
             if (profileState.HasSignedInItem)
             {
@@ -789,7 +804,8 @@ internal sealed class UnityAssetAutomationApp
                 return JSON.stringify({ profileMenuFound: true, hasSignInItem, hasSignedInItem });
             }"), "GetProfileMenuAuthState");
 
-            return JsonSerializer.Deserialize<ProfileMenuAuthState>(raw ?? "{}", _runtimeJsonOptions) ?? new ProfileMenuAuthState();
+            return JsonSerializer.Deserialize<ProfileMenuAuthState>(raw ?? "{}", _runtimeJsonOptions) ??
+                   new ProfileMenuAuthState();
         }
         catch
         {
@@ -797,7 +813,8 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
-    private async Task<T> EvaluateWithRetryAsync<T>(Func<Task<T>> action, string operationName, int attempts = 3, int delayMs = 250)
+    private async Task<T> EvaluateWithRetryAsync<T>(Func<Task<T>> action, string operationName, int attempts = 3,
+        int delayMs = 250)
     {
         Exception? last = null;
         for (var i = 1; i <= attempts; i++)
@@ -846,7 +863,8 @@ internal sealed class UnityAssetAutomationApp
             try
             {
                 var ready = await EvaluateWithRetryAsync(
-                    () => page.EvaluateFunctionAsync<bool>("() => ['interactive','complete'].includes(document.readyState)"),
+                    () => page.EvaluateFunctionAsync<bool>(
+                        "() => ['interactive','complete'].includes(document.readyState)"),
                     "WaitForDocumentReadySoft",
                     attempts: 2,
                     delayMs: 180);
@@ -933,7 +951,8 @@ internal sealed class UnityAssetAutomationApp
 
         return text.Contains("As of Atomic version 3.0.0", StringComparison.OrdinalIgnoreCase) ||
                text.Contains("Because analytics are disabled", StringComparison.OrdinalIgnoreCase) ||
-               text.Contains("Refused to connect to 'https://s.clarity.ms/collect'", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Refused to connect to 'https://s.clarity.ms/collect'",
+                   StringComparison.OrdinalIgnoreCase) ||
                text.Contains("Amplitude snippet has been loaded", StringComparison.OrdinalIgnoreCase) ||
                text.Contains("Amplitude Logger [Error]: Failed to fetch", StringComparison.OrdinalIgnoreCase) ||
                text.Contains("Amplitude Logger [Warn]", StringComparison.OrdinalIgnoreCase) ||
@@ -941,7 +960,8 @@ internal sealed class UnityAssetAutomationApp
                text.Contains("No visitor ID available. Load may have failed", StringComparison.OrdinalIgnoreCase) ||
                text.Contains("/api/carts 404", StringComparison.OrdinalIgnoreCase) ||
                text.Contains("the server responded with a status of 451", StringComparison.OrdinalIgnoreCase) ||
-               text.Contains("Action dispatch error analytics/interface/load/rejected", StringComparison.OrdinalIgnoreCase);
+               text.Contains("Action dispatch error analytics/interface/load/rejected",
+                   StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task SafeGoToAsync(IPage page, string url)
@@ -994,7 +1014,8 @@ internal sealed class UnityAssetAutomationApp
 
             await page.SetCookieAsync(cookies.Select(c => c.ToCookieParam()).ToArray());
             _logger.Info($"Загружено cookies: {cookies.Count}");
-            _logger.Debug($"Домены cookies: {string.Join(", ", cookies.Select(c => c.Domain).Where(d => !string.IsNullOrWhiteSpace(d)).Distinct(StringComparer.OrdinalIgnoreCase))}");
+            _logger.Debug(
+                $"Домены cookies: {string.Join(", ", cookies.Select(c => c.Domain).Where(d => !string.IsNullOrWhiteSpace(d)).Distinct(StringComparer.OrdinalIgnoreCase))}");
             return true;
         }
         catch
@@ -1011,7 +1032,8 @@ internal sealed class UnityAssetAutomationApp
             try
             {
                 var raw = await File.ReadAllTextAsync(_sessionStatePath);
-                var state = JsonSerializer.Deserialize<SessionStateSnapshot>(raw, _runtimeJsonOptions) ?? new SessionStateSnapshot();
+                var state = JsonSerializer.Deserialize<SessionStateSnapshot>(raw, _runtimeJsonOptions) ??
+                            new SessionStateSnapshot();
                 if (state.Cookies.Count > 0)
                 {
                     await page.SetCookieAsync(state.Cookies.Select(c => c.ToCookieParam()).ToArray());
@@ -1074,7 +1096,8 @@ internal sealed class UnityAssetAutomationApp
         await File.WriteAllTextAsync(_sessionStatePath, JsonSerializer.Serialize(state, _jsonOptions));
 
         await File.WriteAllTextAsync(_cookiesPath, JsonSerializer.Serialize(state.Cookies, _jsonOptions));
-        _logger.Info($"Сохранено состояние сессии: cookies={state.Cookies.Count}, originsLocalStorage={state.LocalStorageByOrigin.Count}");
+        _logger.Info(
+            $"Сохранено состояние сессии: cookies={state.Cookies.Count}, originsLocalStorage={state.LocalStorageByOrigin.Count}");
     }
 
     private async Task<Dictionary<string, string>> CaptureLocalStorageForOriginAsync(IPage page, string origin)
@@ -1098,7 +1121,8 @@ internal sealed class UnityAssetAutomationApp
                ?? new Dictionary<string, string>(StringComparer.Ordinal);
     }
 
-    private async Task<Dictionary<string, string>> CaptureLocalStorageInIsolatedPageAsync(IPage anchorPage, string origin)
+    private async Task<Dictionary<string, string>> CaptureLocalStorageInIsolatedPageAsync(IPage anchorPage,
+        string origin)
     {
         await using var tempPage = await anchorPage.Browser.NewPageAsync();
         tempPage.DefaultNavigationTimeout = _options.NavigationTimeoutMs;
@@ -1124,7 +1148,8 @@ internal sealed class UnityAssetAutomationApp
         }", origin, values), $"RestoreLocalStorage[{origin}]");
     }
 
-    private async Task RestoreLocalStorageInIsolatedPageAsync(IPage anchorPage, string origin, Dictionary<string, string> values)
+    private async Task RestoreLocalStorageInIsolatedPageAsync(IPage anchorPage, string origin,
+        Dictionary<string, string> values)
     {
         await using var tempPage = await anchorPage.Browser.NewPageAsync();
         tempPage.DefaultNavigationTimeout = _options.NavigationTimeoutMs;
@@ -1141,7 +1166,8 @@ internal sealed class UnityAssetAutomationApp
         var serializable = cookies.Select(SerializableCookie.FromCookie).ToList();
         await File.WriteAllTextAsync(_cookiesPath, JsonSerializer.Serialize(serializable, _jsonOptions));
         _logger.Info($"Сохранено cookies: {serializable.Count}");
-        _logger.Debug($"Домены cookies после входа: {string.Join(", ", serializable.Select(c => c.Domain).Where(d => !string.IsNullOrWhiteSpace(d)).Distinct(StringComparer.OrdinalIgnoreCase))}");
+        _logger.Debug(
+            $"Домены cookies после входа: {string.Join(", ", serializable.Select(c => c.Domain).Where(d => !string.IsNullOrWhiteSpace(d)).Distinct(StringComparer.OrdinalIgnoreCase))}");
     }
 
     private async Task<List<string>> CollectAssetUrlsAsync(IPage page, IEnumerable<string> sourceUrls)
@@ -1160,7 +1186,8 @@ internal sealed class UnityAssetAutomationApp
                 {
                     if (TryNormalizeDirectAssetUrl(sourceUri, out var directAssetUrl))
                     {
-                        _logger.Info($"Источник является прямой ссылкой на ассет, добавляем без парсинга карточек: {directAssetUrl}");
+                        _logger.Info(
+                            $"Источник является прямой ссылкой на ассет, добавляем без парсинга карточек: {directAssetUrl}");
                         sourceUrlsExtracted = [directAssetUrl];
                     }
                     else
@@ -1179,7 +1206,8 @@ internal sealed class UnityAssetAutomationApp
                     all.Add(url);
                 }
 
-                _logger.Info($"Источник обработан: добавлено ссылок {sourceUrlsExtracted.Count} (после фильтра PURCHASED/You own this asset).");
+                _logger.Info(
+                    $"Источник обработан: добавлено ссылок {sourceUrlsExtracted.Count} (после фильтра PURCHASED/You own this asset).");
             }
             catch (Exception ex)
             {
@@ -1198,7 +1226,8 @@ internal sealed class UnityAssetAutomationApp
 
         if (_options.Sources.Count == 0)
         {
-            sources.AddRange(LoadSourcesFromFile(BaseFreeListFileName, "Файл базового списка бесплатных ассетов не найден"));
+            sources.AddRange(LoadSourcesFromFile(BaseFreeListFileName,
+                "Файл базового списка бесплатных ассетов не найден"));
         }
 
         foreach (var extraFile in _options.ExtraSourceFiles)
@@ -1208,7 +1237,8 @@ internal sealed class UnityAssetAutomationApp
 
         if (_options.UseExtendedSources)
         {
-            _logger.Info("Включены расширенные источники (--extended-sources). Добавляем дополнительные страницы поиска.");
+            _logger.Info(
+                "Включены расширенные источники (--extended-sources). Добавляем дополнительные страницы поиска.");
             sources.AddRange(ExtendedSources);
         }
 
@@ -1235,7 +1265,8 @@ internal sealed class UnityAssetAutomationApp
             var urls = File.ReadAllLines(path)
                 .Select(x => x.Trim())
                 .Where(x => !string.IsNullOrWhiteSpace(x))
-                .Where(x => Uri.TryCreate(x, UriKind.Absolute, out var uri) && uri.Host.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
+                .Where(x => Uri.TryCreate(x, UriKind.Absolute, out var uri) &&
+                            uri.Host.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
@@ -1257,11 +1288,11 @@ internal sealed class UnityAssetAutomationApp
         }
 
         return new List<string>
-        {
-            Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), fileName)),
-            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, fileName)),
-            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", fileName))
-        }
+            {
+                Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), fileName)),
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, fileName)),
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", fileName))
+            }
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
@@ -1291,9 +1322,11 @@ internal sealed class UnityAssetAutomationApp
             await SafeGoToAsync(page, sourceUrl);
             await WaitForDocumentReadySoftAsync(page, TimeSpan.FromSeconds(8));
 
-            if (IsLikelySignOutFlowUrl(page.Url) || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+            if (IsLikelySignOutFlowUrl(page.Url) ||
+                page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
             {
-                _logger.Warn($"Источник {sourceUrl}: обнаружен редирект в logout/login ({page.Url}). Выполняем переавторизацию, попытка {attempt}/3...");
+                _logger.Warn(
+                    $"Источник {sourceUrl}: обнаружен редирект в logout/login ({page.Url}). Выполняем переавторизацию, попытка {attempt}/3...");
                 var authOk = await EnsureAuthenticatedAsync(page);
                 if (!authOk)
                 {
@@ -1306,9 +1339,11 @@ internal sealed class UnityAssetAutomationApp
 
             await ScrollSourcePageAsync(page, TimeSpan.FromSeconds(20));
 
-            if (IsLikelySignOutFlowUrl(page.Url) || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+            if (IsLikelySignOutFlowUrl(page.Url) ||
+                page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
             {
-                _logger.Warn($"Источник {sourceUrl}: во время скролла произошел редирект в logout/login ({page.Url}). Повторяем источник...");
+                _logger.Warn(
+                    $"Источник {sourceUrl}: во время скролла произошел редирект в logout/login ({page.Url}). Повторяем источник...");
                 var authOk = await EnsureAuthenticatedAsync(page);
                 if (!authOk)
                 {
@@ -1378,12 +1413,15 @@ internal sealed class UnityAssetAutomationApp
             });
         }"), "CollectAssetUrlsFromAssetStorePage");
 
-            var parsed = JsonSerializer.Deserialize<SourceCollectionSnapshot>(raw ?? "{}", _runtimeJsonOptions) ?? new SourceCollectionSnapshot();
-            _logger.Info($"Источник Asset Store: найдено карточек={parsed.TotalFound}, пропущено как owned={parsed.OwnedSkipped}, к обработке={parsed.Urls.Count}");
+            var parsed = JsonSerializer.Deserialize<SourceCollectionSnapshot>(raw ?? "{}", _runtimeJsonOptions) ??
+                         new SourceCollectionSnapshot();
+            _logger.Info(
+                $"Источник Asset Store: найдено карточек={parsed.TotalFound}, пропущено как owned={parsed.OwnedSkipped}, к обработке={parsed.Urls.Count}");
 
             if (parsed.TotalFound == 0 && attempt < 3)
             {
-                _logger.Warn($"Источник {sourceUrl}: карточки не обнаружены (0). Повторяем чтение источника ({attempt}/3)...");
+                _logger.Warn(
+                    $"Источник {sourceUrl}: карточки не обнаружены (0). Повторяем чтение источника ({attempt}/3)...");
                 await Task.Delay(1200);
                 continue;
             }
@@ -1414,13 +1452,17 @@ internal sealed class UnityAssetAutomationApp
 
         while (DateTime.UtcNow < stopAt && stableIterations < 4)
         {
-            if (IsLikelySignOutFlowUrl(page.Url) || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+            if (IsLikelySignOutFlowUrl(page.Url) ||
+                page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
             {
-                _logger.Debug($"ScrollSourcePage: обнаружен logout/login URL ({page.Url}), досрочно останавливаем скролл.");
+                _logger.Debug(
+                    $"ScrollSourcePage: обнаружен logout/login URL ({page.Url}), досрочно останавливаем скролл.");
                 return;
             }
 
-            var currentCount = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<int>(@"() => document.querySelectorAll('a[href*=""/packages/""]').length"), "ScrollSourcePage(count)");
+            var currentCount = await EvaluateWithRetryAsync(
+                () => page.EvaluateFunctionAsync<int>(
+                    @"() => document.querySelectorAll('a[href*=""/packages/""]').length"), "ScrollSourcePage(count)");
 
             if (currentCount <= lastCount)
             {
@@ -1433,7 +1475,8 @@ internal sealed class UnityAssetAutomationApp
             }
 
             await EvaluateWithRetryAsync(
-                () => page.EvaluateFunctionAsync<int>(@"() => { window.scrollBy(0, window.innerHeight * 1.6); return document.querySelectorAll(""a[href*='/packages/']"").length; }"),
+                () => page.EvaluateFunctionAsync<int>(
+                    @"() => { window.scrollBy(0, window.innerHeight * 1.6); return document.querySelectorAll(""a[href*='/packages/']"").length; }"),
                 "ScrollSourcePage(scroll)");
             await Task.Delay(900);
         }
@@ -1441,7 +1484,8 @@ internal sealed class UnityAssetAutomationApp
 
     private static IEnumerable<string> ExtractAssetUrlsFromHtml(string html, string baseUrl)
     {
-        var regex = new Regex(@"(?:https?:\/\/assetstore\.unity\.com)?\/packages\/[\w\-\/%\.~]+", RegexOptions.IgnoreCase);
+        var regex = new Regex(@"(?:https?:\/\/assetstore\.unity\.com)?\/packages\/[\w\-\/%\.~]+",
+            RegexOptions.IgnoreCase);
         var baseUri = new Uri(baseUrl);
 
         static bool HasOwnedSignalsNearUrl(string content, int index)
@@ -1513,7 +1557,8 @@ internal sealed class UnityAssetAutomationApp
                 var ready = await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(_options.AssetUiTimeoutMs));
                 if (!ready)
                 {
-                    _logger.Warn("Не удалось дождаться появления ключевых элементов ассета (Add/Open/Sign in/Buy). Продолжаем с текущими данными страницы.");
+                    _logger.Warn(
+                        "Не удалось дождаться появления ключевых элементов ассета (Add/Open/Sign in/Buy). Продолжаем с текущими данными страницы.");
                 }
 
                 var status = await DetectStatusAsync(page);
@@ -1521,21 +1566,29 @@ internal sealed class UnityAssetAutomationApp
                 result.DetectedOwned = status.IsOwned;
                 result.CountsTowardsAddLimit = status.IsFree;
                 result.PurchasedOnText = status.PurchasedOnText;
-                result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary) ? "no-signals" : status.DetectionSummary;
-                _logger.Debug($"CTA snapshot: openInUnity={status.HasOpenInUnity}, addToMyAssets={status.HasAddToMyAssets}, requiresLogin={status.RequiresLogin}, free={status.IsFree}, owned={status.IsOwned}");
+                result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary)
+                    ? "no-signals"
+                    : status.DetectionSummary;
+                _logger.Debug(
+                    $"CTA snapshot: openInUnity={status.HasOpenInUnity}, addToMyAssets={status.HasAddToMyAssets}, requiresLogin={status.RequiresLogin}, free={status.IsFree}, owned={status.IsOwned}");
 
                 if (!status.HasAddToMyAssets && !status.HasOpenInUnity && !status.RequiresLogin)
                 {
-                    _logger.Debug("Не найдены ключевые CTA-сигналы (Add/Open/SignIn). Выполняем расширенное ожидание и повторную детекцию...");
-                    await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Max(_options.AssetUiTimeoutMs, 45000)));
+                    _logger.Debug(
+                        "Не найдены ключевые CTA-сигналы (Add/Open/SignIn). Выполняем расширенное ожидание и повторную детекцию...");
+                    await WaitForAssetSignalsAsync(page,
+                        TimeSpan.FromMilliseconds(Math.Max(_options.AssetUiTimeoutMs, 45000)));
 
                     status = await DetectStatusAsync(page);
                     result.DetectedFree = status.IsFree;
                     result.DetectedOwned = status.IsOwned;
                     result.CountsTowardsAddLimit = status.IsFree;
                     result.PurchasedOnText = status.PurchasedOnText;
-                    result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary) ? "no-signals" : status.DetectionSummary;
-                    _logger.Debug($"CTA snapshot (after extra wait): openInUnity={status.HasOpenInUnity}, addToMyAssets={status.HasAddToMyAssets}, requiresLogin={status.RequiresLogin}, free={status.IsFree}, owned={status.IsOwned}");
+                    result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary)
+                        ? "no-signals"
+                        : status.DetectionSummary;
+                    _logger.Debug(
+                        $"CTA snapshot (after extra wait): openInUnity={status.HasOpenInUnity}, addToMyAssets={status.HasAddToMyAssets}, requiresLogin={status.RequiresLogin}, free={status.IsFree}, owned={status.IsOwned}");
                 }
 
                 _logger.Debug($"Статус ассета (до действия): {status.DetectionSummary}");
@@ -1545,7 +1598,8 @@ internal sealed class UnityAssetAutomationApp
 
                 if (needsReAuth)
                 {
-                    _logger.Warn($"Обнаружены признаки неавторизованной сессии на странице ассета. Попытка переавторизации {processingAttempt}/2...");
+                    _logger.Warn(
+                        $"Обнаружены признаки неавторизованной сессии на странице ассета. Попытка переавторизации {processingAttempt}/2...");
                     var reAuthOk = await EnsureAuthenticatedAsync(page);
                     if (!reAuthOk)
                     {
@@ -1561,8 +1615,10 @@ internal sealed class UnityAssetAutomationApp
 
                     if (!status.HasAddToMyAssets && !status.HasOpenInUnity && !status.RequiresLogin)
                     {
-                        _logger.Debug("После переавторизации CTA-сигналы все еще не готовы. Выполняем расширенное ожидание и повторную детекцию...");
-                        await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Max(_options.AssetUiTimeoutMs, 45000)));
+                        _logger.Debug(
+                            "После переавторизации CTA-сигналы все еще не готовы. Выполняем расширенное ожидание и повторную детекцию...");
+                        await WaitForAssetSignalsAsync(page,
+                            TimeSpan.FromMilliseconds(Math.Max(_options.AssetUiTimeoutMs, 45000)));
                         status = await DetectStatusAsync(page);
                     }
 
@@ -1570,9 +1626,12 @@ internal sealed class UnityAssetAutomationApp
                     result.DetectedOwned = status.IsOwned;
                     result.CountsTowardsAddLimit = status.IsFree;
                     result.PurchasedOnText = status.PurchasedOnText;
-                    result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary) ? "no-signals" : status.DetectionSummary;
+                    result.DetectionSummary = string.IsNullOrWhiteSpace(status.DetectionSummary)
+                        ? "no-signals"
+                        : status.DetectionSummary;
                     _logger.Debug($"Статус ассета (после переавторизации): {status.DetectionSummary}");
-                    _logger.Debug($"CTA snapshot (after re-auth): openInUnity={status.HasOpenInUnity}, addToMyAssets={status.HasAddToMyAssets}, requiresLogin={status.RequiresLogin}, free={status.IsFree}, owned={status.IsOwned}");
+                    _logger.Debug(
+                        $"CTA snapshot (after re-auth): openInUnity={status.HasOpenInUnity}, addToMyAssets={status.HasAddToMyAssets}, requiresLogin={status.RequiresLogin}, free={status.IsFree}, owned={status.IsOwned}");
                 }
 
                 if (status.HasOpenInUnity || status.IsOwned)
@@ -1596,7 +1655,8 @@ internal sealed class UnityAssetAutomationApp
                 if (!status.HasAddToMyAssets)
                 {
                     result.Status = AssetProcessStatus.Failed;
-                    result.Message = "Кнопка Add to My Assets не найдена (возможно требуется вход или изменена верстка).";
+                    result.Message =
+                        "Кнопка Add to My Assets не найдена (возможно требуется вход или изменена верстка).";
                     await SaveErrorScreenshotAsync(page, "add-button-not-found");
                     return result;
                 }
@@ -1623,11 +1683,14 @@ internal sealed class UnityAssetAutomationApp
                     TimeSpan.FromMilliseconds(Math.Max(12000, Math.Min(_options.AssetUiTimeoutMs, 45000))));
 
                 result.PurchasedOnText = postStatus.PurchasedOnText ?? result.PurchasedOnText;
-                result.DetectionSummary = string.IsNullOrWhiteSpace(postStatus.DetectionSummary) ? "no-signals" : postStatus.DetectionSummary;
+                result.DetectionSummary = string.IsNullOrWhiteSpace(postStatus.DetectionSummary)
+                    ? "no-signals"
+                    : postStatus.DetectionSummary;
                 _logger.Debug($"Статус ассета (после клика): {postStatus.DetectionSummary}");
                 _logger.Debug($"PostAddOpenInUnity={(postStatus.HasOpenInUnity || postStatus.IsOwned)}");
 
-                if (postStatus.RequiresLogin || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+                if (postStatus.RequiresLogin ||
+                    page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
                 {
                     _logger.Warn("После попытки добавления потребовалась повторная авторизация.");
                     continue;
@@ -1668,7 +1731,8 @@ internal sealed class UnityAssetAutomationApp
             var current = await DetectStatusAsync(page);
             lastStatus = current;
 
-            _logger.Debug($"PostAddCycle[{cycle}]: openInUnity={current.HasOpenInUnity}, addToMyAssets={current.HasAddToMyAssets}, requiresLogin={current.RequiresLogin}, owned={current.IsOwned}");
+            _logger.Debug(
+                $"PostAddCycle[{cycle}]: openInUnity={current.HasOpenInUnity}, addToMyAssets={current.HasAddToMyAssets}, requiresLogin={current.RequiresLogin}, owned={current.IsOwned}");
 
             if (current.RequiresLogin || page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
             {
@@ -1700,16 +1764,20 @@ internal sealed class UnityAssetAutomationApp
                 }
 
                 refreshAttempt++;
-                _logger.Debug($"PostAddCycle[{cycle}]: Open in Unity ещё не появился. Обновляем страницу ассета (refresh={refreshAttempt})...");
+                _logger.Debug(
+                    $"PostAddCycle[{cycle}]: Open in Unity ещё не появился. Обновляем страницу ассета (refresh={refreshAttempt})...");
                 await SafeGoToAsync(page, assetUrl);
-                await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 15000)));
+                await WaitForAssetSignalsAsync(page,
+                    TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 15000)));
             }
             else
             {
                 refreshAttempt++;
-                _logger.Debug($"PostAddCycle[{cycle}]: Add/Open не видны, выполняем контрольный refresh (refresh={refreshAttempt})...");
+                _logger.Debug(
+                    $"PostAddCycle[{cycle}]: Add/Open не видны, выполняем контрольный refresh (refresh={refreshAttempt})...");
                 await SafeGoToAsync(page, assetUrl);
-                await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 15000)));
+                await WaitForAssetSignalsAsync(page,
+                    TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 15000)));
             }
         }
 
@@ -1826,7 +1894,8 @@ internal sealed class UnityAssetAutomationApp
             });
         }"), "DetectStatus");
 
-        return JsonSerializer.Deserialize<AssetStatusSnapshot>(raw ?? "{}", _runtimeJsonOptions) ?? new AssetStatusSnapshot();
+        return JsonSerializer.Deserialize<AssetStatusSnapshot>(raw ?? "{}", _runtimeJsonOptions) ??
+               new AssetStatusSnapshot();
     }
 
     private async Task<bool> WaitForAssetSignalsAsync(IPage page, TimeSpan timeout)
@@ -2089,6 +2158,7 @@ internal sealed class AppLogger : IDisposable
     public void Info(string message) => Write("INFO", message);
     public void Warn(string message) => Write("WARN", message);
     public void Error(string message) => Write("ERROR", message);
+
     public void Debug(string message)
     {
         if (_verbose || _traceNetwork)
@@ -2393,7 +2463,8 @@ internal sealed class CliOptions
         if ((string.IsNullOrWhiteSpace(unityEmail) && !string.IsNullOrWhiteSpace(unityPassword)) ||
             (!string.IsNullOrWhiteSpace(unityEmail) && string.IsNullOrWhiteSpace(unityPassword)))
         {
-            Console.WriteLine("Для автовхода необходимо задать и UNITY_EMAIL, и UNITY_PASSWORD (или оба через CLI). Будет использован ручной вход.");
+            Console.WriteLine(
+                "Для автовхода необходимо задать и UNITY_EMAIL, и UNITY_PASSWORD (или оба через CLI). Будет использован ручной вход.");
             unityEmail = null;
             unityPassword = null;
         }
@@ -2520,7 +2591,9 @@ internal sealed class SessionStateSnapshot
 {
     public DateTime SavedAtUtc { get; set; }
     public List<SerializableCookie> Cookies { get; set; } = [];
-    public Dictionary<string, Dictionary<string, string>> LocalStorageByOrigin { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public Dictionary<string, Dictionary<string, string>> LocalStorageByOrigin { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
 }
 
 internal sealed class RunReport
