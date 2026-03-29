@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using PuppeteerSharp;
@@ -424,7 +424,6 @@ internal sealed class UnityAssetAutomationApp
     private async Task<bool> WaitForAuthenticatedSessionAsync(IPage page, TimeSpan timeout)
     {
         var stopAt = DateTime.UtcNow.Add(timeout);
-        var redirectedToAssetStore = false;
 
         while (DateTime.UtcNow < stopAt)
         {
@@ -442,7 +441,6 @@ internal sealed class UnityAssetAutomationApp
 
             if (page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
             {
-                redirectedToAssetStore = false;
                 if (await HasAuthMarkersAsync(page))
                 {
                     _logger.Info("AuthStep: auth-confirmed");
@@ -459,12 +457,11 @@ internal sealed class UnityAssetAutomationApp
                     }
                 }
             }
-            else if (!redirectedToAssetStore)
+            else
             {
-                _logger.Debug(
-                    $"AuthWait: сторонний URL '{page.Url}'. Возвращаемся в Asset Store для проверки статуса...");
-                await SafeGoToAsync(page, AssetStoreHomeUrl);
-                redirectedToAssetStore = true;
+                // Не форсируем редирект, чтобы не прерывать цепочку OAuth (Google, Apple, Facebook и др.)
+                // или внутренние редиректы Unity. OAuth может происходить на других доменах.
+                _logger.Debug($"AuthWait: промежуточный или сторонний URL '{page.Url}'. Ожидаем завершения входа...");
             }
 
             await Task.Delay(1500);

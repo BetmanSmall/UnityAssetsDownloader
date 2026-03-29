@@ -17,41 +17,61 @@ set "PROJECT=UnityAssetsDownloader/UnityAssetsDownloader.csproj"
 :menu
 cls
 echo ==============================================
-echo UnityAssetsDownloader - универсальный запуск / universal launcher
+echo UnityAssetsDownloader - выбор режима / Mode selection
 echo ==============================================
 echo.
-echo 1^) [По умолчанию / Default] Простой запуск ^(видимый браузер^) / Simple run ^(visible browser^)
-echo 2^) Только логин и сохранение cookies / Login only and save cookies
-echo 3^) Dry-run ^(проверка без добавления в аккаунт^) / Dry-run ^(check without adding to account^)
-echo 4^) Расширенные источники / Extended sources
-echo 5^) Дополнительный файл ссылок ^(extra_asset_urls.example.txt^) / Extra URL file
-echo 6^) Выход / Exit
+echo 1^) [Все источники] Топ бесплатные + Китайский архив + extra_urls + расширенные
+echo 2^) Только из топ бесплатных (Asset Store top-free^)
+echo 3^) Только из списка free_list_GreaterChinaUnityAssetArchiveLinks.txt
+echo 4^) Только из списка extra_asset_urls.example.txt
+echo 5^) Только логин и сохранение cookies / Login only and save cookies
+echo 6^) Dry-run ^(проверка без добавления в аккаунт^)
+echo 7^) Выход / Exit
 echo.
 set "opt="
 set /p "opt=Выберите режим / Choose mode [Enter = 1]: "
 if not defined opt set "opt=1"
 
-if "%opt%"=="1" goto run_default
-if "%opt%"=="2" goto run_login
-if "%opt%"=="3" goto run_dry
-if "%opt%"=="4" goto run_extended
-if "%opt%"=="5" goto run_extra_file
-if "%opt%"=="6" goto end
+if "%opt%"=="1" goto run_all
+if "%opt%"=="2" goto run_top_free
+if "%opt%"=="3" goto run_china_list
+if "%opt%"=="4" goto run_extra_list
+if "%opt%"=="5" goto run_login
+if "%opt%"=="6" goto run_dry
+if "%opt%"=="7" goto end
 
 echo.
 echo Некорректный выбор / Invalid choice: %opt%
 pause
 goto menu
 
-:run_default
+:run_all
 echo.
-echo Запуск: простой режим по умолчанию... / Running: default simple mode...
-dotnet run --project "%PROJECT%" -- --headless false --verbose
+echo Запуск: все возможные источники... / Running: all sources...
+dotnet run --project "%PROJECT%" -- --headless false --extra-source-file "extra_asset_urls.example.txt" --extended-sources --verbose
+goto after_run
+
+:run_top_free
+echo.
+echo Запуск: только топ бесплатные... / Running: only top free...
+dotnet run --project "%PROJECT%" -- --headless false --source "https://assetstore.unity.com/top-assets/top-free" --verbose
+goto after_run
+
+:run_china_list
+echo.
+echo Запуск: только из free_list_GreaterChinaUnityAssetArchiveLinks...
+dotnet run --project "%PROJECT%" -- --headless false --source "https://assetstore.unity.com/" --extra-source-file "free_list_GreaterChinaUnityAssetArchiveLinks.txt" --verbose
+goto after_run
+
+:run_extra_list
+echo.
+echo Запуск: только из extra_asset_urls.example.txt...
+dotnet run --project "%PROJECT%" -- --headless false --source "https://assetstore.unity.com/" --extra-source-file "extra_asset_urls.example.txt" --verbose
 goto after_run
 
 :run_login
 echo.
-echo Запуск: только логин и сохранение cookies... / Running: login only and save cookies...
+echo Запуск: только логин и сохранение cookies... / Running: login only...
 dotnet run --project "%PROJECT%" -- --login --headless false --verbose
 goto after_run
 
@@ -59,18 +79,6 @@ goto after_run
 echo.
 echo Запуск: dry-run... / Running: dry-run...
 dotnet run --project "%PROJECT%" -- --dry-run --headless false --verbose
-goto after_run
-
-:run_extended
-echo.
-echo Запуск: расширенные источники... / Running: extended sources...
-dotnet run --project "%PROJECT%" -- --headless false --extended-sources --verbose
-goto after_run
-
-:run_extra_file
-echo.
-echo Запуск: дополнительный файл ссылок... / Running: extra URL file...
-dotnet run --project "%PROJECT%" -- --headless false --extra-source-file "extra_asset_urls.example.txt" --verbose
 goto after_run
 
 :after_run
