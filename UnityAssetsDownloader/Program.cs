@@ -16,6 +16,8 @@ internal sealed class UnityAssetAutomationApp
     private const string BaseFreeListFileName =
         "GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt";
 
+    private const string ExtendedSourcesFileName = "extended_sources.txt";
+
     private readonly CliOptions _options;
     private readonly AppLogger _logger;
     private readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true };
@@ -44,63 +46,7 @@ internal sealed class UnityAssetAutomationApp
         "https://login.unity.com"
     ];
 
-    private static readonly string[] ExtendedSources =
-    [
-        "https://vanquish3r.github.io/greater-china-unity-assets/",
-        "https://assetstore.unity.com/search#nf-ec_price_filter=0...0",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=96",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=192",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=288",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=384",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=480",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=576",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=672",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=768",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=864",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=960",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=1056",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=1152",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=1248",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=1344",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=1440",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=1536",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=1632",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=1728",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=1824",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=1920",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=2016",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=2112",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=2208",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=2304",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=2400",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=2496",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=2592",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=2688",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=2784",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=2880",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=2976",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=3072",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=3168",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=3264",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=3360",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=3456",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=3552",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=3648",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=3744",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=3840",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=3936",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=4032",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=4128",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=4224",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=4320",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=4416",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=4512",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=4608",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=4704",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=4800",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=4896",
-        "https://assetstore.unity.com/search?hideOwnership=true#nf-ec_price_filter=0...0&firstResult=4992"
-    ];
+    // Расширенные источники поиска теперь загружаются из отдельного файла
 
     public UnityAssetAutomationApp(CliOptions options)
     {
@@ -128,12 +74,27 @@ internal sealed class UnityAssetAutomationApp
             {
                 Headless = _options.Headless,
                 DefaultViewport = null,
-                Args = ["--start-maximized"]
+                IgnoredDefaultArgs = ["--enable-automation"],
+                Args =
+                [
+                    "--start-maximized",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars"
+                ]
             });
 
             await using var page = await browser.NewPageAsync();
             page.DefaultNavigationTimeout = _options.NavigationTimeoutMs;
             page.DefaultTimeout = _options.NavigationTimeoutMs;
+
+            // Скрываем признаки Puppeteer (чтобы пускал Google OAuth)
+            await page.EvaluateFunctionOnNewDocumentAsync(@"() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            }");
+
+            var ua = await browser.GetUserAgentAsync();
+            await page.SetUserAgentAsync(ua.Replace("HeadlessChrome", "Chrome"));
+
             AttachPageDiagnostics(page);
 
             var authenticated = await EnsureAuthenticatedAsync(page);
@@ -460,10 +421,18 @@ internal sealed class UnityAssetAutomationApp
             else
             {
                 // Не форсируем редирект, чтобы не прерывать цепочку OAuth (Google, Apple, Facebook и др.)
-                // или внутренние редиректы Unity. OAuth может происходить на других доменах.
-                _logger.Debug($"AuthWait: промежуточный или сторонний URL '{page.Url}'. Ожидаем завершения входа...");
+                // Возвращаем в Asset Store только если цепочка завершилась в консоли Unity
+                if (page.Url.Contains("cloud.unity.com/home", StringComparison.OrdinalIgnoreCase) ||
+                    page.Url.Contains("cloud.unity.com/account", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.Info($"Вход выполнен, но открыта страница консоли ({page.Url}). Возвращаемся в Asset Store...");
+                    await SafeGoToAsync(page, "https://assetstore.unity.com/");
+                }
+                else
+                {
+                    _logger.Debug($"AuthWait: промежуточный или сторонний URL '{page.Url}'. Ожидаем завершения входа...");
+                }
             }
-
             await Task.Delay(1500);
         }
 
@@ -550,11 +519,20 @@ internal sealed class UnityAssetAutomationApp
             const text = document.body?.innerText?.toLowerCase() || '';
             const hasMyAssetsLink = !!document.querySelector('a[href*=""/my-assets""], a[href*=""my-assets""]');
             const hasSignInLink = !!document.querySelector('a[href*=""login.unity.com""], a[href*=""/sign-in""]');
-            const hasMyAssetsText = text.includes('my assets');
-            const hasSignInText = text.includes('sign in');
+            
+            // Avoid false positives from 'add to my assets' inside product cards
+            const elements = Array.from(document.querySelectorAll('a, button, span, div, p'));
+            const hasMyAssetsText = elements.some(el => {
+                const t = (el.innerText || '').trim().toLowerCase();
+                return t === 'my assets';
+            });
+            const hasSignInText = elements.some(el => {
+                const t = (el.innerText || '').trim().toLowerCase();
+                return t === 'sign in' || t === 'log in';
+            });
+            
             const hasSignInWithUnityText = text.includes('sign in with unity');
-            const hasSignInWithUnityButton = Array.from(document.querySelectorAll('button, a, span'))
-                .some(el => (el.innerText || '').trim().toLowerCase().includes('sign in with unity'));
+            const hasSignInWithUnityButton = elements.some(el => (el.innerText || '').trim().toLowerCase() === 'sign in with unity');
 
             return JSON.stringify({
                 hasMyAssetsLink,
@@ -579,6 +557,8 @@ internal sealed class UnityAssetAutomationApp
             {
                 hasApiAuthMarkers = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<bool>(@"async () => {
                 try {
+                    // Используем другой API endpoint, который 100% отдает 401 для гостей
+                    // или требуем чтобы в ответе были разумные поля (например id или orgs)
                     const res = await fetch('/api/users/organizations', { credentials: 'include' });
                     if (!res.ok) return false;
                     const text = (await res.text() || '').trim();
@@ -588,6 +568,10 @@ internal sealed class UnityAssetAutomationApp
                     if (lower.includes('unauthorized') || lower.includes('forbidden') || lower.includes('sign in')) {
                         return false;
                     }
+
+                    // Если Unity отдает [], это может быть гость. Нужно чтобы что-то было, либо пробовать другой эндпоинт.
+                    // Изменим проверку: если вернулся пустой массив или пустой объект без id, возможно это ложноположительный ответ
+                     if (text === '[]' || text === '{}') return false;
 
                     return text.startsWith('{') || text.startsWith('[');
                 } catch {
@@ -626,7 +610,7 @@ internal sealed class UnityAssetAutomationApp
     private static async Task<bool> TryOpenUserProfileMenuAsync(IPage page)
     {
         return await page.EvaluateFunctionAsync<bool>(@"() => {
-            const button = document.querySelector('[aria-label=""Open user profile menu""], button[aria-label*=""profile"" i], button[aria-label*=""user"" i]');
+            const button = document.querySelector('[aria-label*=""profile"" i], [aria-label*=""user"" i], [aria-label*=""account"" i], button[class*=""user"" i], button[class*=""profile"" i]');
             if (!button) return false;
 
             button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
@@ -1234,9 +1218,12 @@ internal sealed class UnityAssetAutomationApp
 
         if (_options.UseExtendedSources)
         {
-            _logger.Info(
-                "Включены расширенные источники (--extended-sources). Добавляем дополнительные страницы поиска.");
-            sources.AddRange(ExtendedSources);
+            var extendedSourcesList = LoadSourcesFromFile(ExtendedSourcesFileName, "Файл расширенных источников поиска не найден");
+            if (extendedSourcesList.Count > 0)
+            {
+                _logger.Info($"Включены расширенные источники (--extended-sources). Загружено: {extendedSourcesList.Count}");
+                sources.AddRange(extendedSourcesList);
+            }
         }
 
         return sources
