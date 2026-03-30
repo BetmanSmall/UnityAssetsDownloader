@@ -16,17 +16,11 @@
 Склонируйте репозиторий на свой компьютер и перейдите в его папку:
 
 ```powershell
-git clone <URL_вашего_репозитория>
+git clone https://github.com/BetmanSmall/UnityAssetsDownloader
 cd UnityAssetsDownloader
 ```
 
 Для работы потребуется установленный **.NET SDK 8.0+** (Windows, Linux или macOS).
-Восстановите зависимости и соберите проект:
-
-```powershell
-dotnet restore UnityAssetsDownloader.sln
-dotnet build UnityAssetsDownloader.sln
-```
 
 > При первом запуске скрипт (через фреймворк PuppeteerSharp) автоматически скачает необходимую версию браузера Chromium.
 
