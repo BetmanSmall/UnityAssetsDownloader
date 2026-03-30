@@ -62,13 +62,13 @@ goto after_run
 :run_china_list
 echo.
 echo Запуск: только из free_list_GreaterChinaUnityAssetArchiveLinks...
-dotnet run --project "%PROJECT%" -- --headless false --source "https://assetstore.unity.com/" --extra-source-file "free_list_GreaterChinaUnityAssetArchiveLinks.txt" --verbose
+dotnet run --project "%PROJECT%" -- --headless false --no-defaults --extra-source-file "GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt" --verbose
 goto after_run
 
 :run_extra_list
 echo.
 echo Запуск: только из extra_asset_urls.example.txt...
-dotnet run --project "%PROJECT%" -- --headless false --source "https://assetstore.unity.com/" --extra-source-file "extra_asset_urls.example.txt" --verbose
+dotnet run --project "%PROJECT%" -- --headless false --no-defaults --extra-source-file "extra_asset_urls.example.txt" --verbose
 goto after_run
 
 :run_extended

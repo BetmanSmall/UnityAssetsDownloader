@@ -363,23 +363,45 @@ internal sealed class UnityAssetAutomationApp
         {
             _logger.Warn("Не удалось перейти к Sign In через меню профиля. Пробуем альтернативный путь входа...");
         }
+        else
+        {
+            var stopAt = DateTime.UtcNow.AddSeconds(5);
+            while (DateTime.UtcNow < stopAt && !IsAuthFlowUrl(page.Url))
+            {
+                await Task.Delay(500);
+            }
+        }
 
-        if (!page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+        if (!IsAuthFlowUrl(page.Url))
         {
             var clickedSignInWithUnity = await TryClickSignInWithUnityAsync(page);
             if (clickedSignInWithUnity)
             {
                 _logger.Info("AuthStep: click-sign-in-with-unity");
+                var stopAt = DateTime.UtcNow.AddSeconds(5);
+                while (DateTime.UtcNow < stopAt && !IsAuthFlowUrl(page.Url))
+                {
+                    await Task.Delay(500);
+                }
             }
         }
 
-        if (!page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+        if (!IsAuthFlowUrl(page.Url))
         {
-            _logger.Warn("Не удалось перейти на login.unity.com через UI. Используем прямой переход как fallback.");
+            _logger.Warn("Не удалось перейти на страницу входа через UI. Используем прямой переход как fallback.");
             await SafeGoToAsync(page, AssetStoreSignInUrl);
         }
 
         _logger.Info($"SSO запущен, текущий URL: {page.Url}");
+    }
+
+    private static bool IsAuthFlowUrl(string url)
+    {
+        return url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase) ||
+               url.Contains("api.unity.com", StringComparison.OrdinalIgnoreCase) ||
+               url.Contains("auth.cloud.unity.com", StringComparison.OrdinalIgnoreCase) ||
+               url.Contains("accounts.google", StringComparison.OrdinalIgnoreCase) ||
+               url.Contains("cloud.unity.com/login", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<bool> WaitForAuthenticatedSessionAsync(IPage page, TimeSpan timeout)
@@ -410,12 +432,9 @@ internal sealed class UnityAssetAutomationApp
 
                 if (!_options.HasCredentials)
                 {
-                    var clicked = await TryTriggerSignInFromHomeUiAsync(page) ||
-                                  await TryClickSignInWithUnityAsync(page);
-                    if (clicked)
-                    {
-                        _logger.Info("AuthStep: wait-user-login");
-                    }
+                    // В режиме ручного входа не пытаемся агрессивно кликать по меню каждую секунду,
+                    // так как это мешает пользователю. Просто ждем, пока он сам войдет.
+                    _logger.Debug("Ожидание авторизации пользователем...");
                 }
             }
             else
@@ -712,7 +731,7 @@ internal sealed class UnityAssetAutomationApp
             }
 
             _logger.Info("AuthStep: open-profile-menu");
-            var menuReady = await WaitForProfileMenuReadyAsync(page, TimeSpan.FromSeconds(12));
+            var menuReady = await WaitForProfileMenuReadyAsync(page, TimeSpan.FromSeconds(3));
             if (!menuReady)
             {
                 _logger.Warn("Меню профиля открыто, но пункты не успели загрузиться. Повторяем...");
@@ -1201,14 +1220,16 @@ internal sealed class UnityAssetAutomationApp
 
     private List<string> ResolveSources()
     {
-        var sources = _options.Sources.Count > 0
-            ? _options.Sources
-            : new List<string> { BaseTopFreeSource };
+        var sources = new List<string>();
 
-        if (_options.Sources.Count == 0)
+        if (_options.Sources.Count > 0)
         {
-            sources.AddRange(LoadSourcesFromFile(BaseFreeListFileName,
-                "Файл базового списка бесплатных ассетов не найден"));
+            sources.AddRange(_options.Sources);
+        }
+        else if (!_options.UseNoDefaults)
+        {
+            sources.Add(BaseTopFreeSource);
+            sources.AddRange(LoadSourcesFromFile(BaseFreeListFileName, "Файл базового списка бесплатных ассетов не найден"));
         }
 
         foreach (var extraFile in _options.ExtraSourceFiles)
@@ -1228,7 +1249,7 @@ internal sealed class UnityAssetAutomationApp
 
         return sources
             .Select(x => x.Trim())
-            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Where(x => !string.IsNullOrWhiteSpace(x) && !x.Equals("none", StringComparison.OrdinalIgnoreCase))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
@@ -2053,16 +2074,57 @@ internal sealed class UnityAssetAutomationApp
                 return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
             };
 
+            const simulateClick = (el) => {
+                if (!el) return;
+                const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+                for (const ev of events) {
+                    el.dispatchEvent(new MouseEvent(ev, { bubbles: true, cancelable: true, view: window }));
+                }
+            };
+
             for (let i = 0; i < 8; i++) {
                 const dialogs = Array.from(document.querySelectorAll('[role=""dialog""], [aria-modal=""true""], [class*=""modal"" i], [class*=""dialog"" i], [class*=""popup"" i], [class*=""overlay"" i]'))
                     .filter(visible);
 
                 for (const dialog of dialogs) {
+                    const checkboxes = Array.from(dialog.querySelectorAll('input[type=""checkbox""], [role=""checkbox""]'));
+                    let checkedAny = false;
+                    for (const cb of checkboxes) {
+                        const isInputChecked = cb.tagName.toLowerCase() === 'input' && cb.checked;
+                        const isAriaChecked = cb.getAttribute('aria-checked') === 'true';
+                        
+                        if (!isInputChecked && !isAriaChecked) {
+                            const label = cb.closest('label');
+                            if (label && visible(label)) {
+                                simulateClick(label);
+                            } else if (visible(cb)) {
+                                simulateClick(cb);
+                            } else {
+                                const nextElem = cb.nextElementSibling;
+                                if (nextElem && visible(nextElem)) {
+                                    simulateClick(nextElem);
+                                } else {
+                                    simulateClick(cb);
+                                }
+                            }
+                            
+                            if (cb.tagName.toLowerCase() === 'input') {
+                                cb.checked = true;
+                                cb.dispatchEvent(new Event('change', { bubbles: true }));
+                            }
+                            checkedAny = true;
+                        }
+                    }
+
+                    if (checkedAny) {
+                        await wait(500); // wait for UI to update enabled state of the Accept button
+                    }
+
                     const dialogText = normalize(dialog.innerText || '');
                     const candidates = Array.from(dialog.querySelectorAll('button, a, [role=""button""]')).filter(visible);
                     const candidateTexts = candidates.map(x => normalize(x.innerText));
 
-                    const hasAccept = candidateTexts.some(t => t === 'accept' || t.startsWith('accept '));
+                    const hasAccept = candidateTexts.some(t => t === 'accept' || t.startsWith('accept'));
                     const hasCancelLike = candidateTexts.some(t => t.includes('cancel') || t.includes('decline') || t.includes('close') || t.includes('back'));
                     const looksLikeAssetConfirmation = dialogText.includes('license') || dialogText.includes('agreement') || dialogText.includes('terms') || dialogText.includes('eula') || dialogText.includes('unity') || dialogText.includes('asset');
 
@@ -2072,9 +2134,18 @@ internal sealed class UnityAssetAutomationApp
                     for (const element of candidates) {
                         const txt = normalize(element.innerText);
                         if (!txt) continue;
-                        if (txt !== 'accept' && !txt.startsWith('accept ')) continue;
+                        if (!txt.startsWith('accept')) continue;
 
-                        element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        const isDisabled = element.disabled || 
+                                           element.getAttribute('aria-disabled') === 'true' || 
+                                           element.classList.contains('disabled') ||
+                                           element.classList.contains('btn-disabled');
+                        
+                        if (isDisabled) {
+                            continue; // Cannot click yet, loop and wait
+                        }
+
+                        simulateClick(element);
                         return true;
                     }
                 }
@@ -2179,6 +2250,7 @@ internal sealed class CliOptions
     public bool Verbose { get; init; }
     public bool TraceNetwork { get; init; }
     public bool UseExtendedSources { get; init; }
+    public bool UseNoDefaults { get; init; }
     public List<string> ExtraSourceFiles { get; init; } = [];
     public string? LogFilePath { get; init; }
     public string? UnityEmail { get; init; }
@@ -2202,6 +2274,7 @@ internal sealed class CliOptions
         var cliVerbose = false;
         var cliTraceNetwork = false;
         var cliUseExtendedSources = false;
+        var cliUseNoDefaults = false;
         string? cliLogFilePath = null;
         string? cliUnityEmail = null;
         string? cliUnityPassword = null;
@@ -2249,6 +2322,9 @@ internal sealed class CliOptions
                     break;
                 case "--extended-sources":
                     cliUseExtendedSources = true;
+                    break;
+                case "--no-defaults":
+                    cliUseNoDefaults = true;
                     break;
                 case "--log-file" when i + 1 < args.Length:
                     cliLogFilePath = args[++i];
@@ -2339,6 +2415,7 @@ internal sealed class CliOptions
         var verbose = cliVerbose || (config?.Verbose ?? false);
         var traceNetwork = cliTraceNetwork || (config?.TraceNetwork ?? false);
         var useExtendedSources = cliUseExtendedSources || (config?.ExtendedSources ?? false);
+        var useNoDefaults = cliUseNoDefaults || (config?.NoDefaults ?? false);
         if (traceNetwork)
         {
             verbose = true;
@@ -2461,6 +2538,7 @@ internal sealed class CliOptions
             Verbose = verbose,
             TraceNetwork = traceNetwork,
             UseExtendedSources = useExtendedSources,
+            UseNoDefaults = useNoDefaults,
             ExtraSourceFiles = extraSourceFiles,
             LogFilePath = logFilePath,
             UnityEmail = unityEmail,
@@ -2484,6 +2562,7 @@ internal sealed class AppConfig
     public bool? Verbose { get; init; }
     public bool? TraceNetwork { get; init; }
     public bool? ExtendedSources { get; init; }
+    public bool? NoDefaults { get; init; }
     public List<string> ExtraSourceFiles { get; init; } = [];
     public string? LogFilePath { get; init; }
     public string? UnityEmail { get; init; }
