@@ -27,7 +27,8 @@ echo 4^) Только из списка extra_asset_urls.example.txt
 echo 5^) Только из расширенных списков поиска (extended_sources.txt^)
 echo 6^) Только логин и сохранение cookies / Login only and save cookies
 echo 7^) Dry-run ^(проверка без добавления в аккаунт^)
-echo 8^) Выход / Exit
+echo 8^) Telegram каналы ^(парсинг и добавление ассетов^)
+echo 9^) Выход / Exit
 echo.
 set "opt="
 set /p "opt=Выберите режим / Choose mode [Enter = 1]: "
@@ -40,7 +41,8 @@ if "%opt%"=="4" goto run_extra_list
 if "%opt%"=="5" goto run_extended
 if "%opt%"=="6" goto run_login
 if "%opt%"=="7" goto run_dry
-if "%opt%"=="8" goto end
+if "%opt%"=="8" goto run_telegram
+if "%opt%"=="9" goto end
 
 echo.
 echo Некорректный выбор / Invalid choice: %opt%
@@ -87,6 +89,37 @@ goto after_run
 echo.
 echo Запуск: dry-run... / Running: dry-run...
 dotnet run --project "%PROJECT%" -- --dry-run --headless false --verbose
+goto after_run
+
+:run_telegram
+echo.
+echo Запуск: только Telegram каналы... / Running: only Telegram channels...
+echo.
+set "tg_channels="
+set /p "tg_channels=Введите имена каналов через запятую (или Enter для telegram_sources.txt): "
+if not defined tg_channels (
+    if exist telegram_sources.txt (
+        for /f "usebackq tokens=* delims=" %%a in ("telegram_sources.txt") do (
+            if defined tg_channels (
+                set "tg_channels=!tg_channels!,%%a"
+            ) else (
+                set "tg_channels=%%a"
+            )
+        )
+    )
+)
+if not defined tg_channels (
+    echo [WARN] Каналы не указаны. Используйте config.json или telegram_sources.txt
+    echo.
+    pause
+    goto menu
+)
+echo Запуск с каналами: %tg_channels%
+dotnet run --project "%PROJECT%" -- --headless false --no-defaults --tg-channels "%tg_channels%" --verbose
+echo.
+echo Telegram: git-ссылки сохранены в logs/telegram_git_links.log
+echo Telegram: промокоды сохранены в logs/telegram_promocodes.log
+echo Telegram: скриншоты постов без ссылок в logs/telegram/
 goto after_run
 
 :after_run

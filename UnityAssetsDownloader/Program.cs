@@ -70,17 +70,26 @@ internal sealed class UnityAssetAutomationApp
             _logger.Info("Подготовка браузера Chromium...");
             await new BrowserFetcher().DownloadAsync();
 
+            var browserArgs = new List<string>
+            {
+                "--start-maximized",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars"
+            };
+
+            if (_options.ProxyHost != null && _options.ProxyPort.HasValue)
+            {
+                var proxyArg = $"--proxy-server={_options.ProxyType ?? "socks5"}://{_options.ProxyHost}:{_options.ProxyPort}";
+                browserArgs.Add(proxyArg);
+                _logger.Info($"Прокси включён: {proxyArg}");
+            }
+
             await using var browser = await Puppeteer.LaunchAsync(new LaunchOptions
             {
                 Headless = _options.Headless,
                 DefaultViewport = null,
                 IgnoredDefaultArgs = ["--enable-automation"],
-                Args =
-                [
-                    "--start-maximized",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-infobars"
-                ]
+                Args = [..browserArgs]
             });
 
             await using var page = await browser.NewPageAsync();
@@ -112,6 +121,58 @@ internal sealed class UnityAssetAutomationApp
 
             var sources = ResolveSources();
             var assetUrls = await CollectAssetUrlsAsync(page, sources);
+
+            // Парсинг Telegram каналов (если указаны)
+            if (_options.TelegramChannels.Count > 0)
+            {
+                _logger.Info($"Запуск парсинга Telegram каналов: {string.Join(", ", _options.TelegramChannels)}");
+                var tgParser = new TelegramSourceParser(
+                    browser,
+                    _logger,
+                    _logsDirectory,
+                    _options.NavigationTimeoutMs,
+                    _options.TelegramPostLimit,
+                    _options.TelegramScreenshotOnNoLinks);
+
+                var tgResult = await tgParser.ParseChannelsAsync(_options.TelegramChannels);
+
+                if (tgResult.AssetUrls.Count > 0)
+                {
+                    _logger.Info($"Telegram: найдено ссылок на ассеты: {tgResult.AssetUrls.Count}");
+                    foreach (var url in tgResult.AssetUrls)
+                    {
+                        assetUrls.Add(url);
+                        _logger.Debug($"Telegram asset: {url}");
+                    }
+                }
+
+                if (tgResult.GitLinks.Count > 0)
+                {
+                    var gitLogPath = Path.Combine(_logsDirectory, "telegram_git_links.log");
+                    await File.WriteAllLinesAsync(gitLogPath, tgResult.GitLinks);
+                    _logger.Info($"Telegram git-ссылки сохранены в: {gitLogPath} (всего: {tgResult.GitLinks.Count})");
+                }
+
+                if (tgResult.Promocodes.Count > 0)
+                {
+                    var promoLogPath = Path.Combine(_logsDirectory, "telegram_promocodes.log");
+                    await File.WriteAllLinesAsync(promoLogPath, tgResult.Promocodes);
+                    _logger.Info($"Telegram промокоды сохранены в: {promoLogPath} (всего: {tgResult.Promocodes.Count})");
+                }
+
+                if (tgResult.PostsWithoutLinks.Count > 0)
+                {
+                    _logger.Warn($"Telegram: постов без ссылок: {tgResult.PostsWithoutLinks.Count}. Скриншоты сохранены в logs/telegram/");
+                }
+
+                if (tgResult.Errors.Count > 0)
+                {
+                    foreach (var err in tgResult.Errors)
+                    {
+                        _logger.Warn($"Telegram ошибка: {err}");
+                    }
+                }
+            }
 
             _logger.Info($"Найдено уникальных ассетов: {assetUrls.Count}");
             var report = new RunReport
@@ -2263,6 +2324,16 @@ internal sealed class CliOptions
     public int? MaxVisitedAssets { get; init; }
     public List<string> Sources { get; init; } = [];
     public bool HasCredentials => !string.IsNullOrWhiteSpace(UnityEmail) && !string.IsNullOrWhiteSpace(UnityPassword);
+    
+    // Прокси
+    public string? ProxyType { get; init; }
+    public string? ProxyHost { get; init; }
+    public int? ProxyPort { get; init; }
+    
+    // Telegram
+    public List<string> TelegramChannels { get; init; } = [];
+    public int TelegramPostLimit { get; init; } = 20;
+    public bool TelegramScreenshotOnNoLinks { get; init; } = true;
 
     public static CliOptions Parse(string[] args)
     {
@@ -2286,6 +2357,7 @@ internal sealed class CliOptions
         int? cliMaxVisitedAssets = null;
         var cliSources = new List<string>();
         var cliExtraSourceFiles = new List<string>();
+        var cliTelegramChannels = new List<string>();
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -2395,6 +2467,16 @@ internal sealed class CliOptions
                 case "--extra-source-file" when i + 1 < args.Length:
                     cliExtraSourceFiles.Add(args[++i]);
                     break;
+                case "--tg-channels" when i + 1 < args.Length:
+                {
+                    var raw = args[++i];
+                    foreach (var ch in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    {
+                        if (!string.IsNullOrWhiteSpace(ch))
+                            cliTelegramChannels.Add(ch);
+                    }
+                    break;
+                }
             }
         }
 
@@ -2530,6 +2612,24 @@ internal sealed class CliOptions
             unityPassword = null;
         }
 
+        // Прокси из конфига
+        string? proxyType = config?.Proxy?.Type;
+        string? proxyHost = config?.Proxy?.Host;
+        int? proxyPort = config?.Proxy?.Port;
+
+        // Telegram из конфига + CLI (CLI имеет приоритет)
+        var telegramChannels = new List<string>();
+        if (cliTelegramChannels.Count > 0)
+        {
+            telegramChannels.AddRange(cliTelegramChannels);
+        }
+        else if (config?.Telegram?.Channels?.Count > 0)
+        {
+            telegramChannels.AddRange(config.Telegram.Channels);
+        }
+        var telegramPostLimit = config?.Telegram?.PostLimit ?? 20;
+        var telegramScreenshotOnNoLinks = config?.Telegram?.ScreenshotOnNoLinks ?? true;
+
         return new CliOptions
         {
             LoginOnly = loginOnly,
@@ -2549,7 +2649,13 @@ internal sealed class CliOptions
             AssetUiTimeoutMs = assetUiTimeoutMs,
             MaxAddAttempts = maxAddAttempts,
             MaxVisitedAssets = maxVisitedAssets,
-            Sources = sources
+            Sources = sources,
+            ProxyType = proxyType,
+            ProxyHost = proxyHost,
+            ProxyPort = proxyPort,
+            TelegramChannels = telegramChannels,
+            TelegramPostLimit = telegramPostLimit,
+            TelegramScreenshotOnNoLinks = telegramScreenshotOnNoLinks
         };
     }
 }
@@ -2574,6 +2680,8 @@ internal sealed class AppConfig
     public int? MaxAddAttempts { get; init; }
     public int? MaxVisitedAssets { get; init; }
     public List<string> Sources { get; init; } = [];
+    public ProxyConfig? Proxy { get; init; }
+    public TelegramConfig? Telegram { get; init; }
 
     public static AppConfig? Load(string? explicitConfigPath, out string? usedConfigPath, out string? error)
     {
@@ -2612,6 +2720,20 @@ internal sealed class AppConfig
             return null;
         }
     }
+}
+
+internal sealed class ProxyConfig
+{
+    public string Type { get; init; } = "socks5";
+    public string Host { get; init; } = "127.0.0.1";
+    public int Port { get; init; } = 1080;
+}
+
+internal sealed class TelegramConfig
+{
+    public List<string> Channels { get; init; } = [];
+    public int PostLimit { get; init; } = 20;
+    public bool ScreenshotOnNoLinks { get; init; } = true;
 }
 
 internal sealed class SerializableCookie
