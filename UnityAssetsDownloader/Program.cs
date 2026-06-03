@@ -136,6 +136,22 @@ internal sealed class UnityAssetAutomationApp
 
                 var tgResult = await tgParser.ParseChannelsAsync(_options.TelegramChannels);
 
+                if (tgResult.AllPosts.Count > 0)
+                {
+                    var tgPostsLogPath = Path.Combine(_logsDirectory, "telegram_posts_raw.log");
+                    var lines = new List<string>();
+                    foreach (var post in tgResult.AllPosts)
+                    {
+                        lines.Add("============================================================");
+                        lines.Add($"CHANNEL: {post.ChannelName} | POST ID: {post.PostId}");
+                        lines.Add("============================================================");
+                        lines.Add(post.Text);
+                        lines.Add(string.Empty);
+                    }
+                    await File.WriteAllLinesAsync(tgPostsLogPath, lines);
+                    _logger.Info($"Telegram: все тексты постов ({tgResult.AllPosts.Count}) сохранены в: {tgPostsLogPath}");
+                }
+
                 if (tgResult.AssetUrls.Count > 0)
                 {
                     _logger.Info($"Telegram: найдено ссылок на ассеты: {tgResult.AssetUrls.Count}");
@@ -1702,18 +1718,21 @@ internal sealed class UnityAssetAutomationApp
 
                 if (status.HasOpenInUnity || status.IsOwned)
                 {
+                    _logger.Info($"[Пропуск] Ассет уже принадлежит вашему аккаунту: {assetUrl}");
                     result.Status = AssetProcessStatus.AlreadyOwned;
                     return result;
                 }
 
                 if (!status.IsFree && !status.HasAddToMyAssets)
                 {
+                    _logger.Info($"[Пропуск] Ассет является платным: {assetUrl} (Сигналы: {status.DetectionSummary})");
                     result.Status = AssetProcessStatus.PaidSkipped;
                     return result;
                 }
 
                 if (_options.DryRun)
                 {
+                    _logger.Info($"[Имитация] Ассет бесплатный, был бы добавлен (Dry-run): {assetUrl}");
                     result.Status = AssetProcessStatus.WouldAddInDryRun;
                     return result;
                 }
@@ -1723,6 +1742,7 @@ internal sealed class UnityAssetAutomationApp
                     result.Status = AssetProcessStatus.Failed;
                     result.Message =
                         "Кнопка Add to My Assets не найдена (возможно требуется вход или изменена верстка).";
+                    _logger.Info($"[Ошибка] Не удалось обработать ассет: {assetUrl}. Причина: {result.Message}");
                     await SaveErrorScreenshotAsync(page, "add-button-not-found");
                     return result;
                 }
@@ -1732,6 +1752,7 @@ internal sealed class UnityAssetAutomationApp
                 {
                     result.Status = AssetProcessStatus.Failed;
                     result.Message = "Кнопка добавления не найдена.";
+                    _logger.Info($"[Ошибка] Не удалось обработать ассет: {assetUrl}. Причина: {result.Message}");
                     await SaveErrorScreenshotAsync(page, "add-button-not-found");
                     return result;
                 }
@@ -1765,11 +1786,21 @@ internal sealed class UnityAssetAutomationApp
                 result.Status = (postStatus.HasOpenInUnity || postStatus.IsOwned)
                     ? AssetProcessStatus.Added
                     : AssetProcessStatus.UnknownAfterClick;
+
+                if (result.Status == AssetProcessStatus.Added)
+                {
+                    _logger.Info($"[УСПЕХ] Ассет успешно добавлен на аккаунт: {assetUrl}");
+                }
+                else
+                {
+                    _logger.Info($"[Внимание] Кнопка добавления была нажата, но статус добавления не подтвержден: {assetUrl} (Сигналы: {result.DetectionSummary})");
+                }
                 return result;
             }
 
             result.Status = AssetProcessStatus.Failed;
             result.Message = "Не удалось завершить добавление после переавторизации.";
+            _logger.Info($"[Ошибка] {result.Message} ({assetUrl})");
             await SaveErrorScreenshotAsync(page, "reauth-loop-failed");
             return result;
         }
@@ -1777,6 +1808,7 @@ internal sealed class UnityAssetAutomationApp
         {
             result.Status = AssetProcessStatus.Failed;
             result.Message = ex.Message;
+            _logger.Info($"[Ошибка] Исключение при обработке ассета: {ex.Message} ({assetUrl})");
             await SaveErrorScreenshotAsync(page, "processing-error");
             return result;
         }
@@ -2544,7 +2576,7 @@ internal sealed class CliOptions
         }
 
         var sources = new List<string>();
-        if (config?.Sources?.Count > 0)
+        if (!useNoDefaults && config?.Sources?.Count > 0)
         {
             sources.AddRange(config.Sources.Where(x => !string.IsNullOrWhiteSpace(x)));
         }
@@ -2561,7 +2593,7 @@ internal sealed class CliOptions
             .ToList();
 
         var extraSourceFiles = new List<string>();
-        if (config?.ExtraSourceFiles?.Count > 0)
+        if (!useNoDefaults && config?.ExtraSourceFiles?.Count > 0)
         {
             extraSourceFiles.AddRange(config.ExtraSourceFiles.Where(x => !string.IsNullOrWhiteSpace(x)));
         }

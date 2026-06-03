@@ -58,6 +58,7 @@ internal sealed class TelegramSourceParser
             result.Promocodes.AddRange(channelResult.Promocodes);
             result.PostsWithoutLinks.AddRange(channelResult.PostsWithoutLinks);
             result.Errors.AddRange(channelResult.Errors);
+            result.AllPosts.AddRange(channelResult.AllPosts);
         }
 
         // Дедупликация
@@ -113,6 +114,12 @@ internal sealed class TelegramSourceParser
                 processedCount++;
 
                 var (text, postId) = post;
+                channelResult.AllPosts.Add(new TelegramPostInfo
+                {
+                    ChannelName = channelName,
+                    PostId = postId,
+                    Text = text
+                });
                 _logger.Debug($"[Telegram] {channelName} пост #{postId}: текст ({text.Length} символов)");
 
                 // Ищем ссылки на ассеты
@@ -269,7 +276,17 @@ internal sealed class TelegramSourceParser
 
                 // Извлекаем текст поста
                 const textEl = message.querySelector('.tgme_widget_message_text');
-                const text = textEl ? textEl.innerText || '' : '';
+                let text = textEl ? textEl.innerText || '' : '';
+
+                // Находим все ссылки <a> в сообщении и дописываем их href в текст поста,
+                // чтобы C# регулярные выражения могли извлечь скрытые за текстом ссылки (например, 'тут', 'вот здесь')
+                const links = message.querySelectorAll('a');
+                links.forEach(a => {
+                    const href = a.getAttribute('href') || '';
+                    if (href && !text.includes(href)) {
+                        text += '\n' + href;
+                    }
+                });
 
                 results.push({ text, postId });
             });
@@ -278,8 +295,17 @@ internal sealed class TelegramSourceParser
             if (results.length === 0) {
                 const articles = document.querySelectorAll('article, [class*=""message""], .tgme_widget_message');
                 articles.forEach(article => {
-                    const text = article.innerText || '';
+                    let text = article.innerText || '';
                     const postId = article.getAttribute('data-post') || 'unknown';
+
+                    const links = article.querySelectorAll('a');
+                    links.forEach(a => {
+                        const href = a.getAttribute('href') || '';
+                        if (href && !text.includes(href)) {
+                            text += '\n' + href;
+                        }
+                    });
+
                     results.push({ text, postId });
                 });
             }
@@ -307,7 +333,8 @@ internal sealed class TelegramSourceParser
             Directory.CreateDirectory(telegramDir);
 
             var safeChannel = SanitizeFileName(channelName);
-            var fileName = $"{safeChannel}_{DateTime.Now:yyyyMMdd-HHmmss}_post{postId}.png";
+            var safePostId = SanitizeFileName(postId);
+            var fileName = $"{safeChannel}_{DateTime.Now:yyyyMMdd-HHmmss}_post{safePostId}.png";
             var filePath = Path.Combine(telegramDir, fileName);
 
             // Скроллим к посту перед скриншотом
@@ -368,6 +395,7 @@ internal sealed class TelegramParseResult
     public List<string> Promocodes { get; set; } = [];
     public List<PostWithoutLink> PostsWithoutLinks { get; set; } = [];
     public List<string> Errors { get; set; } = [];
+    public List<TelegramPostInfo> AllPosts { get; set; } = [];
 }
 
 internal sealed class TelegramChannelResult
@@ -378,6 +406,7 @@ internal sealed class TelegramChannelResult
     public List<string> Promocodes { get; set; } = [];
     public List<PostWithoutLink> PostsWithoutLinks { get; set; } = [];
     public List<string> Errors { get; set; } = [];
+    public List<TelegramPostInfo> AllPosts { get; set; } = [];
 }
 
 internal sealed class PostWithoutLink
@@ -391,4 +420,11 @@ internal sealed class TelegramPostRaw
 {
     public string Text { get; set; } = string.Empty;
     public string PostId { get; set; } = string.Empty;
+}
+
+internal sealed class TelegramPostInfo
+{
+    public string ChannelName { get; set; } = string.Empty;
+    public string PostId { get; set; } = string.Empty;
+    public string Text { get; set; } = string.Empty;
 }
