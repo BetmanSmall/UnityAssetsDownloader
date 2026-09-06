@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using PuppeteerSharp;
@@ -67,13 +68,50 @@ internal sealed class UnityAssetAutomationApp
             Directory.CreateDirectory(_dataDirectory);
             Directory.CreateDirectory(_logsDirectory);
 
+            _logger.Info($"ОС: {RuntimeInformation.OSDescription} | Arch: {RuntimeInformation.OSArchitecture} | .NET: {RuntimeInformation.FrameworkDescription}");
+
             string? chromePath = null;
-            var potentialChromePaths = new[]
+            string[] potentialChromePaths;
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                @"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Google\Chrome\Application\chrome.exe")
-            };
+                potentialChromePaths =
+                [
+                    @"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                    @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        @"Google\Chrome\Application\chrome.exe")
+                ];
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                potentialChromePaths =
+                [
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                    "/Applications/Chromium.app/Contents/MacOS/Chromium"
+                ];
+            }
+            else
+            {
+                // Linux: стандартные пути + Snap + Flatpak (system + user, Steam Deck / SteamOS)
+                var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                potentialChromePaths =
+                [
+                    "/usr/bin/google-chrome",
+                    "/usr/bin/google-chrome-stable",
+                    "/usr/bin/chromium-browser",
+                    "/usr/bin/chromium",
+                    "/snap/bin/chromium",
+                    "/snap/bin/google-chrome",
+                    "/var/lib/flatpak/app/com.google.Chrome/current/active/files/chrome",
+                    "/var/lib/flatpak/app/org.chromium.Chromium/current/active/files/chromium",
+                    Path.Combine(home, ".local/share/flatpak/app/com.google.Chrome/current/active/files/chrome"),
+                    Path.Combine(home, ".local/share/flatpak/app/org.chromium.Chromium/current/active/files/chromium"),
+                    "/usr/lib/chromium-browser/chromium-browser",
+                    "/usr/lib/chromium/chromium",
+                    Path.Combine(home, ".local/bin/google-chrome")
+                ];
+            }
 
             foreach (var path in potentialChromePaths)
             {
@@ -86,13 +124,15 @@ internal sealed class UnityAssetAutomationApp
 
             if (chromePath != null)
             {
-                _logger.Info($"Используем локальный Google Chrome: {chromePath}");
+                _logger.Info($"Используем локальный браузер: {chromePath}");
             }
             else
             {
-                _logger.Info("Локальный Google Chrome не найден. Подготовка встроенного Chromium...");
+                _logger.Info("Локальный Chrome/Chromium не найден. Скачивание встроенного Chromium...");
+                _logger.Debug($"Проверялись пути: {string.Join(", ", potentialChromePaths)}");
                 await new BrowserFetcher().DownloadAsync();
             }
+
 
             var browserArgs = new List<string>
             {
@@ -122,10 +162,13 @@ internal sealed class UnityAssetAutomationApp
             }
 
             await using var browser = await Puppeteer.LaunchAsync(launchOptions);
+            var browserVersion = await browser.GetVersionAsync();
+            _logger.Info($"Браузер запущен: {browserVersion} | headless={_options.Headless}");
 
             await using var page = await browser.NewPageAsync();
             page.DefaultNavigationTimeout = _options.NavigationTimeoutMs;
             page.DefaultTimeout = _options.NavigationTimeoutMs;
+
 
             // Скрываем признаки Puppeteer (чтобы пускал Google OAuth)
             await page.EvaluateFunctionOnNewDocumentAsync(@"() => {
@@ -1864,62 +1907,85 @@ internal sealed class UnityAssetAutomationApp
     private async Task<ProcessResult> ProcessPromoAssetAsync(IPage page, string assetUrl, string promoCode, ProcessResult result)
     {
         var sanitizedId = SanitizeFileName(assetUrl.Split('/').Last());
+        var totalSw = Stopwatch.StartNew();
+        _logger.Info($"[Промокод] ===== НАЧАЛО выкупа по промокоду '{promoCode}' | ассет: {assetUrl} =====");
+
         try
         {
             // 1. Нажимаем кнопку "Add to Cart" или "Buy Now"
-            _logger.Info($"[Промокод] Добавление ассета в корзину: {assetUrl}");
+            var stepSw = Stopwatch.StartNew();
+            _logger.Info($"[Промокод][Шаг 1] Попытка нажать 'Add to Cart' / 'Buy Now' | URL: {page.Url}");
+            await LogAllButtonsAsync(page, "Шаг 1 - кнопки до клика");
             var clicked = await TryClickAddToCartOrBuyNowButtonAsync(page);
+            _logger.Info($"[Промокод][Шаг 1] clicked={clicked} | {stepSw.ElapsedMilliseconds}мс");
             if (!clicked)
             {
                 result.Status = AssetProcessStatus.Failed;
                 result.Message = "Не удалось нажать кнопку Add to Cart или Buy Now на странице ассета.";
-                _logger.Warn($"[Ошибка] {result.Message}");
+                _logger.Warn($"[Ошибка][Шаг 1] {result.Message}");
                 await SaveErrorScreenshotAsync(page, $"promo_failed_click_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step1_no_btn_{sanitizedId}");
                 return result;
             }
 
+
             await Task.Delay(3000);
+            _logger.Debug($"[Промокод][Шаг 1] URL после клика: {page.Url}");
             await SaveErrorScreenshotAsync(page, $"promo_added_to_cart_{sanitizedId}");
 
             // 2. Ожидаем автоматического перехода в корзину или чекаут
-            _logger.Info("[Промокод] Ожидание автоматического перехода в корзину или чекаут...");
+            stepSw.Restart();
+            _logger.Info($"[Промокод][Шаг 2] Ожидание редиректа в корзину/чекаут...");
             var redirected = false;
             for (var i = 0; i < 15; i++)
             {
-                if (page.Url.Contains("pay.unity.com", StringComparison.OrdinalIgnoreCase) || 
-                    page.Url.Contains("/cart", StringComparison.OrdinalIgnoreCase) || 
+                _logger.Debug($"[Промокод][Шаг 2] Проверка URL [{i+1}/15]: {page.Url}");
+                if (page.Url.Contains("pay.unity.com", StringComparison.OrdinalIgnoreCase) ||
+                    page.Url.Contains("/cart", StringComparison.OrdinalIgnoreCase) ||
                     page.Url.Contains("/checkout", StringComparison.OrdinalIgnoreCase))
                 {
                     redirected = true;
-                    _logger.Info($"[Промокод] Зафиксирован автоматический переход на: {page.Url}");
+                    _logger.Info($"[Промокод][Шаг 2] Автоматический переход зафиксирован: {page.Url} | {stepSw.ElapsedMilliseconds}мс");
                     break;
                 }
                 await Task.Delay(1000);
             }
 
+
             if (!redirected)
             {
-                _logger.Info("[Промокод] Автоматический переход не произошел за 15 секунд. Переходим принудительно на страницу корзины: https://assetstore.unity.com/cart");
+                _logger.Info($"[Промокод][Шаг 2] Авторедирект не произошёл за 15с. Принудительный переход на /cart | URL сейчас: {page.Url}");
                 await SafeGoToAsync(page, "https://assetstore.unity.com/cart");
                 await Task.Delay(3000);
+                _logger.Debug($"[Промокод][Шаг 2] URL после принудительного перехода: {page.Url}");
             }
+
 
             await SaveErrorScreenshotAsync(page, $"promo_pay_page_{sanitizedId}");
 
             // 3. Ожидание полей ввода
+            stepSw.Restart();
+            _logger.Info($"[Промокод][Шаг 3] Ожидание элементов страницы корзины (poле промо / кнопка оплаты) | URL: {page.Url}");
             var elementsReady = await WaitForCartPageElementsAsync(page, TimeSpan.FromSeconds(30));
+            _logger.Info($"[Промокод][Шаг 3] elementsReady={elementsReady} | {stepSw.ElapsedMilliseconds}мс");
             if (!elementsReady)
             {
                 result.Status = AssetProcessStatus.Failed;
                 result.Message = "Не удалось загрузить элементы оформления заказа (поле ввода или кнопки оплаты).";
-                _logger.Warn($"[Ошибка] {result.Message}");
+                _logger.Warn($"[Ошибка][Шаг 3] {result.Message}");
+
+                await LogAllInputFieldsAsync(page, "Шаг 3 - элементы не найдены");
+                await LogAllButtonsAsync(page, "Шаг 3 - кнопки");
                 await SaveErrorScreenshotAsync(page, $"promo_failed_elements_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step3_no_elements_{sanitizedId}");
                 await ClearCartAsync(page);
                 return result;
             }
 
             // 4. Обработка шага налогообложения "Tax Business use"
-            _logger.Info("[Промокод] Проверка и заполнение налогового вопроса 'Tax Business use'...");
+            stepSw.Restart();
+            _logger.Info($"[Промокод][Шаг 4] Проверка налогового вопроса 'Tax Business use' | URL: {page.Url}");
+
             var taxHandled = await page.EvaluateFunctionAsync<bool>(@"() => {
                 const visible = (el) => {
                     if (!el) return false;
@@ -1987,16 +2053,21 @@ internal sealed class UnityAssetAutomationApp
             if (taxHandled)
             {
                 _logger.Info("[Промокод] Вопрос налогообложения обнаружен: выбран вариант 'No'.");
+                _logger.Info($"[Промокод][Шаг 4] Налоговый вопрос обнаружен: выбран 'No' | {stepSw.ElapsedMilliseconds}мс");
                 await Task.Delay(2000);
                 await SaveErrorScreenshotAsync(page, $"promo_tax_selected_{sanitizedId}");
             }
             else
             {
                 _logger.Debug("[Промокод] Вопрос налогообложения 'Tax Business use' не найден (возможно, не pay.unity.com или шаг пропущен).");
+                _logger.Debug($"[Промокод][Шаг 4] Налоговый вопрос 'Tax Business use' не найден (не pay.unity.com или пропущен) | {stepSw.ElapsedMilliseconds}мс | URL: {page.Url}");
             }
 
             // 4.5. Обработка формы адреса (Billing Address Form), если она открыта
             _logger.Info("[Промокод] Проверка наличия формы ввода адреса (Billing Address)...");
+            stepSw.Restart();
+            _logger.Info($"[Промокод][Шаг 4.5] Проверка формы Billing Address | URL: {page.Url}");
+
             var billingAddressHandled = await page.EvaluateFunctionAsync<bool>(@"async () => {
                 const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
                 const visible = (el) => {
@@ -2041,12 +2112,21 @@ internal sealed class UnityAssetAutomationApp
             if (billingAddressHandled)
             {
                 _logger.Info("[Промокод] Обнаружена форма адреса: нажата кнопка продолжения/сохранения.");
+                _logger.Info($"[Промокод][Шаг 4.5] Форма адреса обнаружена: нажата кнопка продолжения | {stepSw.ElapsedMilliseconds}мс");
                 await Task.Delay(4000);
+                _logger.Debug($"[Промокод][Шаг 4.5] URL после сохранения адреса: {page.Url}");
                 await SaveErrorScreenshotAsync(page, $"promo_billing_saved_{sanitizedId}");
+            }
+            else
+            {
+                _logger.Debug($"[Промокод][Шаг 4.5] Форма Billing Address не обнаружена (пропущена) | {stepSw.ElapsedMilliseconds}мс | URL: {page.Url}");
             }
 
             // 5. Вводим промокод и нажимаем Apply
             _logger.Info($"[Промокод] Ввод промокода '{promoCode}'...");
+            stepSw.Restart();
+            _logger.Info($"[Промокод][Шаг 5] Поиск поля ввода промокода и ввод '{promoCode}' | URL: {page.Url}");
+            await LogAllInputFieldsAsync(page, "Шаг 5 - все input перед вводом кода");
             var promoEntered = await page.EvaluateFunctionAsync<bool>(@"async (code) => {
                 const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
                 const visible = (el) => {
@@ -2084,15 +2164,21 @@ internal sealed class UnityAssetAutomationApp
                 return true;
             }", promoCode);
 
+            _logger.Info($"[Промокод][Шаг 5] promoEntered={promoEntered} | {stepSw.ElapsedMilliseconds}мс");
             if (!promoEntered)
             {
                 result.Status = AssetProcessStatus.Failed;
                 result.Message = "Не найдено поле ввода промокода.";
-                _logger.Warn($"[Ошибка] {result.Message}");
+                _logger.Warn($"[Ошибка][Шаг 5] {result.Message} | URL: {page.Url}");
+
+                await LogAllInputFieldsAsync(page, "Шаг 5 - поле не найдено, все inputs");
+                await LogAllButtonsAsync(page, "Шаг 5 - кнопки при ошибке");
                 await SaveErrorScreenshotAsync(page, $"promo_failed_input_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step5_no_input_{sanitizedId}");
                 await ClearCartAsync(page);
                 return result;
             }
+
 
             var applyClicked = await page.EvaluateFunctionAsync<bool>(@"() => {
                 const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -2145,22 +2231,30 @@ internal sealed class UnityAssetAutomationApp
                 return true;
             }");
 
+            // 5.5 - Apply button
+            stepSw.Restart();
+            _logger.Info($"[Промокод][Шаг 5.5] Нажатие кнопки Apply/Redeem | URL: {page.Url}");
             if (!applyClicked)
             {
                 result.Status = AssetProcessStatus.Failed;
                 result.Message = "Не найдена кнопка Apply для промокода.";
-                _logger.Warn($"[Ошибка] {result.Message}");
+                _logger.Warn($"[Ошибка][Шаг 5.5] {result.Message} | URL: {page.Url}");
+                await LogAllButtonsAsync(page, "Шаг 5.5 - кнопки при ошибке Apply");
                 await SaveErrorScreenshotAsync(page, $"promo_failed_apply_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step5_5_no_apply_{sanitizedId}");
                 await ClearCartAsync(page);
                 return result;
             }
 
-            _logger.Info("[Промокод] Кнопка Apply нажата. Ожидание обновления стоимости...");
-            await Task.Delay(4000); 
+            _logger.Info($"[Промокод][Шаг 5.5] Кнопка Apply нажата | {stepSw.ElapsedMilliseconds}мс. Ожидание обновления стоимости (4с)...");
+            await Task.Delay(4000);
+            _logger.Debug($"[Промокод][Шаг 5.5] URL после Apply: {page.Url}");
 
             await SaveErrorScreenshotAsync(page, $"promo_coupon_applied_{sanitizedId}");
 
             // 6. Проверка ошибок применения промокода и обнуления цены
+            stepSw.Restart();
+            _logger.Info($"[Промокод][Шаг 6] Проверка статуса корзины (ошибки кода / цена = $0) | URL: {page.Url}");
             var cartState = await page.EvaluateFunctionAsync<string>(@"() => {
                 const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
                 const visible = (el) => {
@@ -2197,26 +2291,33 @@ internal sealed class UnityAssetAutomationApp
                     foundError,
                     hasZeroPrice: hasZero,
                     bodyTextPreview: bodyText.substring(0, 500)
+                    bodyTextPreview: bodyText.substring(0, 3000)
                 });
             }");
 
             var state = JsonSerializer.Deserialize<CartStateSnapshot>(cartState, _runtimeJsonOptions) ?? new CartStateSnapshot();
             _logger.Debug($"[Промокод] Статус корзины: hasPromoError={state.HasPromoError} (код: {state.FoundError}), hasZeroPrice={state.HasZeroPrice}");
+            _logger.Info($"[Промокод][Шаг 6] CartState: hasPromoError={state.HasPromoError} (keyword: '{state.FoundError}'), hasZeroPrice={state.HasZeroPrice} | {stepSw.ElapsedMilliseconds}мс");
+            _logger.Debug($"[Промокод][Шаг 6] BodyText (первые 3000 символов):\n{state.BodyTextPreview}");
 
             if (state.HasPromoError || !state.HasZeroPrice)
             {
                 result.Status = AssetProcessStatus.Failed;
-                result.Message = state.HasPromoError 
+                result.Message = state.HasPromoError
                     ? $"Промокод не был применен: обнаружена ошибка '{state.FoundError}'."
                     : "Промокод введен, но итоговая стоимость не стала бесплатной ($0.00).";
-                _logger.Warn($"[Ошибка] {result.Message} Абортируем оформление.");
+                _logger.Warn($"[Ошибка][Шаг 6] {result.Message} Абортируем оформление. URL: {page.Url}");
                 await SaveErrorScreenshotAsync(page, $"promo_failed_error_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step6_promo_failed_{sanitizedId}");
                 await ClearCartAsync(page);
                 return result;
             }
 
             // 7. Прохождение EULA (согласие с EULA чекбоксом)
-            _logger.Info("[Промокод] Согласие с чекбоксом EULA...");
+            stepSw.Restart();
+            _logger.Info($"[Промокод][Шаг 7] Поиск и принятие EULA-чекбокса | URL: {page.Url}");
+
+
             var eulaHandled = await page.EvaluateFunctionAsync<bool>(@"() => {
                 const visible = (el) => {
                     if (!el) return false;
@@ -2272,15 +2373,20 @@ internal sealed class UnityAssetAutomationApp
             if (eulaHandled)
             {
                 _logger.Info("[Промокод] Согласие с EULA успешно отмечено.");
+                _logger.Info($"[Промокод][Шаг 7] EULA-чекбокс отмечен | {stepSw.ElapsedMilliseconds}мс");
                 await Task.Delay(1000);
             }
             else
             {
                 _logger.Warn("[Промокод] Предупреждение: чекбокс соглашения с EULA не обнаружен.");
+                _logger.Warn($"[Промокод][Шаг 7] EULA-чекбокс не обнаружен (возможно, не требуется) | URL: {page.Url}");
             }
 
             // 8. Кликаем кнопку оформления заказа ("Pay Now", "Complete Purchase", "Place Order")
             _logger.Info("[Промокод] Нажатие на кнопку оформления заказа (Pay Now / Place Order)...");
+            stepSw.Restart();
+            _logger.Info($"[Промокод][Шаг 8] Поиск кнопки Pay Now / Place Order | URL: {page.Url}");
+            await LogAllButtonsAsync(page, "Шаг 8 - кнопки перед Pay");
             var finalCheckoutClicked = await page.EvaluateFunctionAsync<bool>(@"() => {
                 const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
                 const visible = (el) => {
@@ -2308,22 +2414,28 @@ internal sealed class UnityAssetAutomationApp
                 return true;
             }");
 
+            _logger.Info($"[Промокод][Шаг 8] finalCheckoutClicked={finalCheckoutClicked} | {stepSw.ElapsedMilliseconds}мс");
             if (!finalCheckoutClicked)
             {
                 result.Status = AssetProcessStatus.Failed;
                 result.Message = "Не найдена финальная кнопка оформления заказа (Pay Now / Place Order).";
-                _logger.Warn($"[Ошибка] {result.Message}");
+                _logger.Warn($"[Ошибка][Шаг 8] {result.Message} | URL: {page.Url}");
+                await LogAllButtonsAsync(page, "Шаг 8 - кнопки при ошибке Pay");
                 await SaveErrorScreenshotAsync(page, $"promo_failed_checkout_btn_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step8_no_pay_{sanitizedId}");
                 await ClearCartAsync(page);
                 return result;
             }
 
-            _logger.Info("[Промокод] Кнопка покупки нажата. Ожидание завершения транзакции...");
-            await Task.Delay(10000); 
+            _logger.Info($"[Промокод][Шаг 8] Кнопка Pay нажата. Ожидание завершения транзакции (10с)...");
+            await Task.Delay(10000);
+            _logger.Debug($"[Промокод][Шаг 8] URL после транзакции: {page.Url}");
 
             await SaveErrorScreenshotAsync(page, $"promo_checkout_success_{sanitizedId}");
 
             // 9. Проверка успешного завершения покупки
+            stepSw.Restart();
+            _logger.Info($"[Промокод][Шаг 9] Проверка успешного завершения | URL: {page.Url}");
             var successState = await page.EvaluateFunctionAsync<bool>(@"() => {
                 const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
                 const text = normalize(document.body?.innerText || '');
@@ -2334,25 +2446,32 @@ internal sealed class UnityAssetAutomationApp
             {
                 result.Status = AssetProcessStatus.Added;
                 _logger.Info($"[УСПЕХ] Ассет успешно получен по промокоду: {assetUrl}");
+                _logger.Info($"[УСПЕХ][Шаг 9] Ассет получен по промокоду! Итого: {totalSw.Elapsed.TotalSeconds:F1}с | URL: {page.Url}");
             }
             else
             {
                 result.Status = AssetProcessStatus.UnknownAfterClick;
                 _logger.Warn($"[Внимание] Кнопка оформления по промокоду нажата, но переход на страницу успешного завершения не зафиксирован: {page.Url}");
+                _logger.Warn($"[Внимание][Шаг 9] Кнопка Pay нажата, но страница успеха не зафиксирована. Итого: {totalSw.Elapsed.TotalSeconds:F1}с | URL: {page.Url}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step9_unknown_{sanitizedId}");
             }
 
+            _logger.Info($"[Промокод] ===== КОНЕЦ выкупа по промокоду '{promoCode}' | статус: {result.Status} | {totalSw.Elapsed.TotalSeconds:F1}с =====");
             return result;
         }
         catch (Exception ex)
         {
             result.Status = AssetProcessStatus.Failed;
             result.Message = $"Исключение при покупке по промокоду: {ex.Message}";
-            _logger.Error($"[Ошибка] {result.Message}");
+            _logger.Error($"[КРИТИЧЕСКАЯ ОШИБКА] {result.Message} | URL: {page.Url} | Итого: {totalSw.Elapsed.TotalSeconds:F1}с\n{ex}");
+
             await SaveErrorScreenshotAsync(page, $"promo_exception_{sanitizedId}");
+            await SaveHtmlDumpAsync(page, $"promo_dump_exception_{sanitizedId}");
             await ClearCartAsync(page);
             return result;
         }
     }
+
 
     private async Task ClearCartAsync(IPage page)
     {
@@ -2984,6 +3103,86 @@ internal sealed class UnityAssetAutomationApp
             // игнорируем вторичные ошибки
         }
     }
+
+    /// <summary>
+    /// Сохраняет полный HTML страницы в logs/*.html для постдиагностики.
+    /// Вызывать при любой ошибке в промокод-флоу.
+    /// </summary>
+    private async Task SaveHtmlDumpAsync(IPage page, string prefix)
+    {
+        try
+        {
+            var path = Path.Combine(_logsDirectory, $"{prefix}-{DateTime.Now:yyyyMMdd-HHmmss}.html");
+            var html = await page.GetContentAsync();
+            await File.WriteAllTextAsync(path, html);
+            _logger.Debug($"[HTML-дамп] Сохранён: {Path.GetFileName(path)} ({html.Length:N0} байт) | URL: {page.Url}");
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"[HTML-дамп] Не удалось сохранить ({prefix}): {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Логирует все input-поля страницы — для диагностики когда нужное поле не найдено.
+    /// </summary>
+    private async Task LogAllInputFieldsAsync(IPage page, string context)
+    {
+        try
+        {
+            var inputsJson = await page.EvaluateFunctionAsync<string>(@"() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+                };
+                const inputs = Array.from(document.querySelectorAll('input'));
+                return JSON.stringify(inputs.map(el => ({
+                    type: el.type || '',
+                    name: el.name || '',
+                    id: el.id || '',
+                    placeholder: el.placeholder || '',
+                    value: (el.value || '').substring(0, 40),
+                    visible: visible(el)
+                })));
+            }");
+            _logger.Debug($"[{context}] Все <input> на странице ({page.Url}): {inputsJson}");
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"[{context}] Не удалось получить список <input>: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Логирует все видимые кнопки страницы — для диагностики когда кнопка не найдена.
+    /// </summary>
+    private async Task LogAllButtonsAsync(IPage page, string context)
+    {
+        try
+        {
+            var btnsJson = await page.EvaluateFunctionAsync<string>(@"() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+                };
+                const btns = Array.from(document.querySelectorAll('button, a, [role=""button""]'))
+                    .filter(visible)
+                    .map(el => ({ tag: el.tagName, text: (el.innerText || '').trim().substring(0, 60) }))
+                    .filter(x => x.text);
+                return JSON.stringify(btns);
+            }");
+            _logger.Debug($"[{context}] Видимые кнопки ({page.Url}): {btnsJson}");
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"[{context}] Не удалось получить список кнопок: {ex.Message}");
+        }
+    }
+
 
     private static void PrintSummary(RunReport report)
     {
