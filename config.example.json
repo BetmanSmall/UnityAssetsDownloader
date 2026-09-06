@@ -9,6 +9,8 @@
     "extra_asset_urls.example.txt"
   ],
   "logFilePath": "",
+  "logsDirectory": "",
+  "dataDirectory": "",
   "unityEmail": "",
   "unityPassword": "",
   "delayMs": 1200,
@@ -19,7 +21,7 @@
   "maxVisitedAssets": null,
   "sources": [],
   "telegram": {
-    "channels": ["unity_assets_1","unityassets2"],
+    "channels": [],
     "postLimit": 40,
     "screenshotOnNoLinks": true
   },

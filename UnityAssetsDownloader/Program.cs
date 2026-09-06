@@ -4,9 +4,49 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using PuppeteerSharp;
 
+// Windows-консоль по умолчанию не в UTF-8 — без этого русские логи превращаются в кракозябры.
+try
+{
+    Console.OutputEncoding = System.Text.Encoding.UTF8;
+    Console.InputEncoding = System.Text.Encoding.UTF8;
+}
+catch
+{
+    // В перенаправленном выводе смена кодировки может не поддерживаться. Это не критично.
+}
+
 var options = CliOptions.Parse(args);
-var app = new UnityAssetAutomationApp(options);
-await app.RunAsync();
+
+try
+{
+    var app = new UnityAssetAutomationApp(options);
+    await app.RunAsync();
+}
+catch (Exception ex)
+{
+    // Любое необработанное падение сохраняем в отдельный файл, чтобы его можно было прислать целиком.
+    var crashText =
+        $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] НЕОБРАБОТАННАЯ ОШИБКА{Environment.NewLine}" +
+        $"ОС: {RuntimeInformation.OSDescription} | .NET: {RuntimeInformation.FrameworkDescription}{Environment.NewLine}" +
+        $"Аргументы: {string.Join(" ", args)}{Environment.NewLine}" +
+        ex;
+
+    Console.Error.WriteLine(crashText);
+
+    try
+    {
+        Directory.CreateDirectory(options.LogsDirectory);
+        var crashPath = Path.Combine(options.LogsDirectory, $"crash-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+        await File.WriteAllTextAsync(crashPath, crashText);
+        Console.Error.WriteLine($"Полный текст ошибки сохранен: {crashPath}");
+    }
+    catch (Exception writeEx)
+    {
+        Console.Error.WriteLine($"Не удалось сохранить файл с ошибкой: {writeEx.Message}");
+    }
+
+    Environment.ExitCode = 1;
+}
 
 internal sealed class UnityAssetAutomationApp
 {
@@ -23,8 +63,8 @@ internal sealed class UnityAssetAutomationApp
     private readonly AppLogger _logger;
     private readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true };
     private readonly JsonSerializerOptions _runtimeJsonOptions = new() { PropertyNameCaseInsensitive = true };
-    private readonly string _dataDirectory = Path.Combine(AppContext.BaseDirectory, "data");
-    private readonly string _logsDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
+    private readonly string _dataDirectory;
+    private readonly string _logsDirectory;
     private readonly string _cookiesPath;
     private readonly string _sessionStatePath;
     private readonly string _reportPath;
@@ -52,13 +92,19 @@ internal sealed class UnityAssetAutomationApp
     public UnityAssetAutomationApp(CliOptions options)
     {
         _options = options;
+        _dataDirectory = options.DataDirectory;
+        _logsDirectory = options.LogsDirectory;
         _cookiesPath = Path.Combine(_dataDirectory, "unity_cookies.json");
         _sessionStatePath = Path.Combine(_dataDirectory, "unity_session_state.json");
         _reportPath = Path.Combine(_logsDirectory, $"run-report-{DateTime.Now:yyyyMMdd-HHmmss}.json");
         var logFilePath = string.IsNullOrWhiteSpace(options.LogFilePath)
             ? Path.Combine(_logsDirectory, $"run-log-{DateTime.Now:yyyyMMdd-HHmmss}.log")
             : Path.GetFullPath(options.LogFilePath);
-        _logger = new AppLogger(options.Verbose, options.TraceNetwork, logFilePath);
+        var errorsFilePath = Path.Combine(_logsDirectory, $"errors-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+        _logger = new AppLogger(options.Verbose, options.TraceNetwork, logFilePath, errorsFilePath);
+        _logger.Info($"Каталог логов: {_logsDirectory}");
+        _logger.Info($"Каталог данных (cookies): {_dataDirectory}");
+        _logger.Info($"Файл только с ошибками: {errorsFilePath}");
     }
 
     public async Task RunAsync()
@@ -3220,26 +3266,40 @@ internal sealed class AppLogger : IDisposable
     private readonly bool _verbose;
     private readonly bool _traceNetwork;
     private readonly StreamWriter? _writer;
+    private readonly StreamWriter? _errorWriter;
     private readonly object _sync = new();
 
-    public AppLogger(bool verbose, bool traceNetwork, string? logFilePath)
+    public AppLogger(bool verbose, bool traceNetwork, string? logFilePath, string? errorsFilePath = null)
     {
         _verbose = verbose;
         _traceNetwork = traceNetwork;
 
+        _writer = CreateWriter(logFilePath);
+        // Отдельный файл только с WARN/ERROR — его удобно прислать целиком, он короткий.
+        _errorWriter = CreateWriter(errorsFilePath);
+
         if (!string.IsNullOrWhiteSpace(logFilePath))
         {
-            var directory = Path.GetDirectoryName(logFilePath);
-            if (!string.IsNullOrWhiteSpace(directory))
-            {
-                Directory.CreateDirectory(directory);
-            }
-
-            _writer = new StreamWriter(logFilePath, append: true) { AutoFlush = true };
             Info($"Логирование в файл включено: {logFilePath}");
         }
 
         Info($"Verbose={_verbose}; TraceNetwork={_traceNetwork}");
+    }
+
+    private static StreamWriter? CreateWriter(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        var directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        return new StreamWriter(path, append: true) { AutoFlush = true };
     }
 
     public void Info(string message) => Write("INFO", message);
@@ -3262,6 +3322,11 @@ internal sealed class AppLogger : IDisposable
         {
             Console.WriteLine(line);
             _writer?.WriteLine(line);
+
+            if (level is "WARN" or "ERROR")
+            {
+                _errorWriter?.WriteLine(line);
+            }
         }
     }
 
@@ -3270,6 +3335,7 @@ internal sealed class AppLogger : IDisposable
         lock (_sync)
         {
             _writer?.Dispose();
+            _errorWriter?.Dispose();
         }
     }
 }
@@ -3285,6 +3351,8 @@ internal sealed class CliOptions
     public bool UseNoDefaults { get; init; }
     public List<string> ExtraSourceFiles { get; init; } = [];
     public string? LogFilePath { get; init; }
+    public string LogsDirectory { get; init; } = Path.Combine(AppContext.BaseDirectory, "logs");
+    public string DataDirectory { get; init; } = Path.Combine(AppContext.BaseDirectory, "data");
     public string? UnityEmail { get; init; }
     public string? UnityPassword { get; init; }
     public int DelayMs { get; init; } = 1200;
@@ -3318,6 +3386,8 @@ internal sealed class CliOptions
         var cliUseExtendedSources = false;
         var cliUseNoDefaults = false;
         string? cliLogFilePath = null;
+        string? cliLogsDirectory = null;
+        string? cliDataDirectory = null;
         string? cliUnityEmail = null;
         string? cliUnityPassword = null;
         int? cliDelayMs = null;
@@ -3371,6 +3441,12 @@ internal sealed class CliOptions
                     break;
                 case "--log-file" when i + 1 < args.Length:
                     cliLogFilePath = args[++i];
+                    break;
+                case "--logs-dir" when i + 1 < args.Length:
+                    cliLogsDirectory = args[++i];
+                    break;
+                case "--data-dir" when i + 1 < args.Length:
+                    cliDataDirectory = args[++i];
                     break;
                 case "--unity-email" when i + 1 < args.Length:
                     cliUnityEmail = args[++i];
@@ -3603,6 +3679,9 @@ internal sealed class CliOptions
             telegramChannels.AddRange(ReadTelegramSourcesFile("telegram_sources.txt"));
         }
 
+        var logsDirectory = ResolveDirectory(cliLogsDirectory ?? config?.LogsDirectory, "logs");
+        var dataDirectory = ResolveDirectory(cliDataDirectory ?? config?.DataDirectory, "data");
+
         var telegramPostLimit = config?.Telegram?.PostLimit ?? 20;
         var telegramScreenshotOnNoLinks = config?.Telegram?.ScreenshotOnNoLinks ?? true;
 
@@ -3617,6 +3696,8 @@ internal sealed class CliOptions
             UseNoDefaults = useNoDefaults,
             ExtraSourceFiles = extraSourceFiles,
             LogFilePath = logFilePath,
+            LogsDirectory = logsDirectory,
+            DataDirectory = dataDirectory,
             UnityEmail = unityEmail,
             UnityPassword = unityPassword,
             DelayMs = delayMs,
@@ -3633,6 +3714,17 @@ internal sealed class CliOptions
             TelegramPostLimit = telegramPostLimit,
             TelegramScreenshotOnNoLinks = telegramScreenshotOnNoLinks
         };
+    }
+
+    /// <summary>
+    /// Определяет каталог для логов или данных.
+    /// Если путь не задан, используется папка рядом с исполняемым файлом.
+    /// </summary>
+    private static string ResolveDirectory(string? configured, string defaultFolderName)
+    {
+        return string.IsNullOrWhiteSpace(configured)
+            ? Path.Combine(AppContext.BaseDirectory, defaultFolderName)
+            : Path.GetFullPath(configured);
     }
 
     /// <summary>
@@ -3709,6 +3801,8 @@ internal sealed class AppConfig
     public bool? NoDefaults { get; init; }
     public List<string> ExtraSourceFiles { get; init; } = [];
     public string? LogFilePath { get; init; }
+    public string? LogsDirectory { get; init; }
+    public string? DataDirectory { get; init; }
     public string? UnityEmail { get; init; }
     public string? UnityPassword { get; init; }
     public int? DelayMs { get; init; }

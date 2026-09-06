@@ -403,3 +403,8 @@ FodyWeavers.xsd
 
 # Local runtime config (can contain credentials)
 config.json
+# Runtime data of UnityAssetsDownloader
+/data/
+/logs/
+logs-*.zip
+telegram_sources.local.txt

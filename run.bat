@@ -4,129 +4,198 @@ chcp 65001 >nul
 
 cd /d "%~dp0"
 
+set "PROJECT=UnityAssetsDownloader\UnityAssetsDownloader.csproj"
+set "LOGS=%~dp0logs"
+set "DATA=%~dp0data"
+set "COMMON=--logs-dir "%LOGS%" --data-dir "%DATA%" --verbose"
+
 where dotnet >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] dotnet SDK was not found in PATH.
-    echo Install .NET 8 SDK: https://dotnet.microsoft.com/download
+    echo [ОШИБКА] dotnet SDK не найден в PATH.
+    echo Установите .NET 8 SDK: https://dotnet.microsoft.com/download
+    echo.
     pause
     exit /b 1
 )
 
-set "PROJECT=UnityAssetsDownloader/UnityAssetsDownloader.csproj"
+echo Сборка проекта...
+dotnet build "%PROJECT%" --nologo -v q
+if errorlevel 1 (
+    echo.
+    echo [ОШИБКА] Проект не собрался. Текст ошибок выше.
+    echo.
+    pause
+    exit /b 1
+)
 
 :menu
 cls
 echo ==============================================
-echo UnityAssetsDownloader - выбор режима / Mode selection
+echo  UnityAssetsDownloader - выбор режима
+echo ==============================================
+echo  Логи пишутся в: %LOGS%
+echo  Cookies хранятся в: %DATA%
 echo ==============================================
 echo.
-echo 1^) [Основные источники] Топ бесплатные + Китайский архив + extra_urls (без расширенных^)
-echo 2^) Только из топ бесплатных (Asset Store top-free^)
-echo 3^) Только из списка free_list_GreaterChinaUnityAssetArchiveLinks.txt
-echo 4^) Только из списка extra_asset_urls.example.txt
-echo 5^) Только из расширенных списков поиска (extended_sources.txt^)
-echo 6^) Только логин и сохранение cookies / Login only and save cookies
-echo 7^) Dry-run ^(проверка без добавления в аккаунт^)
-echo 8^) Telegram каналы ^(парсинг и добавление ассетов^)
-echo 9^) Выход / Exit
+echo  1^) Основные источники (топ бесплатные + китайский архив + extra_urls^)
+echo  2^) Только топ бесплатные (Asset Store top-free^)
+echo  3^) Только free_list_GreaterChinaUnityAssetArchiveLinks.txt
+echo  4^) Только extra_asset_urls.example.txt
+echo  5^) Только расширенные списки поиска (extended_sources.txt^)
+echo  6^) Только логин и сохранение cookies  ^<== начните с этого
+echo  7^) Dry-run (проверка без добавления в аккаунт^)
+echo  8^) Telegram каналы из telegram_sources.txt
+echo  9^) Диагностика: Telegram + максимум логов (--trace-network^)
+echo  L^) Собрать логи в архив для отправки
+echo  0^) Выход
 echo.
 set "opt="
-set /p "opt=Выберите режим / Choose mode [Enter = 1]: "
-if not defined opt set "opt=1"
+set /p "opt=Выберите режим [Enter = 6]: "
+if not defined opt set "opt=6"
 
-if "%opt%"=="1" goto run_all
-if "%opt%"=="2" goto run_top_free
-if "%opt%"=="3" goto run_china_list
-if "%opt%"=="4" goto run_extra_list
-if "%opt%"=="5" goto run_extended
-if "%opt%"=="6" goto run_login
-if "%opt%"=="7" goto run_dry
-if "%opt%"=="8" goto run_telegram
-if "%opt%"=="9" goto end
+if /i "%opt%"=="1" goto run_all
+if /i "%opt%"=="2" goto run_top_free
+if /i "%opt%"=="3" goto run_china_list
+if /i "%opt%"=="4" goto run_extra_list
+if /i "%opt%"=="5" goto run_extended
+if /i "%opt%"=="6" goto run_login
+if /i "%opt%"=="7" goto run_dry
+if /i "%opt%"=="8" goto run_telegram
+if /i "%opt%"=="9" goto run_diag
+if /i "%opt%"=="L" goto collect_logs
+if /i "%opt%"=="0" goto end
 
 echo.
-echo Некорректный выбор / Invalid choice: %opt%
+echo Некорректный выбор: %opt%
 pause
 goto menu
 
+:ask_limit
+set "limit="
+set /p "limit=Сколько новых ассетов добавить за запуск? [Enter = без лимита]: "
+set "LIMIT_ARG="
+if defined limit set "LIMIT_ARG=--max-add-attempts %limit%"
+goto :eof
+
 :run_all
+call :ask_limit
 echo.
-echo Запуск: основные источники... / Running: main sources...
-dotnet run --project "%PROJECT%" -- --headless false --extra-source-file "extra_asset_urls.example.txt" --verbose
+echo Запуск: основные источники...
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% --headless false --extra-source-file "extra_asset_urls.example.txt" %LIMIT_ARG%
 goto after_run
 
 :run_top_free
+call :ask_limit
 echo.
-echo Запуск: только топ бесплатные... / Running: only top free...
-dotnet run --project "%PROJECT%" -- --headless false --source "https://assetstore.unity.com/top-assets/top-free" --verbose
+echo Запуск: только топ бесплатные...
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% --headless false --source "https://assetstore.unity.com/top-assets/top-free" %LIMIT_ARG%
 goto after_run
 
 :run_china_list
+call :ask_limit
 echo.
-echo Запуск: только из free_list_GreaterChinaUnityAssetArchiveLinks...
-dotnet run --project "%PROJECT%" -- --headless false --no-defaults --extra-source-file "GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt" --verbose
+echo Запуск: только из free_list_GreaterChinaUnityAssetArchiveLinks.txt...
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% --headless false --no-defaults --extra-source-file "GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt" %LIMIT_ARG%
 goto after_run
 
 :run_extra_list
+call :ask_limit
 echo.
 echo Запуск: только из extra_asset_urls.example.txt...
-dotnet run --project "%PROJECT%" -- --headless false --no-defaults --extra-source-file "extra_asset_urls.example.txt" --verbose
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% --headless false --no-defaults --extra-source-file "extra_asset_urls.example.txt" %LIMIT_ARG%
 goto after_run
 
 :run_extended
+call :ask_limit
 echo.
-echo Запуск: только расширенные списки поиска... / Running: extended sources...
-dotnet run --project "%PROJECT%" -- --headless false --source "https://assetstore.unity.com/" --extended-sources --verbose
+echo Запуск: расширенные списки поиска...
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% --headless false --source "https://assetstore.unity.com/" --extended-sources %LIMIT_ARG%
 goto after_run
 
 :run_login
 echo.
-echo Запуск: только логин и сохранение cookies... / Running: login only...
-dotnet run --project "%PROJECT%" -- --login --headless false --verbose
+echo Запуск: только логин и сохранение cookies.
+echo Откроется окно браузера. Войдите в аккаунт Unity и дождитесь закрытия.
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% --login --headless false
 goto after_run
 
 :run_dry
+call :ask_limit
 echo.
-echo Запуск: dry-run... / Running: dry-run...
-dotnet run --project "%PROJECT%" -- --dry-run --headless false --verbose
+echo Запуск: dry-run (аккаунт не меняется^)...
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% --dry-run --headless false %LIMIT_ARG%
 goto after_run
 
 :run_telegram
-echo.
-echo Запуск: только Telegram каналы... / Running: only Telegram channels...
-echo.
-set "tg_channels="
-set /p "tg_channels=Введите имена каналов через запятую (или Enter для telegram_sources.txt): "
-if not defined tg_channels (
-    if exist telegram_sources.txt (
-        for /f "usebackq tokens=* delims=" %%a in ("telegram_sources.txt") do (
-            if defined tg_channels (
-                set "tg_channels=!tg_channels!,%%a"
-            ) else (
-                set "tg_channels=%%a"
-            )
-        )
-    )
-)
-if not defined tg_channels (
-    echo [WARN] Каналы не указаны. Используйте config.json или telegram_sources.txt
+if not exist "telegram_sources.txt" (
+    echo.
+    echo [ОШИБКА] Файл telegram_sources.txt не найден рядом с run.bat
+    echo Создайте его: по одному имени канала на строку.
     echo.
     pause
     goto menu
 )
-echo Запуск с каналами: %tg_channels%
-dotnet run --project "%PROJECT%" -- --headless false --no-defaults --tg-channels "%tg_channels%" --verbose
 echo.
-echo Telegram: git-ссылки сохранены в logs/telegram_git_links.log
-echo Telegram: промокоды сохранены в logs/telegram_promocodes.log
-echo Telegram: скриншоты постов без ссылок в logs/telegram/
+echo Каналы из telegram_sources.txt:
+type "telegram_sources.txt"
+echo.
+call :ask_limit
+echo.
+echo Запуск: Telegram каналы...
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% --headless false --no-defaults %LIMIT_ARG%
 goto after_run
 
+:run_diag
+echo.
+echo Запуск: диагностика. Пишутся максимально подробные логи.
+echo Аккаунт НЕ меняется (--dry-run^).
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% --trace-network --dry-run --headless false --no-defaults --max-visited-assets 5
+goto after_run
+
+:collect_logs
+echo.
+if not exist "%LOGS%" (
+    echo Папка логов пуста: %LOGS%
+    echo.
+    pause
+    goto menu
+)
+for /f "usebackq tokens=*" %%t in (`powershell -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"`) do set "STAMP=%%t"
+set "ZIP=%~dp0logs-%STAMP%.zip"
+powershell -NoProfile -Command "Compress-Archive -Path '%LOGS%\*' -DestinationPath '%ZIP%' -Force"
+if errorlevel 1 (
+    echo [ОШИБКА] Не удалось создать архив.
+) else (
+    echo Архив с логами готов: %ZIP%
+    echo Пришлите этот файл для разбора ошибок.
+)
+echo.
+pause
+goto menu
+
 :after_run
+set "CODE=%ERRORLEVEL%"
+echo.
+if not "%CODE%"=="0" (
+    echo [ОШИБКА] Программа завершилась с кодом %CODE%.
+) else (
+    echo Готово.
+)
+echo.
+echo Что смотреть:
+echo   %LOGS%\run-log-*.log             - полный лог запуска
+echo   %LOGS%\errors-*.log              - только предупреждения и ошибки
+echo   %LOGS%\crash-*.log               - текст падения, если программа упала
+echo   %LOGS%\run-report-*.json         - что и с каким статусом обработано
+echo   %LOGS%\telegram_posts_raw.log    - тексты всех постов Telegram
+echo   %LOGS%\telegram_promocodes.log   - найденные промокоды
+echo   %LOGS%\*.png / *.html            - скриншоты и дампы страниц при ошибках
+echo.
+echo Чтобы отправить логи: вернитесь в меню и выберите пункт L.
 echo.
 pause
 goto menu
 
 :end
-echo Выход / Exit.
+echo Выход.
 exit /b 0

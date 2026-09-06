@@ -1,0 +1,7 @@
+# Единые переносы строк в репозитории
+* text=auto eol=lf
+
+# Windows-скрипты обязаны быть с CRLF, иначе cmd.exe спотыкается на метках goto
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
