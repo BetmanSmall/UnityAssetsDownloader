@@ -18,6 +18,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
+set "PROFILE_ARG="
+set "PROFILE_NAME=%USERNAME%"
+
 echo Сборка проекта...
 dotnet build "%PROJECT%" --nologo -v q
 if errorlevel 1 (
@@ -33,8 +36,9 @@ cls
 echo ==============================================
 echo  UnityAssetsDownloader - выбор режима
 echo ==============================================
+echo  Профиль аккаунта: %PROFILE_NAME%
 echo  Логи пишутся в: %LOGS%
-echo  Cookies хранятся в: %DATA%
+echo  Учётные данные: %DATA% + Диспетчер учётных данных Windows
 echo ==============================================
 echo.
 echo  1^) Основные источники (топ бесплатные + китайский архив + extra_urls^)
@@ -46,6 +50,7 @@ echo  6^) Только логин и сохранение cookies  ^<== начн
 echo  7^) Dry-run (проверка без добавления в аккаунт^)
 echo  8^) Telegram каналы из telegram_sources.txt
 echo  9^) Диагностика: Telegram + максимум логов (--trace-network^)
+echo  P^) Сменить профиль аккаунта (для второго аккаунта на этом компьютере^)
 echo  L^) Собрать логи в архив для отправки
 echo  0^) Выход
 echo.
@@ -62,6 +67,7 @@ if /i "%opt%"=="6" goto run_login
 if /i "%opt%"=="7" goto run_dry
 if /i "%opt%"=="8" goto run_telegram
 if /i "%opt%"=="9" goto run_diag
+if /i "%opt%"=="P" goto choose_profile
 if /i "%opt%"=="L" goto collect_logs
 if /i "%opt%"=="0" goto end
 
@@ -81,49 +87,49 @@ goto :eof
 call :ask_limit
 echo.
 echo Запуск: основные источники...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% --headless false --extra-source-file "extra_asset_urls.example.txt" %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --headless false --extra-source-file "extra_asset_urls.example.txt" %LIMIT_ARG%
 goto after_run
 
 :run_top_free
 call :ask_limit
 echo.
 echo Запуск: только топ бесплатные...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% --headless false --source "https://assetstore.unity.com/top-assets/top-free" %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --headless false --source "https://assetstore.unity.com/top-assets/top-free" %LIMIT_ARG%
 goto after_run
 
 :run_china_list
 call :ask_limit
 echo.
 echo Запуск: только из free_list_GreaterChinaUnityAssetArchiveLinks.txt...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% --headless false --no-defaults --extra-source-file "GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt" %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --headless false --no-defaults --extra-source-file "GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt" %LIMIT_ARG%
 goto after_run
 
 :run_extra_list
 call :ask_limit
 echo.
 echo Запуск: только из extra_asset_urls.example.txt...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% --headless false --no-defaults --extra-source-file "extra_asset_urls.example.txt" %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --headless false --no-defaults --extra-source-file "extra_asset_urls.example.txt" %LIMIT_ARG%
 goto after_run
 
 :run_extended
 call :ask_limit
 echo.
 echo Запуск: расширенные списки поиска...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% --headless false --source "https://assetstore.unity.com/" --extended-sources %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --headless false --source "https://assetstore.unity.com/" --extended-sources %LIMIT_ARG%
 goto after_run
 
 :run_login
 echo.
 echo Запуск: только логин и сохранение cookies.
 echo Откроется окно браузера. Войдите в аккаунт Unity и дождитесь закрытия.
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% --login --headless false
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --login --headless false
 goto after_run
 
 :run_dry
 call :ask_limit
 echo.
 echo Запуск: dry-run (аккаунт не меняется^)...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% --dry-run --headless false %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --dry-run --headless false %LIMIT_ARG%
 goto after_run
 
 :run_telegram
@@ -142,15 +148,34 @@ echo.
 call :ask_limit
 echo.
 echo Запуск: Telegram каналы...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% --headless false --no-defaults %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --headless false --no-defaults %LIMIT_ARG%
 goto after_run
 
 :run_diag
 echo.
 echo Запуск: диагностика. Пишутся максимально подробные логи.
 echo Аккаунт НЕ меняется (--dry-run^).
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% --trace-network --dry-run --headless false --no-defaults --max-visited-assets 5
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --trace-network --dry-run --headless false --no-defaults --max-visited-assets 5
 goto after_run
+
+:choose_profile
+echo.
+echo Профили на этом компьютере:
+dotnet run --project "%PROJECT%" --no-build -- --data-dir "%DATA%" --list-profiles
+echo.
+echo Профиль - это отдельный аккаунт Unity со своей сессией.
+echo По умолчанию используется имя пользователя Windows: %USERNAME%
+echo.
+set "newprofile="
+set /p "newprofile=Имя профиля [Enter = %USERNAME%]: "
+if not defined newprofile set "newprofile=%USERNAME%"
+set "PROFILE_NAME=%newprofile%"
+set "PROFILE_ARG=--profile "%newprofile%""
+echo.
+echo Выбран профиль: %PROFILE_NAME%
+echo.
+pause
+goto menu
 
 :collect_logs
 echo.
@@ -191,6 +216,7 @@ echo   %LOGS%\telegram_posts_raw.log    - тексты всех постов Tel
 echo   %LOGS%\telegram_promocodes.log   - найденные промокоды
 echo   %LOGS%\*.png / *.html            - скриншоты и дампы страниц при ошибках
 echo.
+echo Профиль: %PROFILE_NAME%. Сменить - пункт P в меню.
 echo Чтобы отправить логи: вернитесь в меню и выберите пункт L.
 echo.
 pause

@@ -1,4 +1,8 @@
 {
+  "profile": "",
+  "signInUrl": "https://login.unity.com/ru/sign-in",
+  "savePassword": null,
+  "interactive": null,
   "loginOnly": false,
   "dryRun": false,
   "headless": false,

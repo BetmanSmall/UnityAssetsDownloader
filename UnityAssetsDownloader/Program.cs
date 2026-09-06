@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using PuppeteerSharp;
@@ -16,6 +17,15 @@ catch
 }
 
 var options = CliOptions.Parse(args);
+
+if (options.ListProfiles)
+{
+    var listStore = new ProfileStore(options.DataDirectory);
+    Console.WriteLine($"Каталог данных: {options.DataDirectory}");
+    Console.WriteLine("Профили на этом компьютере:");
+    Console.WriteLine(listStore.Describe());
+    return;
+}
 
 try
 {
@@ -51,7 +61,6 @@ catch (Exception ex)
 internal sealed class UnityAssetAutomationApp
 {
     private const string AssetStoreHomeUrl = "https://assetstore.unity.com/";
-    private const string AssetStoreSignInUrl = "https://login.unity.com/en/sign-in";
     private const string BaseTopFreeSource = "https://assetstore.unity.com/top-assets/top-free";
 
     private const string BaseFreeListFileName =
@@ -60,6 +69,16 @@ internal sealed class UnityAssetAutomationApp
     private const string ExtendedSourcesFileName = "extended_sources.txt";
 
     private readonly CliOptions _options;
+    private readonly string _signInUrl;
+    private readonly ProfileStore _profileStore;
+    private readonly string _profileName;
+    private readonly string _credentialTarget;
+    private string? _unityEmail;
+    private string? _unityPassword;
+    private bool? _savePasswordAnswer;
+
+    private bool HasCredentials =>
+        !string.IsNullOrWhiteSpace(_unityEmail) && !string.IsNullOrWhiteSpace(_unityPassword);
     private readonly AppLogger _logger;
     private readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true };
     private readonly JsonSerializerOptions _runtimeJsonOptions = new() { PropertyNameCaseInsensitive = true };
@@ -92,10 +111,18 @@ internal sealed class UnityAssetAutomationApp
     public UnityAssetAutomationApp(CliOptions options)
     {
         _options = options;
+        _signInUrl = options.SignInUrl;
         _dataDirectory = options.DataDirectory;
         _logsDirectory = options.LogsDirectory;
-        _cookiesPath = Path.Combine(_dataDirectory, "unity_cookies.json");
-        _sessionStatePath = Path.Combine(_dataDirectory, "unity_session_state.json");
+        _profileStore = new ProfileStore(_dataDirectory);
+        _profileName = options.ProfileName;
+        _credentialTarget = SecretStore.BuildCredentialTarget(_profileName);
+        _unityEmail = options.UnityEmail;
+        _unityPassword = options.UnityPassword;
+
+        var profileDirectory = _profileStore.GetProfileDirectory(_profileName);
+        _cookiesPath = Path.Combine(profileDirectory, "unity_cookies.json");
+        _sessionStatePath = _profileStore.GetSessionPath(_profileName);
         _reportPath = Path.Combine(_logsDirectory, $"run-report-{DateTime.Now:yyyyMMdd-HHmmss}.json");
         var logFilePath = string.IsNullOrWhiteSpace(options.LogFilePath)
             ? Path.Combine(_logsDirectory, $"run-log-{DateTime.Now:yyyyMMdd-HHmmss}.log")
@@ -104,6 +131,7 @@ internal sealed class UnityAssetAutomationApp
         _logger = new AppLogger(options.Verbose, options.TraceNetwork, logFilePath, errorsFilePath);
         _logger.Info($"Каталог логов: {_logsDirectory}");
         _logger.Info($"Каталог данных (cookies): {_dataDirectory}");
+        _logger.Info($"Профиль аккаунта: {_profileName} | папка: {profileDirectory}");
         _logger.Info($"Файл только с ошибками: {errorsFilePath}");
     }
 
@@ -113,6 +141,18 @@ internal sealed class UnityAssetAutomationApp
         {
             Directory.CreateDirectory(_dataDirectory);
             Directory.CreateDirectory(_logsDirectory);
+
+            _profileStore.Touch(_profileName, _unityEmail);
+            if (_profileStore.TryMigrateLegacySession(_profileName, out var migrationMessage))
+            {
+                _logger.Info(migrationMessage);
+            }
+            else if (!string.IsNullOrWhiteSpace(migrationMessage))
+            {
+                _logger.Warn(migrationMessage);
+            }
+
+            ApplySavePasswordPolicy();
 
             _logger.Info($"ОС: {RuntimeInformation.OSDescription} | Arch: {RuntimeInformation.OSArchitecture} | .NET: {RuntimeInformation.FrameworkDescription}");
 
@@ -459,7 +499,8 @@ internal sealed class UnityAssetAutomationApp
             }
         }
 
-        _logger.Warn("Требуется вход в Unity. Запуск SSO через Asset Store...");
+        _logger.Warn("Требуется вход в Unity.");
+        TrySetupCredentialsInteractively();
         _lastFullAuthAttemptUtc = DateTime.UtcNow;
         var authenticated = await AuthenticateViaAssetStoreAsync(page);
         if (!authenticated)
@@ -469,8 +510,166 @@ internal sealed class UnityAssetAutomationApp
         }
 
         await SaveSessionStateAsync(page);
+        TrySavePassword();
         _logger.Info("Авторизация подтверждена, состояние сессии сохранено.");
         return true;
+    }
+
+    /// <summary>
+    /// Выполняет явное указание --save-password false: удаляет ранее сохранённый пароль.
+    /// Вызов идемпотентен — если пароля не было, ничего не происходит.
+    /// </summary>
+    private void ApplySavePasswordPolicy()
+    {
+        if (_options.SavePassword != false || !SecretStore.CredentialManagerAvailable)
+        {
+            return;
+        }
+
+        if (SecretStore.TryReadCredentials(_credentialTarget, out _, out _) &&
+            SecretStore.TryDeleteCredentials(_credentialTarget))
+        {
+            _profileStore.Touch(_profileName, passwordSaved: false);
+            _logger.Info($"Сохранённый пароль профиля '{_profileName}' удалён из Диспетчера учётных данных Windows.");
+        }
+    }
+
+    /// <summary>
+    /// Предлагает ввести логин и пароль, чтобы программа входила сама.
+    /// Пустой email означает обычный вход руками в окне браузера — так можно
+    /// войти через Google, Apple и остальные способы, где пароля Unity нет.
+    /// </summary>
+    private void TrySetupCredentialsInteractively()
+    {
+        if (HasCredentials)
+        {
+            _logger.Info($"Автовход: используются учётные данные профиля '{_profileName}'.");
+            return;
+        }
+
+        if (!_options.Interactive)
+        {
+            _logger.Info("Автовход не настроен. Откроется окно браузера для ручного входа.");
+            return;
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("==================================================");
+        Console.WriteLine($" Вход в Unity. Профиль: {_profileName}");
+        Console.WriteLine("==================================================");
+        Console.WriteLine(" 1) Ввести email и пароль — дальше программа будет входить сама");
+        Console.WriteLine(" 2) Просто нажать Enter — войдёте руками в окне браузера");
+        Console.WriteLine("    (нужно, если вход через Google, Apple или Facebook)");
+        Console.WriteLine();
+        Console.Write("Email (Enter — вход руками): ");
+
+        var email = Console.ReadLine()?.Trim();
+        if (string.IsNullOrWhiteSpace(email))
+        {
+            Console.WriteLine("Хорошо, откроется окно браузера. Войдите и дождитесь подтверждения.");
+            _logger.Info("Выбран ручной вход в браузере.");
+            return;
+        }
+
+        Console.Write("Пароль: ");
+        var password = ReadPasswordMasked();
+        Console.WriteLine();
+
+        if (string.IsNullOrWhiteSpace(password))
+        {
+            Console.WriteLine("Пароль пустой — откроется окно браузера для ручного входа.");
+            _logger.Info("Пароль не введён, переходим к ручному входу.");
+            return;
+        }
+
+        _unityEmail = email;
+        _unityPassword = password;
+        _logger.Info($"Автовход настроен для профиля '{_profileName}' (email: {email}).");
+
+        if (_options.SavePassword.HasValue)
+        {
+            return;
+        }
+
+        if (!SecretStore.CredentialManagerAvailable)
+        {
+            Console.WriteLine("Диспетчер учётных данных есть только в Windows. Пароль сохранён не будет.");
+            return;
+        }
+
+        Console.Write("Сохранить пароль в Диспетчере учётных данных Windows, чтобы больше не вводить? [Д/н]: ");
+        var answer = Console.ReadLine()?.Trim().ToLowerInvariant();
+        _savePasswordAnswer = string.IsNullOrWhiteSpace(answer) || answer is "д" or "да" or "y" or "yes";
+    }
+
+    /// <summary>Читает пароль, показывая звёздочки вместо символов.</summary>
+    private static string ReadPasswordMasked()
+    {
+        if (Console.IsInputRedirected)
+        {
+            return Console.ReadLine() ?? string.Empty;
+        }
+
+        var builder = new StringBuilder();
+
+        while (true)
+        {
+            var key = Console.ReadKey(intercept: true);
+
+            if (key.Key == ConsoleKey.Enter)
+            {
+                return builder.ToString();
+            }
+
+            if (key.Key == ConsoleKey.Backspace)
+            {
+                if (builder.Length > 0)
+                {
+                    builder.Length--;
+                    Console.Write("\b \b");
+                }
+
+                continue;
+            }
+
+            if (char.IsControl(key.KeyChar))
+            {
+                continue;
+            }
+
+            builder.Append(key.KeyChar);
+            Console.Write('*');
+        }
+    }
+
+    /// <summary>
+    /// Сохраняет логин и пароль в Диспетчер учётных данных Windows,
+    /// если это разрешено параметром --save-password или ответом пользователя.
+    /// </summary>
+    private void TrySavePassword()
+    {
+        var allowed = _options.SavePassword ?? _savePasswordAnswer;
+        if (allowed != true || !HasCredentials)
+        {
+            return;
+        }
+
+        if (!SecretStore.CredentialManagerAvailable)
+        {
+            _logger.Warn("Сохранение пароля доступно только в Windows. Пароль не сохранён.");
+            return;
+        }
+
+        if (SecretStore.TrySaveCredentials(_credentialTarget, _unityEmail!, _unityPassword!))
+        {
+            _profileStore.Touch(_profileName, _unityEmail, passwordSaved: true);
+            _logger.Info(
+                $"Пароль профиля '{_profileName}' сохранён в Диспетчере учётных данных Windows (запись '{_credentialTarget}').");
+        }
+        else
+        {
+            _logger.Warn("Не удалось сохранить пароль в Диспетчере учётных данных Windows.");
+        }
     }
 
     private async Task<bool> ValidateSessionForAssetStoreAsync(IPage page, string stage)
@@ -542,7 +741,7 @@ internal sealed class UnityAssetAutomationApp
 
     private async Task<bool> AuthenticateViaAssetStoreAsync(IPage page)
     {
-        if (_options.HasCredentials)
+        if (HasCredentials)
         {
             _logger.Info("Найдены учетные данные для автовхода. Будет выполнена автоматическая отправка формы.");
         }
@@ -557,7 +756,7 @@ internal sealed class UnityAssetAutomationApp
             _logger.Info($"Попытка авторизации {attempt}/3...");
             await StartAssetStoreSsoAsync(page);
 
-            if (_options.HasCredentials)
+            if (HasCredentials)
             {
                 await TrySwitchToSignInPageAsync(page);
                 var submitted = await TryCompleteUnityLoginFormAsync(page);
@@ -580,6 +779,27 @@ internal sealed class UnityAssetAutomationApp
 
     private async Task StartAssetStoreSsoAsync(IPage page)
     {
+        // Основной путь: сразу открываем страницу входа Unity.
+        // Раньше программа сначала грузила витрину Asset Store и искала кнопку Sign In по интерфейсу —
+        // это медленно и ломается каждый раз, когда Unity меняет вёрстку.
+        _logger.Info($"AuthStep: open-sign-in | {_signInUrl}");
+        await SafeGoToAsync(page, _signInUrl);
+
+        var stopAt = DateTime.UtcNow.AddSeconds(5);
+        while (DateTime.UtcNow < stopAt && !IsAuthFlowUrl(page.Url))
+        {
+            await Task.Delay(500);
+        }
+
+        if (IsAuthFlowUrl(page.Url))
+        {
+            await TrySwitchToSignInPageAsync(page);
+            _logger.Info($"SSO запущен напрямую, текущий URL: {page.Url}");
+            return;
+        }
+
+        // Запасной путь на случай, если прямой адрес перестал работать или нас редиректнуло в другое место.
+        _logger.Warn($"Прямой переход на {_signInUrl} не привёл на страницу входа (сейчас {page.Url}). Пробуем через интерфейс Asset Store...");
         _logger.Info("AuthStep: open-home");
         await SafeGoToAsync(page, AssetStoreHomeUrl);
 
@@ -590,8 +810,8 @@ internal sealed class UnityAssetAutomationApp
         }
         else
         {
-            var stopAt = DateTime.UtcNow.AddSeconds(5);
-            while (DateTime.UtcNow < stopAt && !IsAuthFlowUrl(page.Url))
+            var menuStopAt = DateTime.UtcNow.AddSeconds(5);
+            while (DateTime.UtcNow < menuStopAt && !IsAuthFlowUrl(page.Url))
             {
                 await Task.Delay(500);
             }
@@ -603,18 +823,12 @@ internal sealed class UnityAssetAutomationApp
             if (clickedSignInWithUnity)
             {
                 _logger.Info("AuthStep: click-sign-in-with-unity");
-                var stopAt = DateTime.UtcNow.AddSeconds(5);
-                while (DateTime.UtcNow < stopAt && !IsAuthFlowUrl(page.Url))
+                var ssoStopAt = DateTime.UtcNow.AddSeconds(5);
+                while (DateTime.UtcNow < ssoStopAt && !IsAuthFlowUrl(page.Url))
                 {
                     await Task.Delay(500);
                 }
             }
-        }
-
-        if (!IsAuthFlowUrl(page.Url))
-        {
-            _logger.Warn("Не удалось перейти на страницу входа через UI. Используем прямой переход как fallback.");
-            await SafeGoToAsync(page, AssetStoreSignInUrl);
         }
 
         _logger.Info($"SSO запущен, текущий URL: {page.Url}");
@@ -638,7 +852,7 @@ internal sealed class UnityAssetAutomationApp
             if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
             {
                 await TrySwitchToSignInPageAsync(page);
-                if (_options.HasCredentials)
+                if (HasCredentials)
                 {
                     await TryCompleteUnityLoginFormAsync(page);
                 }
@@ -655,7 +869,7 @@ internal sealed class UnityAssetAutomationApp
                     return true;
                 }
 
-                if (!_options.HasCredentials)
+                if (!HasCredentials)
                 {
                     // В режиме ручного входа не пытаемся агрессивно кликать по меню каждую секунду,
                     // так как это мешает пользователю. Просто ждем, пока он сам войдет.
@@ -693,13 +907,13 @@ internal sealed class UnityAssetAutomationApp
         if (page.Url.Contains("/sign-up", StringComparison.OrdinalIgnoreCase))
         {
             _logger.Debug("Обнаружена страница sign-up, переключаемся на sign-in...");
-            await SafeGoToAsync(page, "https://login.unity.com/en/sign-in");
+            await SafeGoToAsync(page, _signInUrl);
         }
     }
 
     private async Task<bool> TryCompleteUnityLoginFormAsync(IPage page)
     {
-        if (!_options.HasCredentials)
+        if (!HasCredentials)
         {
             return false;
         }
@@ -735,7 +949,7 @@ internal sealed class UnityAssetAutomationApp
 
             submit.click();
             return true;
-        }", _options.UnityEmail!, _options.UnityPassword!);
+        }", _unityEmail!, _unityPassword!);
     }
 
     private async Task<bool> IsAuthenticatedAsync(IPage page)
@@ -1222,14 +1436,14 @@ internal sealed class UnityAssetAutomationApp
 
     private async Task<bool> TryLoadCookiesAsync(IPage page)
     {
-        if (!File.Exists(_cookiesPath))
+        var raw = SecretStore.ReadProtectedText(_cookiesPath);
+        if (string.IsNullOrWhiteSpace(raw))
         {
             return false;
         }
 
         try
         {
-            var raw = await File.ReadAllTextAsync(_cookiesPath);
             var cookies = JsonSerializer.Deserialize<List<SerializableCookie>>(raw) ?? [];
             if (cookies.Count == 0)
             {
@@ -1252,12 +1466,12 @@ internal sealed class UnityAssetAutomationApp
 
     private async Task<bool> TryLoadSessionStateAsync(IPage page)
     {
-        if (File.Exists(_sessionStatePath))
+        var storedSession = SecretStore.ReadProtectedText(_sessionStatePath);
+        if (!string.IsNullOrWhiteSpace(storedSession))
         {
             try
             {
-                var raw = await File.ReadAllTextAsync(_sessionStatePath);
-                var state = JsonSerializer.Deserialize<SessionStateSnapshot>(raw, _runtimeJsonOptions) ??
+                var state = JsonSerializer.Deserialize<SessionStateSnapshot>(storedSession, _runtimeJsonOptions) ??
                             new SessionStateSnapshot();
                 if (state.Cookies.Count > 0)
                 {
@@ -1318,11 +1532,14 @@ internal sealed class UnityAssetAutomationApp
             }
         }
 
-        await File.WriteAllTextAsync(_sessionStatePath, JsonSerializer.Serialize(state, _jsonOptions));
+        SecretStore.WriteProtectedText(_sessionStatePath, JsonSerializer.Serialize(state, _jsonOptions));
+        _profileStore.Touch(_profileName, _unityEmail);
 
-        await File.WriteAllTextAsync(_cookiesPath, JsonSerializer.Serialize(state.Cookies, _jsonOptions));
+        var protection = SecretStore.EncryptionAvailable
+            ? "зашифровано средствами Windows"
+            : "файл доступен только текущему пользователю (шифрование ОС недоступно)";
         _logger.Info(
-            $"Сохранено состояние сессии: cookies={state.Cookies.Count}, originsLocalStorage={state.LocalStorageByOrigin.Count}");
+            $"Сохранено состояние сессии профиля '{_profileName}': cookies={state.Cookies.Count}, originsLocalStorage={state.LocalStorageByOrigin.Count} | {protection}");
     }
 
     private async Task<Dictionary<string, string>> CaptureLocalStorageForOriginAsync(IPage page, string origin)
@@ -1389,7 +1606,7 @@ internal sealed class UnityAssetAutomationApp
     {
         var cookies = await page.GetCookiesAsync("https://assetstore.unity.com", "https://login.unity.com");
         var serializable = cookies.Select(SerializableCookie.FromCookie).ToList();
-        await File.WriteAllTextAsync(_cookiesPath, JsonSerializer.Serialize(serializable, _jsonOptions));
+        SecretStore.WriteProtectedText(_cookiesPath, JsonSerializer.Serialize(serializable, _jsonOptions));
         _logger.Info($"Сохранено cookies: {serializable.Count}");
         _logger.Debug(
             $"Домены cookies после входа: {string.Join(", ", serializable.Select(c => c.Domain).Where(d => !string.IsNullOrWhiteSpace(d)).Distinct(StringComparer.OrdinalIgnoreCase))}");
@@ -3350,7 +3567,14 @@ internal sealed class CliOptions
     public bool UseExtendedSources { get; init; }
     public bool UseNoDefaults { get; init; }
     public List<string> ExtraSourceFiles { get; init; } = [];
+    public const string DefaultSignInUrl = "https://login.unity.com/ru/sign-in";
+
     public string? LogFilePath { get; init; }
+    public string SignInUrl { get; init; } = DefaultSignInUrl;
+    public string ProfileName { get; init; } = "default";
+    public bool ListProfiles { get; init; }
+    public bool? SavePassword { get; init; }
+    public bool Interactive { get; init; }
     public string LogsDirectory { get; init; } = Path.Combine(AppContext.BaseDirectory, "logs");
     public string DataDirectory { get; init; } = Path.Combine(AppContext.BaseDirectory, "data");
     public string? UnityEmail { get; init; }
@@ -3387,6 +3611,12 @@ internal sealed class CliOptions
         var cliUseNoDefaults = false;
         string? cliLogFilePath = null;
         string? cliLogsDirectory = null;
+        string? cliSignInUrl = null;
+        string? cliProfile = null;
+        string? cliSetDefaultProfile = null;
+        var cliListProfiles = false;
+        bool? cliSavePassword = null;
+        bool? cliInteractive = null;
         string? cliDataDirectory = null;
         string? cliUnityEmail = null;
         string? cliUnityPassword = null;
@@ -3444,6 +3674,24 @@ internal sealed class CliOptions
                     break;
                 case "--logs-dir" when i + 1 < args.Length:
                     cliLogsDirectory = args[++i];
+                    break;
+                case "--sign-in-url" when i + 1 < args.Length:
+                    cliSignInUrl = args[++i];
+                    break;
+                case "--profile" when i + 1 < args.Length:
+                    cliProfile = args[++i];
+                    break;
+                case "--list-profiles":
+                    cliListProfiles = true;
+                    break;
+                case "--set-default-profile" when i + 1 < args.Length:
+                    cliSetDefaultProfile = args[++i];
+                    break;
+                case "--save-password" when i + 1 < args.Length:
+                    cliSavePassword = ParseBool(args[++i], true);
+                    break;
+                case "--interactive" when i + 1 < args.Length:
+                    cliInteractive = ParseBool(args[++i], true);
                     break;
                 case "--data-dir" when i + 1 < args.Length:
                     cliDataDirectory = args[++i];
@@ -3679,8 +3927,35 @@ internal sealed class CliOptions
             telegramChannels.AddRange(ReadTelegramSourcesFile("telegram_sources.txt"));
         }
 
+        var signInUrl = FirstNonEmpty(cliSignInUrl, config?.SignInUrl) ?? DefaultSignInUrl;
         var logsDirectory = ResolveDirectory(cliLogsDirectory ?? config?.LogsDirectory, "logs");
         var dataDirectory = ResolveDirectory(cliDataDirectory ?? config?.DataDirectory, "data");
+
+        // Профиль решается до всего остального: от него зависит, где лежит сессия
+        // и какие учётные данные брать из Диспетчера учётных данных Windows.
+        var profileStore = new ProfileStore(dataDirectory);
+        var profileName = cliSetDefaultProfile ?? profileStore.ResolveProfileName(cliProfile, config?.Profile);
+
+        if (!string.IsNullOrWhiteSpace(cliSetDefaultProfile))
+        {
+            profileStore.SetDefault(cliSetDefaultProfile.Trim());
+            Console.WriteLine($"Профиль по умолчанию: {cliSetDefaultProfile.Trim()}");
+        }
+
+        // Если логин и пароль не заданы явно, пробуем взять их из хранилища ОС.
+        if (string.IsNullOrWhiteSpace(unityEmail) || string.IsNullOrWhiteSpace(unityPassword))
+        {
+            var target = SecretStore.BuildCredentialTarget(profileName);
+            if (SecretStore.TryReadCredentials(target, out var storedEmail, out var storedPassword))
+            {
+                unityEmail = storedEmail;
+                unityPassword = storedPassword;
+                Console.WriteLine($"[Вход] Учётные данные профиля '{profileName}' взяты из Диспетчера учётных данных Windows.");
+            }
+        }
+
+        // Интерактивный режим доступен, только если программу запустили из живой консоли.
+        var interactive = cliInteractive ?? config?.Interactive ?? !Console.IsInputRedirected;
 
         var telegramPostLimit = config?.Telegram?.PostLimit ?? 20;
         var telegramScreenshotOnNoLinks = config?.Telegram?.ScreenshotOnNoLinks ?? true;
@@ -3697,6 +3972,11 @@ internal sealed class CliOptions
             ExtraSourceFiles = extraSourceFiles,
             LogFilePath = logFilePath,
             LogsDirectory = logsDirectory,
+            SignInUrl = signInUrl,
+            ProfileName = profileName,
+            ListProfiles = cliListProfiles,
+            SavePassword = cliSavePassword ?? config?.SavePassword,
+            Interactive = interactive,
             DataDirectory = dataDirectory,
             UnityEmail = unityEmail,
             UnityPassword = unityPassword,
@@ -3714,6 +3994,32 @@ internal sealed class CliOptions
             TelegramPostLimit = telegramPostLimit,
             TelegramScreenshotOnNoLinks = telegramScreenshotOnNoLinks
         };
+    }
+
+    /// <summary>
+    /// Разбирает значение вида true/false/да/нет/1/0. Непонятное значение — берём запасное.
+    /// </summary>
+    private static bool ParseBool(string raw, bool fallback)
+    {
+        var value = raw.Trim().ToLowerInvariant();
+
+        return value switch
+        {
+            "true" or "1" or "yes" or "y" or "да" or "д" => true,
+            "false" or "0" or "no" or "n" or "нет" or "н" => false,
+            _ => LogAndFallback()
+        };
+
+        bool LogAndFallback()
+        {
+            Console.WriteLine($"Непонятное значение '{raw}'. Используется {fallback}.");
+            return fallback;
+        }
+    }
+
+    private static string? FirstNonEmpty(params string?[] values)
+    {
+        return values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v))?.Trim();
     }
 
     /// <summary>
@@ -3801,6 +4107,10 @@ internal sealed class AppConfig
     public bool? NoDefaults { get; init; }
     public List<string> ExtraSourceFiles { get; init; } = [];
     public string? LogFilePath { get; init; }
+    public string? SignInUrl { get; init; }
+    public string? Profile { get; init; }
+    public bool? SavePassword { get; init; }
+    public bool? Interactive { get; init; }
     public string? LogsDirectory { get; init; }
     public string? DataDirectory { get; init; }
     public string? UnityEmail { get; init; }
