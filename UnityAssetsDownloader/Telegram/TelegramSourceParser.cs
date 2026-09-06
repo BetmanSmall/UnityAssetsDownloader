@@ -59,6 +59,11 @@ internal sealed class TelegramSourceParser
             result.PostsWithoutLinks.AddRange(channelResult.PostsWithoutLinks);
             result.Errors.AddRange(channelResult.Errors);
             result.AllPosts.AddRange(channelResult.AllPosts);
+
+            foreach (var kvp in channelResult.AssetPromocodes)
+            {
+                result.AssetPromocodes[kvp.Key] = kvp.Value;
+            }
         }
 
         // Дедупликация
@@ -148,6 +153,15 @@ internal sealed class TelegramSourceParser
                 channelResult.AssetUrls.AddRange(assetUrls);
                 channelResult.GitLinks.AddRange(gitUrls);
                 channelResult.Promocodes.AddRange(promocodes);
+
+                if (assetUrls.Count > 0 && promocodes.Count > 0)
+                {
+                    var firstPromo = promocodes[0];
+                    foreach (var url in assetUrls)
+                    {
+                        channelResult.AssetPromocodes[url] = firstPromo;
+                    }
+                }
 
                 if (assetUrls.Count > 0)
                 {
@@ -396,6 +410,7 @@ internal sealed class TelegramParseResult
     public List<PostWithoutLink> PostsWithoutLinks { get; set; } = [];
     public List<string> Errors { get; set; } = [];
     public List<TelegramPostInfo> AllPosts { get; set; } = [];
+    public Dictionary<string, string> AssetPromocodes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
 internal sealed class TelegramChannelResult
@@ -407,6 +422,7 @@ internal sealed class TelegramChannelResult
     public List<PostWithoutLink> PostsWithoutLinks { get; set; } = [];
     public List<string> Errors { get; set; } = [];
     public List<TelegramPostInfo> AllPosts { get; set; } = [];
+    public Dictionary<string, string> AssetPromocodes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
 internal sealed class PostWithoutLink

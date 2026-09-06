@@ -67,8 +67,32 @@ internal sealed class UnityAssetAutomationApp
             Directory.CreateDirectory(_dataDirectory);
             Directory.CreateDirectory(_logsDirectory);
 
-            _logger.Info("Подготовка браузера Chromium...");
-            await new BrowserFetcher().DownloadAsync();
+            string? chromePath = null;
+            var potentialChromePaths = new[]
+            {
+                @"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Google\Chrome\Application\chrome.exe")
+            };
+
+            foreach (var path in potentialChromePaths)
+            {
+                if (File.Exists(path))
+                {
+                    chromePath = path;
+                    break;
+                }
+            }
+
+            if (chromePath != null)
+            {
+                _logger.Info($"Используем локальный Google Chrome: {chromePath}");
+            }
+            else
+            {
+                _logger.Info("Локальный Google Chrome не найден. Подготовка встроенного Chromium...");
+                await new BrowserFetcher().DownloadAsync();
+            }
 
             var browserArgs = new List<string>
             {
@@ -84,13 +108,20 @@ internal sealed class UnityAssetAutomationApp
                 _logger.Info($"Прокси включён: {proxyArg}");
             }
 
-            await using var browser = await Puppeteer.LaunchAsync(new LaunchOptions
+            var launchOptions = new LaunchOptions
             {
                 Headless = _options.Headless,
                 DefaultViewport = null,
                 IgnoredDefaultArgs = ["--enable-automation"],
                 Args = [..browserArgs]
-            });
+            };
+
+            if (chromePath != null)
+            {
+                launchOptions.ExecutablePath = chromePath;
+            }
+
+            await using var browser = await Puppeteer.LaunchAsync(launchOptions);
 
             await using var page = await browser.NewPageAsync();
             page.DefaultNavigationTimeout = _options.NavigationTimeoutMs;
@@ -121,6 +152,7 @@ internal sealed class UnityAssetAutomationApp
 
             var sources = ResolveSources();
             var assetUrls = await CollectAssetUrlsAsync(page, sources);
+            var assetPromocodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
             // Парсинг Telegram каналов (если указаны)
             if (_options.TelegramChannels.Count > 0)
@@ -159,6 +191,14 @@ internal sealed class UnityAssetAutomationApp
                     {
                         assetUrls.Add(url);
                         _logger.Debug($"Telegram asset: {url}");
+                    }
+                }
+
+                if (tgResult.AssetPromocodes.Count > 0)
+                {
+                    foreach (var kvp in tgResult.AssetPromocodes)
+                    {
+                        assetPromocodes[kvp.Key] = kvp.Value;
                     }
                 }
 
@@ -229,7 +269,8 @@ internal sealed class UnityAssetAutomationApp
                 index++;
                 _logger.Info($"[{index}/{assetUrls.Count}] Обработка: {assetUrl}");
 
-                var result = await ProcessAssetAsync(page, assetUrl);
+                assetPromocodes.TryGetValue(assetUrl, out var promoCode);
+                var result = await ProcessAssetAsync(page, assetUrl, promoCode);
                 report.Items.Add(result);
 
                 if (result.CountsTowardsAddLimit)
@@ -1622,7 +1663,7 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
-    private async Task<ProcessResult> ProcessAssetAsync(IPage page, string assetUrl)
+    private async Task<ProcessResult> ProcessAssetAsync(IPage page, string assetUrl, string? promoCode = null)
     {
         var result = new ProcessResult
         {
@@ -1725,6 +1766,12 @@ internal sealed class UnityAssetAutomationApp
 
                 if (!status.IsFree && !status.HasAddToMyAssets)
                 {
+                    if (promoCode != null)
+                    {
+                        _logger.Info($"[Промокод] Ассет платный, но найден промокод '{promoCode}'. Запуск процесса чекаута...");
+                        return await ProcessPromoAssetAsync(page, assetUrl, promoCode, result);
+                    }
+
                     _logger.Info($"[Пропуск] Ассет является платным: {assetUrl} (Сигналы: {status.DetectionSummary})");
                     result.Status = AssetProcessStatus.PaidSkipped;
                     return result;
@@ -1812,6 +1859,613 @@ internal sealed class UnityAssetAutomationApp
             await SaveErrorScreenshotAsync(page, "processing-error");
             return result;
         }
+    }
+
+    private async Task<ProcessResult> ProcessPromoAssetAsync(IPage page, string assetUrl, string promoCode, ProcessResult result)
+    {
+        var sanitizedId = SanitizeFileName(assetUrl.Split('/').Last());
+        try
+        {
+            // 1. Нажимаем кнопку "Add to Cart" или "Buy Now"
+            _logger.Info($"[Промокод] Добавление ассета в корзину: {assetUrl}");
+            var clicked = await TryClickAddToCartOrBuyNowButtonAsync(page);
+            if (!clicked)
+            {
+                result.Status = AssetProcessStatus.Failed;
+                result.Message = "Не удалось нажать кнопку Add to Cart или Buy Now на странице ассета.";
+                _logger.Warn($"[Ошибка] {result.Message}");
+                await SaveErrorScreenshotAsync(page, $"promo_failed_click_{sanitizedId}");
+                return result;
+            }
+
+            await Task.Delay(3000);
+            await SaveErrorScreenshotAsync(page, $"promo_added_to_cart_{sanitizedId}");
+
+            // 2. Ожидаем автоматического перехода в корзину или чекаут
+            _logger.Info("[Промокод] Ожидание автоматического перехода в корзину или чекаут...");
+            var redirected = false;
+            for (var i = 0; i < 15; i++)
+            {
+                if (page.Url.Contains("pay.unity.com", StringComparison.OrdinalIgnoreCase) || 
+                    page.Url.Contains("/cart", StringComparison.OrdinalIgnoreCase) || 
+                    page.Url.Contains("/checkout", StringComparison.OrdinalIgnoreCase))
+                {
+                    redirected = true;
+                    _logger.Info($"[Промокод] Зафиксирован автоматический переход на: {page.Url}");
+                    break;
+                }
+                await Task.Delay(1000);
+            }
+
+            if (!redirected)
+            {
+                _logger.Info("[Промокод] Автоматический переход не произошел за 15 секунд. Переходим принудительно на страницу корзины: https://assetstore.unity.com/cart");
+                await SafeGoToAsync(page, "https://assetstore.unity.com/cart");
+                await Task.Delay(3000);
+            }
+
+            await SaveErrorScreenshotAsync(page, $"promo_pay_page_{sanitizedId}");
+
+            // 3. Ожидание полей ввода
+            var elementsReady = await WaitForCartPageElementsAsync(page, TimeSpan.FromSeconds(30));
+            if (!elementsReady)
+            {
+                result.Status = AssetProcessStatus.Failed;
+                result.Message = "Не удалось загрузить элементы оформления заказа (поле ввода или кнопки оплаты).";
+                _logger.Warn($"[Ошибка] {result.Message}");
+                await SaveErrorScreenshotAsync(page, $"promo_failed_elements_{sanitizedId}");
+                await ClearCartAsync(page);
+                return result;
+            }
+
+            // 4. Обработка шага налогообложения "Tax Business use"
+            _logger.Info("[Промокод] Проверка и заполнение налогового вопроса 'Tax Business use'...");
+            var taxHandled = await page.EvaluateFunctionAsync<bool>(@"() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+
+                const labels = Array.from(document.querySelectorAll('label, span, div'));
+                const taxLabel = labels.find(el => {
+                    const txt = (el.innerText || '').toLowerCase();
+                    return txt.includes('tax business use') || txt.includes('business use') || txt.includes('коммерческ') || txt.includes('для бизнеса') || txt.includes('предпринимател') || txt.includes('инн') || txt.includes('tax number');
+                });
+
+                if (!taxLabel) return false;
+
+                const inputs = Array.from(document.querySelectorAll('input[type=""radio""]'));
+                let noRadio = null;
+                for (const input of inputs) {
+                    if (!visible(input)) continue;
+                    
+                    let labelText = '';
+                    if (input.id) {
+                        const lbl = document.querySelector(`label[for=""${input.id}""]`);
+                        if (lbl) labelText = lbl.innerText;
+                    }
+                    if (!labelText) {
+                        let parent = input.parentElement;
+                        while (parent && parent !== document.body) {
+                            if (parent.tagName === 'LABEL') {
+                                labelText = parent.innerText;
+                                break;
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+
+                    const labelTextNorm = labelText.toLowerCase().replace(/\s+/g, '');
+                    if (labelTextNorm.includes('no') || labelTextNorm.includes('нет') || input.value.toLowerCase() === 'no') {
+                        noRadio = input;
+                        break;
+                    }
+                }
+
+                if (!noRadio) {
+                    const clickables = Array.from(document.querySelectorAll('button, span, div, label')).filter(visible);
+                    noRadio = clickables.find(el => {
+                        const t = (el.innerText || '').trim().toLowerCase();
+                        return t === 'no' || t === 'нет';
+                    });
+                }
+
+                if (noRadio) {
+                    noRadio.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    if (typeof noRadio.click === 'function') {
+                        noRadio.click();
+                    }
+                    noRadio.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                }
+
+                return false;
+            }");
+
+            if (taxHandled)
+            {
+                _logger.Info("[Промокод] Вопрос налогообложения обнаружен: выбран вариант 'No'.");
+                await Task.Delay(2000);
+                await SaveErrorScreenshotAsync(page, $"promo_tax_selected_{sanitizedId}");
+            }
+            else
+            {
+                _logger.Debug("[Промокод] Вопрос налогообложения 'Tax Business use' не найден (возможно, не pay.unity.com или шаг пропущен).");
+            }
+
+            // 4.5. Обработка формы адреса (Billing Address Form), если она открыта
+            _logger.Info("[Промокод] Проверка наличия формы ввода адреса (Billing Address)...");
+            var billingAddressHandled = await page.EvaluateFunctionAsync<bool>(@"async () => {
+                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+
+                const inputs = Array.from(document.querySelectorAll('input'));
+                const hasAddressFields = inputs.some(el => {
+                    if (!visible(el)) return false;
+                    const name = normalize(el.name || '');
+                    const id = normalize(el.id || '');
+                    return name.includes('address') || name.includes('postal') || name.includes('zip') || name.includes('city') || name.includes('state') ||
+                           id.includes('address') || id.includes('postal') || id.includes('zip') || id.includes('city') || id.includes('state');
+                });
+
+                if (!hasAddressFields) return false;
+
+                const buttons = Array.from(document.querySelectorAll('button, a, [role=""button""]')).filter(visible);
+                const saveBtn = buttons.find(el => {
+                    const txt = normalize(el.innerText || '');
+                    if (txt.includes('pay') || txt.includes('заплатить') || txt.includes('оплатить') || txt.includes('купить') || txt.includes('place order') || txt.includes('complete purchase')) {
+                        return false;
+                    }
+                    return txt === 'save' || txt === 'continue' || txt === 'next' || txt.includes('save & continue') ||
+                           txt === 'далее' || txt === 'сохранить' || txt === 'продолжить' || txt.includes('сохранить и продолжить');
+                });
+
+                if (saveBtn) {
+                    saveBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    if (typeof saveBtn.click === 'function') {
+                        saveBtn.click();
+                    }
+                    return true;
+                }
+
+                return false;
+            }");
+
+            if (billingAddressHandled)
+            {
+                _logger.Info("[Промокод] Обнаружена форма адреса: нажата кнопка продолжения/сохранения.");
+                await Task.Delay(4000);
+                await SaveErrorScreenshotAsync(page, $"promo_billing_saved_{sanitizedId}");
+            }
+
+            // 5. Вводим промокод и нажимаем Apply
+            _logger.Info($"[Промокод] Ввод промокода '{promoCode}'...");
+            var promoEntered = await page.EvaluateFunctionAsync<bool>(@"async (code) => {
+                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+
+                const inputs = Array.from(document.querySelectorAll('input'));
+                const promoInput = inputs.find(el => {
+                    if (!visible(el)) return false;
+                    const placeholder = normalize(el.placeholder || '');
+                    const name = normalize(el.name || '');
+                    const id = normalize(el.id || '');
+                    
+                    const isAddressField = 
+                        name.includes('postal') || name.includes('zip') || name.includes('address') || name.includes('phone') || name.includes('city') || name.includes('state') || name.includes('country') || name.includes('company') || name.includes('name') || name.includes('email') ||
+                        id.includes('postal') || id.includes('zip') || id.includes('address') || id.includes('phone') || id.includes('city') || id.includes('state') || id.includes('country') || id.includes('company') || id.includes('name') || id.includes('email') ||
+                        placeholder.includes('zip') || placeholder.includes('postal') || placeholder.includes('address') || placeholder.includes('phone') || placeholder.includes('city') || placeholder.includes('state') || placeholder.includes('country') || placeholder.includes('email');
+
+                    if (isAddressField) return false;
+
+                    return placeholder.includes('coupon') || placeholder.includes('promo') || placeholder.includes('code') || placeholder.includes('credit') ||
+                           placeholder.includes('купон') || placeholder.includes('промо') || placeholder.includes('код') || placeholder.includes('скидк') ||
+                           name.includes('coupon') || name.includes('promo') || name.includes('code') ||
+                           id.includes('coupon') || id.includes('promo') || id.includes('code');
+                });
+
+                if (!promoInput) return false;
+
+                promoInput.value = code;
+                promoInput.dispatchEvent(new Event('input', { bubbles: true }));
+                promoInput.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            }", promoCode);
+
+            if (!promoEntered)
+            {
+                result.Status = AssetProcessStatus.Failed;
+                result.Message = "Не найдено поле ввода промокода.";
+                _logger.Warn($"[Ошибка] {result.Message}");
+                await SaveErrorScreenshotAsync(page, $"promo_failed_input_{sanitizedId}");
+                await ClearCartAsync(page);
+                return result;
+            }
+
+            var applyClicked = await page.EvaluateFunctionAsync<bool>(@"() => {
+                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+
+                const buttons = Array.from(document.querySelectorAll('button, a, [role=""button""]')).filter(visible);
+                let applyBtn = buttons.find(el => {
+                    const txt = normalize(el.innerText || '');
+                    return txt === 'apply' || txt === 'redeem' || txt === 'submit' || txt.includes('apply') || txt.includes('применить') || txt.includes('ввести');
+                });
+
+                if (!applyBtn) {
+                    const inputs = Array.from(document.querySelectorAll('input'));
+                    const promoInput = inputs.find(el => {
+                        const placeholder = normalize(el.placeholder || '');
+                        const name = normalize(el.name || '');
+                        const id = normalize(el.id || '');
+                        
+                        const isAddressField = 
+                            name.includes('postal') || name.includes('zip') || name.includes('address') || name.includes('phone') || name.includes('city') || name.includes('state') || name.includes('country') || name.includes('company') || name.includes('name') || name.includes('email') ||
+                            id.includes('postal') || id.includes('zip') || id.includes('address') || id.includes('phone') || id.includes('city') || id.includes('state') || id.includes('country') || id.includes('company') || id.includes('name') || id.includes('email') ||
+                            placeholder.includes('zip') || placeholder.includes('postal') || placeholder.includes('address') || placeholder.includes('phone') || placeholder.includes('city') || placeholder.includes('state') || placeholder.includes('country') || placeholder.includes('email');
+
+                        if (isAddressField) return false;
+
+                        return placeholder.includes('coupon') || placeholder.includes('promo') || placeholder.includes('code') || placeholder.includes('купон') || placeholder.includes('промо') || placeholder.includes('код') ||
+                               name.includes('coupon') || name.includes('promo') || name.includes('code') ||
+                               id.includes('coupon') || id.includes('promo') || id.includes('code');
+                    });
+                    if (promoInput) {
+                        let parent = promoInput.parentElement;
+                        while (parent && parent !== document.body) {
+                            const btnInParent = Array.from(parent.querySelectorAll('button, a, [role=""button""]')).filter(visible)[0];
+                            if (btnInParent) {
+                                applyBtn = btnInParent;
+                                break;
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+                }
+
+                if (!applyBtn) return false;
+                applyBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                return true;
+            }");
+
+            if (!applyClicked)
+            {
+                result.Status = AssetProcessStatus.Failed;
+                result.Message = "Не найдена кнопка Apply для промокода.";
+                _logger.Warn($"[Ошибка] {result.Message}");
+                await SaveErrorScreenshotAsync(page, $"promo_failed_apply_{sanitizedId}");
+                await ClearCartAsync(page);
+                return result;
+            }
+
+            _logger.Info("[Промокод] Кнопка Apply нажата. Ожидание обновления стоимости...");
+            await Task.Delay(4000); 
+
+            await SaveErrorScreenshotAsync(page, $"promo_coupon_applied_{sanitizedId}");
+
+            // 6. Проверка ошибок применения промокода и обнуления цены
+            var cartState = await page.EvaluateFunctionAsync<string>(@"() => {
+                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+
+                const bodyText = (document.body?.innerText || '');
+                const normBody = normalize(bodyText);
+
+                const errorKeywords = ['expired', 'invalid', 'is not valid', 'недействителен', 'истек', 'ошибка', 'coupon limit'];
+                let hasPromoError = false;
+                let foundError = '';
+                for (const kw of errorKeywords) {
+                    if (normBody.includes(kw)) {
+                        hasPromoError = true;
+                        foundError = kw;
+                        break;
+                    }
+                }
+
+                const candidates = Array.from(document.querySelectorAll('span, div, p, strong, td')).filter(visible);
+                
+                const hasZero = candidates.some(x => {
+                    const t = normalize(x.innerText || '');
+                    return t === '$0.00' || t === '$0,00' || t === '$0' || t === 'free' || t === 'бесплатно' || 
+                           t.includes('0.00') || t.includes('0,00') || t.includes('free') || t.includes('бесплатно');
+                });
+
+                return JSON.stringify({
+                    hasPromoError,
+                    foundError,
+                    hasZeroPrice: hasZero,
+                    bodyTextPreview: bodyText.substring(0, 500)
+                });
+            }");
+
+            var state = JsonSerializer.Deserialize<CartStateSnapshot>(cartState, _runtimeJsonOptions) ?? new CartStateSnapshot();
+            _logger.Debug($"[Промокод] Статус корзины: hasPromoError={state.HasPromoError} (код: {state.FoundError}), hasZeroPrice={state.HasZeroPrice}");
+
+            if (state.HasPromoError || !state.HasZeroPrice)
+            {
+                result.Status = AssetProcessStatus.Failed;
+                result.Message = state.HasPromoError 
+                    ? $"Промокод не был применен: обнаружена ошибка '{state.FoundError}'."
+                    : "Промокод введен, но итоговая стоимость не стала бесплатной ($0.00).";
+                _logger.Warn($"[Ошибка] {result.Message} Абортируем оформление.");
+                await SaveErrorScreenshotAsync(page, $"promo_failed_error_{sanitizedId}");
+                await ClearCartAsync(page);
+                return result;
+            }
+
+            // 7. Прохождение EULA (согласие с EULA чекбоксом)
+            _logger.Info("[Промокод] Согласие с чекбоксом EULA...");
+            var eulaHandled = await page.EvaluateFunctionAsync<bool>(@"() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+
+                const checkboxes = Array.from(document.querySelectorAll('input[type=""checkbox""]')).filter(visible);
+                let eulaCheckbox = null;
+                for (const checkbox of checkboxes) {
+                    let labelText = '';
+                    if (checkbox.id) {
+                        const lbl = document.querySelector(`label[for=""${checkbox.id}""]`);
+                        if (lbl) labelText = lbl.innerText;
+                    }
+                    if (!labelText) {
+                        let parent = checkbox.parentElement;
+                        while (parent && parent !== document.body) {
+                            if (parent.tagName === 'LABEL' || parent.innerText.trim().length > 0) {
+                                labelText = parent.innerText;
+                                break;
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+
+                    const lt = labelText.toLowerCase();
+                    if (lt.includes('understand and agree') || lt.includes('eula') || lt.includes('license agreement') || lt.includes('withdrawal') || lt.includes('согласен') || lt.includes('условия')) {
+                        eulaCheckbox = checkbox;
+                        break;
+                    }
+                }
+
+                if (!eulaCheckbox && checkboxes.length > 0) {
+                    eulaCheckbox = checkboxes[0];
+                }
+
+                if (eulaCheckbox) {
+                    if (!eulaCheckbox.checked) {
+                        eulaCheckbox.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        if (typeof eulaCheckbox.click === 'function') {
+                            eulaCheckbox.click();
+                        }
+                        eulaCheckbox.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    return true;
+                }
+
+                return false;
+            }");
+
+            if (eulaHandled)
+            {
+                _logger.Info("[Промокод] Согласие с EULA успешно отмечено.");
+                await Task.Delay(1000);
+            }
+            else
+            {
+                _logger.Warn("[Промокод] Предупреждение: чекбокс соглашения с EULA не обнаружен.");
+            }
+
+            // 8. Кликаем кнопку оформления заказа ("Pay Now", "Complete Purchase", "Place Order")
+            _logger.Info("[Промокод] Нажатие на кнопку оформления заказа (Pay Now / Place Order)...");
+            var finalCheckoutClicked = await page.EvaluateFunctionAsync<bool>(@"() => {
+                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+
+                const buttons = Array.from(document.querySelectorAll('button, a, [role=""button""]')).filter(visible);
+                const payBtn = buttons.find(el => {
+                    const txt = normalize(el.innerText || '');
+                    return txt.includes('pay now') || txt.includes('place order') || txt.includes('complete purchase') || txt.includes('complete order') || txt === 'pay' || txt.includes('купить') || txt.includes('оформить заказ') || txt.includes('оплатить');
+                });
+
+                if (!payBtn) return false;
+                
+                setTimeout(() => {
+                    payBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    if (typeof payBtn.click === 'function') {
+                        payBtn.click();
+                    }
+                }, 50);
+                
+                return true;
+            }");
+
+            if (!finalCheckoutClicked)
+            {
+                result.Status = AssetProcessStatus.Failed;
+                result.Message = "Не найдена финальная кнопка оформления заказа (Pay Now / Place Order).";
+                _logger.Warn($"[Ошибка] {result.Message}");
+                await SaveErrorScreenshotAsync(page, $"promo_failed_checkout_btn_{sanitizedId}");
+                await ClearCartAsync(page);
+                return result;
+            }
+
+            _logger.Info("[Промокод] Кнопка покупки нажата. Ожидание завершения транзакции...");
+            await Task.Delay(10000); 
+
+            await SaveErrorScreenshotAsync(page, $"promo_checkout_success_{sanitizedId}");
+
+            // 9. Проверка успешного завершения покупки
+            var successState = await page.EvaluateFunctionAsync<bool>(@"() => {
+                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const text = normalize(document.body?.innerText || '');
+                return text.includes('thank you') || text.includes('success') || text.includes('order completed') || text.includes('успешно') || text.includes('спасибо за покупку') || window.location.href.includes('success');
+            }");
+
+            if (successState || page.Url.Contains("success", StringComparison.OrdinalIgnoreCase))
+            {
+                result.Status = AssetProcessStatus.Added;
+                _logger.Info($"[УСПЕХ] Ассет успешно получен по промокоду: {assetUrl}");
+            }
+            else
+            {
+                result.Status = AssetProcessStatus.UnknownAfterClick;
+                _logger.Warn($"[Внимание] Кнопка оформления по промокоду нажата, но переход на страницу успешного завершения не зафиксирован: {page.Url}");
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            result.Status = AssetProcessStatus.Failed;
+            result.Message = $"Исключение при покупке по промокоду: {ex.Message}";
+            _logger.Error($"[Ошибка] {result.Message}");
+            await SaveErrorScreenshotAsync(page, $"promo_exception_{sanitizedId}");
+            await ClearCartAsync(page);
+            return result;
+        }
+    }
+
+    private async Task ClearCartAsync(IPage page)
+    {
+        try
+        {
+            _logger.Info("[Очистка корзины] Переход на https://assetstore.unity.com/cart для очистки...");
+            await SafeGoToAsync(page, "https://assetstore.unity.com/cart");
+            await Task.Delay(3000);
+
+            var cleared = await page.EvaluateFunctionAsync<bool>(@"() => {
+                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+
+                const buttons = Array.from(document.querySelectorAll('button, a, [role=""button""]')).filter(visible);
+                const removeButtons = buttons.filter(el => {
+                    const txt = normalize(el.innerText || '');
+                    const label = normalize(el.getAttribute('aria-label') || '');
+                    return txt === 'remove' || txt === 'delete' || txt === 'удалить' || label.includes('remove') || label.includes('delete');
+                });
+
+                if (removeButtons.length === 0) return false;
+
+                for (const btn of removeButtons) {
+                    btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    if (typeof btn.click === 'function') {
+                        btn.click();
+                    }
+                }
+                return true;
+            }");
+
+            if (cleared)
+            {
+                _logger.Info("[Очистка корзины] Элементы удалены из корзины.");
+                await Task.Delay(2000);
+            }
+            else
+            {
+                _logger.Debug("[Очистка корзины] Корзина пуста или кнопки удаления не найдены.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[Очистка корзины] Не удалось очистить корзину: {ex.Message}");
+        }
+    }
+
+    private async Task<bool> WaitForCartPageElementsAsync(IPage page, TimeSpan timeout)
+    {
+        var stopAt = DateTime.UtcNow.Add(timeout);
+        while (DateTime.UtcNow < stopAt)
+        {
+            try
+            {
+                var exists = await page.EvaluateFunctionAsync<bool>(@"() => {
+                    const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                    };
+                    
+                    const inputs = Array.from(document.querySelectorAll('input'));
+                    const hasPromoInput = inputs.some(el => {
+                        if (!visible(el)) return false;
+                        const placeholder = normalize(el.placeholder || '');
+                        const name = normalize(el.name || '');
+                        const id = normalize(el.id || '');
+                        
+                        const isAddressField = 
+                            name.includes('postal') || name.includes('zip') || name.includes('address') || name.includes('phone') || name.includes('city') || name.includes('state') || name.includes('country') || name.includes('company') || name.includes('name') || name.includes('email') ||
+                            id.includes('postal') || id.includes('zip') || id.includes('address') || id.includes('phone') || id.includes('city') || id.includes('state') || id.includes('country') || id.includes('company') || id.includes('name') || id.includes('email') ||
+                            placeholder.includes('zip') || placeholder.includes('postal') || placeholder.includes('address') || placeholder.includes('phone') || placeholder.includes('city') || placeholder.includes('state') || placeholder.includes('country') || placeholder.includes('email');
+
+                        if (isAddressField) return false;
+
+                        return placeholder.includes('coupon') || placeholder.includes('promo') || placeholder.includes('code') || placeholder.includes('credit') ||
+                               placeholder.includes('купон') || placeholder.includes('промо') || placeholder.includes('код') || placeholder.includes('скидк') ||
+                               name.includes('coupon') || name.includes('promo') || name.includes('code') ||
+                               id.includes('coupon') || id.includes('promo') || id.includes('code');
+                    });
+
+                    const buttons = Array.from(document.querySelectorAll('button, a, [role=""button""]'));
+                    const hasCheckoutBtn = buttons.some(el => {
+                        if (!visible(el)) return false;
+                        const txt = normalize(el.innerText || '');
+                        return txt.includes('checkout') || txt.includes('place order') || txt.includes('proceed') || txt.includes('order') || txt.includes('pay') || txt.includes('complete purchase') ||
+                               txt.includes('оформить') || txt.includes('оплатить') || txt.includes('купить') || txt.includes('заказать');
+                    });
+
+                    return hasPromoInput || hasCheckoutBtn;
+                }");
+
+                if (exists) return true;
+            }
+            catch
+            {
+            }
+            await Task.Delay(1000);
+        }
+        return false;
+    }
+
+    private static string SanitizeFileName(string name)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        return string.Join("_", name.Split(invalid, StringSplitOptions.RemoveEmptyEntries));
     }
 
     private async Task<AssetStatusSnapshot> VerifyPostAddStatusAsync(IPage page, string assetUrl, TimeSpan timeout)
@@ -2094,6 +2748,74 @@ internal sealed class UnityAssetAutomationApp
         }");
     }
 
+    private static async Task<bool> TryClickAddToCartOrBuyNowButtonAsync(IPage page)
+    {
+        return await page.EvaluateFunctionAsync<bool>(@"() => {
+            const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+
+            const rootSelectors = [
+                '[data-testid*=""cta"" i]',
+                '[data-testid*=""purchase"" i]',
+                '[class*=""cta"" i]',
+                '[class*=""purchase"" i]',
+                '[class*=""buy"" i]',
+                'aside[class*=""sidebar"" i]',
+                'div[class*=""sidebar"" i]'
+            ].join(', ');
+
+            const roots = Array.from(document.querySelectorAll(rootSelectors))
+                .filter(visible)
+                .filter(root => {
+                    const txt = normalize(root.innerText || '');
+                    return txt.includes('add to cart') || txt.includes('buy now') || txt.includes('buy');
+                });
+
+            const collectClickables = (root) => Array.from(root.querySelectorAll('button, a, [role=""button""]'))
+                .filter(visible)
+                .map(el => ({
+                    element: el,
+                    text: normalize(el.innerText)
+                }))
+                .filter(x => !!x.text);
+
+            const clickFrom = (items) => {
+                const addCart = items.find(x => x.text.includes('add to cart'));
+                const buyNow = items.find(x => x.text.includes('buy now') || x.text === 'buy');
+                const target = addCart || buyNow;
+
+                if (!target) return false;
+                
+                setTimeout(() => {
+                    if (typeof target.element.click === 'function') {
+                        target.element.click();
+                    } else {
+                        target.element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    }
+                }, 50);
+                
+                return true;
+            };
+
+            for (const root of roots) {
+                const items = collectClickables(root);
+                if (clickFrom(items)) return true;
+            }
+
+            const fallback = Array.from(document.querySelectorAll('button, a, [role=""button""]'))
+                .filter(visible)
+                .map(el => ({ element: el, text: normalize(el.innerText) }))
+                .filter(x => !!x.text);
+
+            return clickFrom(fallback);
+        }");
+    }
+
     private static async Task<bool> TryClickAddButtonAsync(IPage page)
     {
         return await page.EvaluateFunctionAsync<bool>(@"() => {
@@ -2255,7 +2977,7 @@ internal sealed class UnityAssetAutomationApp
         try
         {
             var path = Path.Combine(_logsDirectory, $"{prefix}-{DateTime.Now:yyyyMMdd-HHmmss}.png");
-            await page.ScreenshotAsync(path, new ScreenshotOptions { FullPage = true });
+            await page.ScreenshotAsync(path, new ScreenshotOptions { FullPage = false });
         }
         catch
         {
@@ -2878,4 +3600,12 @@ internal enum AssetProcessStatus
     WouldAddInDryRun,
     UnknownAfterClick,
     Failed
+}
+
+internal sealed class CartStateSnapshot
+{
+    public bool HasPromoError { get; set; }
+    public string FoundError { get; set; } = string.Empty;
+    public bool HasZeroPrice { get; set; }
+    public string BodyTextPreview { get; set; } = string.Empty;
 }
