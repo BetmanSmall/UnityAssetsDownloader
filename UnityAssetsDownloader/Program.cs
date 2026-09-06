@@ -211,21 +211,27 @@ internal sealed class UnityAssetAutomationApp
 
                 var tgResult = await tgParser.ParseChannelsAsync(_options.TelegramChannels);
 
-                if (tgResult.AllPosts.Count > 0)
+                var tgPostsLogPath = Path.Combine(_logsDirectory, "telegram_posts_raw.log");
+                var tgPostLines = new List<string>
                 {
-                    var tgPostsLogPath = Path.Combine(_logsDirectory, "telegram_posts_raw.log");
-                    var lines = new List<string>();
-                    foreach (var post in tgResult.AllPosts)
-                    {
-                        lines.Add("============================================================");
-                        lines.Add($"CHANNEL: {post.ChannelName} | POST ID: {post.PostId}");
-                        lines.Add("============================================================");
-                        lines.Add(post.Text);
-                        lines.Add(string.Empty);
-                    }
-                    await File.WriteAllLinesAsync(tgPostsLogPath, lines);
-                    _logger.Info($"Telegram: все тексты постов ({tgResult.AllPosts.Count}) сохранены в: {tgPostsLogPath}");
+                    string.Empty,
+                    "############################################################",
+                    $"# ЗАПУСК: {DateTime.Now:yyyy-MM-dd HH:mm:ss}",
+                    $"# КАНАЛЫ: {string.Join(", ", _options.TelegramChannels)}",
+                    $"# ПОСТОВ СОБРАНО: {tgResult.AllPosts.Count}",
+                    "############################################################"
+                };
+                foreach (var post in tgResult.AllPosts)
+                {
+                    tgPostLines.Add("============================================================");
+                    tgPostLines.Add($"CHANNEL: {post.ChannelName} | POST ID: {post.PostId}");
+                    tgPostLines.Add("============================================================");
+                    tgPostLines.Add(post.Text);
+                    tgPostLines.Add(string.Empty);
                 }
+
+                await File.AppendAllLinesAsync(tgPostsLogPath, tgPostLines);
+                _logger.Info($"Telegram: тексты постов ({tgResult.AllPosts.Count}) дописаны в: {tgPostsLogPath}");
 
                 if (tgResult.AssetUrls.Count > 0)
                 {
@@ -281,10 +287,10 @@ internal sealed class UnityAssetAutomationApp
                 Sources = sources
             };
 
-            var freeAssetsProcessed = 0;
+            var newlyAddedCount = 0;
             if (_options.MaxAddAttempts.HasValue)
             {
-                _logger.Info($"Включен лимит по бесплатным ассетам: {_options.MaxAddAttempts.Value}");
+                _logger.Info($"Включен лимит по новым добавленным ассетам: {_options.MaxAddAttempts.Value}");
             }
 
             if (_options.MaxVisitedAssets.HasValue)
@@ -302,10 +308,10 @@ internal sealed class UnityAssetAutomationApp
                     break;
                 }
 
-                if (_options.MaxAddAttempts.HasValue && freeAssetsProcessed >= _options.MaxAddAttempts.Value)
+                if (_options.MaxAddAttempts.HasValue && newlyAddedCount >= _options.MaxAddAttempts.Value)
                 {
                     _logger.Warn(
-                        $"Достигнут лимит бесплатных ассетов ({freeAssetsProcessed}/{_options.MaxAddAttempts.Value}). Обработка остановлена.");
+                        $"[Лимит] Достигнут лимит новых ассетов ({newlyAddedCount}/{_options.MaxAddAttempts.Value}). Обработка остановлена.");
                     break;
                 }
 
@@ -316,13 +322,25 @@ internal sealed class UnityAssetAutomationApp
                 var result = await ProcessAssetAsync(page, assetUrl, promoCode);
                 report.Items.Add(result);
 
-                if (result.CountsTowardsAddLimit)
+                // В лимит попадают только фактически добавленные ассеты.
+                // AlreadyOwned / PaidSkipped / Failed не считаются.
+                // В режиме --dry-run считаем то, что было бы добавлено, иначе лимит не сработает никогда.
+                var countsAsNewlyAdded = result.Status == AssetProcessStatus.Added ||
+                                         (_options.DryRun && result.Status == AssetProcessStatus.WouldAddInDryRun);
+                result.CountsTowardsAddLimit = countsAsNewlyAdded;
+
+                if (countsAsNewlyAdded)
                 {
-                    freeAssetsProcessed++;
-                    if (_options.MaxAddAttempts.HasValue)
+                    newlyAddedCount++;
+                    _logger.Info(_options.MaxAddAttempts.HasValue
+                        ? $"[Лимит] Добавлено новых ассетов: {newlyAddedCount}/{_options.MaxAddAttempts.Value}"
+                        : $"[Лимит] Добавлено новых ассетов: {newlyAddedCount}");
+
+                    if (_options.MaxAddAttempts.HasValue && newlyAddedCount >= _options.MaxAddAttempts.Value)
                     {
                         _logger.Info(
-                            $"Лимит-счетчик бесплатных ассетов: {freeAssetsProcessed}/{_options.MaxAddAttempts.Value} (статус: {result.Status})");
+                            $"[Лимит] Достигнут лимит {_options.MaxAddAttempts.Value} новых ассетов. Завершение.");
+                        break;
                     }
                 }
 
@@ -3580,6 +3598,11 @@ internal sealed class CliOptions
         {
             telegramChannels.AddRange(config.Telegram.Channels);
         }
+        else
+        {
+            telegramChannels.AddRange(ReadTelegramSourcesFile("telegram_sources.txt"));
+        }
+
         var telegramPostLimit = config?.Telegram?.PostLimit ?? 20;
         var telegramScreenshotOnNoLinks = config?.Telegram?.ScreenshotOnNoLinks ?? true;
 
@@ -3610,6 +3633,68 @@ internal sealed class CliOptions
             TelegramPostLimit = telegramPostLimit,
             TelegramScreenshotOnNoLinks = telegramScreenshotOnNoLinks
         };
+    }
+
+    /// <summary>
+    /// Читает список Telegram-каналов из текстового файла (по одному имени на строку).
+    /// Пустые строки и строки, начинающиеся с # или //, игнорируются.
+    /// Файл ищется в рабочем каталоге, рядом с exe и выше по дереву (для запуска из bin/Debug/netX).
+    /// </summary>
+    private static List<string> ReadTelegramSourcesFile(string fileName)
+    {
+        var channels = new List<string>();
+
+        var candidates = new List<string>
+            {
+                Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), fileName)),
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, fileName)),
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", fileName)),
+                Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", fileName))
+            }
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var path = candidates.FirstOrDefault(File.Exists);
+        if (path is null)
+        {
+            Console.WriteLine(
+                $"[Telegram] Файл {fileName} не найден. Проверены пути: {string.Join("; ", candidates)}");
+            return channels;
+        }
+
+        try
+        {
+            foreach (var rawLine in File.ReadAllLines(path))
+            {
+                var line = rawLine.Trim();
+                if (line.Length == 0 || line.StartsWith('#') || line.StartsWith("//", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                // Поддерживаем и голое имя канала, и @name, и ссылку https://t.me/name
+                var name = line.TrimStart('@');
+                var tmeIndex = name.IndexOf("t.me/", StringComparison.OrdinalIgnoreCase);
+                if (tmeIndex >= 0)
+                {
+                    name = name[(tmeIndex + "t.me/".Length)..];
+                }
+
+                name = name.Split('/', '?')[0].Trim();
+                if (name.Length > 0 && !channels.Contains(name, StringComparer.OrdinalIgnoreCase))
+                {
+                    channels.Add(name);
+                }
+            }
+
+            Console.WriteLine($"[Telegram] Каналы загружены из {path}: {string.Join(", ", channels)}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Telegram] Не удалось прочитать {path}: {ex.Message}");
+        }
+
+        return channels;
     }
 }
 

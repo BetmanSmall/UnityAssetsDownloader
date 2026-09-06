@@ -125,7 +125,8 @@ internal sealed class TelegramSourceParser
                     PostId = postId,
                     Text = text
                 });
-                _logger.Debug($"[Telegram] {channelName} пост #{postId}: текст ({text.Length} символов)");
+                _logger.Info($"[Telegram] ---- ПОСТ {channelName}/#{postId} ({text.Length} символов) ----");
+                _logger.Info($"[Telegram] {text}");
 
                 // Ищем ссылки на ассеты
                 var assetMatches = AssetUrlRegex.Matches(text);
@@ -163,12 +164,14 @@ internal sealed class TelegramSourceParser
                     }
                 }
 
+                _logger.Info(
+                    $"[Telegram] ---- Найдено: assets={assetUrls.Count}, promos=[{string.Join(",", promocodes)}], git={gitUrls.Count} ----");
+
                 if (assetUrls.Count > 0)
                 {
-                    _logger.Info($"[Telegram] {channelName} пост #{postId}: найдено ссылок на ассеты: {assetUrls.Count}");
                     foreach (var url in assetUrls)
                     {
-                        _logger.Debug($"[Telegram]   Asset URL: {url}");
+                        _logger.Info($"[Telegram]   Asset URL: {url}");
                     }
                 }
 
