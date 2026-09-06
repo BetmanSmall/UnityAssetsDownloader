@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -37,6 +38,7 @@ catch (Exception ex)
     // Любое необработанное падение сохраняем в отдельный файл, чтобы его можно было прислать целиком.
     var crashText =
         $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] НЕОБРАБОТАННАЯ ОШИБКА{Environment.NewLine}" +
+        $"ВЕРСИЯ ПРОГРАММЫ: {UnityAssetAutomationApp.BuildVersionLine()}{Environment.NewLine}" +
         $"ОС: {RuntimeInformation.OSDescription} | .NET: {RuntimeInformation.FrameworkDescription}{Environment.NewLine}" +
         $"Аргументы: {string.Join(" ", args)}{Environment.NewLine}" +
         ex;
@@ -132,6 +134,7 @@ internal sealed class UnityAssetAutomationApp
             : Path.GetFullPath(options.LogFilePath);
         var errorsFilePath = Path.Combine(_logsDirectory, CliOptions.ProblemsFileName);
         _logger = new AppLogger(options.Verbose, options.TraceNetwork, logFilePath, errorsFilePath);
+        _logger.Info($"ВЕРСИЯ ПРОГРАММЫ: {BuildVersionLine()}");
         _logger.Info($"Каталог логов: {_logsDirectory}");
         _logger.Info($"Каталог данных (cookies): {_dataDirectory}");
         _logger.Info($"Профиль аккаунта: {_profileName} | папка: {profileDirectory}");
@@ -156,6 +159,14 @@ internal sealed class UnityAssetAutomationApp
             }
 
             ApplySavePasswordPolicy();
+
+            // Вопрос про вход задаём до запуска браузера. Если спросить позже,
+            // окно браузера перехватит внимание и вопрос в консоли останется незамеченным —
+            // со стороны это выглядит как "программа зависла".
+            if (!HasStoredSession())
+            {
+                TrySetupCredentialsInteractively();
+            }
 
             _logger.Info($"ОС: {RuntimeInformation.OSDescription} | Arch: {RuntimeInformation.OSArchitecture} | .NET: {RuntimeInformation.FrameworkDescription}");
 
@@ -230,6 +241,15 @@ internal sealed class UnityAssetAutomationApp
                 "--disable-infobars"
             };
 
+            // В контейнерах Linux (Flatpak, Docker, Steam Deck) песочница Chrome недоступна,
+            // и браузер просто не стартует. На Windows и macOS это не нужно и не добавляется.
+            if (OperatingSystem.IsLinux())
+            {
+                browserArgs.Add("--no-sandbox");
+                browserArgs.Add("--disable-dev-shm-usage");
+                _logger.Debug("Linux: добавлены --no-sandbox и --disable-dev-shm-usage для запуска в контейнере.");
+            }
+
             if (_options.ProxyHost != null && _options.ProxyPort.HasValue)
             {
                 var proxyArg = $"--proxy-server={_options.ProxyType ?? "socks5"}://{_options.ProxyHost}:{_options.ProxyPort}";
@@ -268,6 +288,12 @@ internal sealed class UnityAssetAutomationApp
             await page.SetUserAgentAsync(ua.Replace("HeadlessChrome", "Chrome"));
 
             AttachPageDiagnostics(page);
+
+            if (_options.CheckLoginPage)
+            {
+                await CheckSignInPageAsync(page);
+                return;
+            }
 
             var authenticated = await EnsureAuthenticatedAsync(page);
             if (!authenticated)
@@ -453,6 +479,141 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
+    /// <summary>
+    /// Строка с версией, номером коммита и датой сборки.
+    /// По ней видно, какой именно код запущен на компьютере пользователя.
+    /// </summary>
+    public static string BuildVersionLine()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        var version = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                      ?? assembly.GetName().Version?.ToString()
+                      ?? "неизвестна";
+
+        var built = "дата сборки неизвестна";
+        try
+        {
+            var exePath = Environment.ProcessPath;
+            if (!string.IsNullOrWhiteSpace(exePath) && File.Exists(exePath))
+            {
+                built = $"собрано {File.GetLastWriteTime(exePath):yyyy-MM-dd HH:mm}";
+            }
+        }
+        catch
+        {
+            // Дата сборки — приятная мелочь, из-за неё падать нельзя.
+        }
+
+        return $"{version} | {built}";
+    }
+
+    /// <summary>
+    /// Открывает страницу входа и проверяет, что на ней есть поля для автовхода.
+    /// Ничего не нажимает и никуда не отправляет — только смотрит и делает скриншот.
+    /// </summary>
+    private async Task CheckSignInPageAsync(IPage page)
+    {
+        _logger.Info("============================================================");
+        _logger.Info($" ПРОВЕРКА СТРАНИЦЫ ВХОДА: {_signInUrl}");
+        _logger.Info("============================================================");
+
+        await SafeGoToAsync(page, _signInUrl);
+        await WaitForDocumentReadySoftAsync(page, TimeSpan.FromSeconds(15));
+        await Task.Delay(3000);
+
+        _logger.Info($"Адрес после загрузки: {page.Url}");
+        _logger.Info($"Заголовок страницы: {await page.GetTitleAsync()}");
+
+        if (!page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.Warn("Нас увели с login.unity.com. Проверьте адрес в --sign-in-url.");
+        }
+
+        var report = await page.EvaluateFunctionAsync<string>(@"() => {
+            const find = (sel) => document.querySelector(sel);
+            const email = find('input[type=""email""], input[name*=""email"" i], input[id*=""email"" i]');
+            const pass = find('input[type=""password""], input[name*=""password"" i], input[id*=""password"" i]');
+            const submit = (pass && pass.form && pass.form.querySelector('button[type=""submit""], input[type=""submit""]'))
+                || find('button[type=""submit""], button[data-testid*=""sign"" i]');
+            const describe = (el) => el
+                ? `НАЙДЕНО (тег ${el.tagName.toLowerCase()}, name=""${el.name || ''}"", id=""${el.id || ''}"")`
+                : 'НЕ НАЙДЕНО';
+            const inputs = Array.from(document.querySelectorAll('input'))
+                .map(el => `type=${el.type} name=${el.name || '-'} id=${el.id || '-'}`);
+            return JSON.stringify({
+                email: describe(email),
+                password: describe(pass),
+                submit: describe(submit),
+                allInputs: inputs
+            });
+        }");
+
+        using var parsed = JsonDocument.Parse(report);
+        var root = parsed.RootElement;
+
+        _logger.Info($"Поле email:  {root.GetProperty("email").GetString()}");
+        _logger.Info($"Поле пароля: {root.GetProperty("password").GetString()}");
+        _logger.Info($"Кнопка входа: {root.GetProperty("submit").GetString()}");
+
+        foreach (var input in root.GetProperty("allInputs").EnumerateArray())
+        {
+            _logger.Info($"  поле ввода: {input.GetString()}");
+        }
+
+        var hasEmail = !root.GetProperty("email").GetString()!.StartsWith("НЕ");
+        var hasSubmit = !root.GetProperty("submit").GetString()!.StartsWith("НЕ");
+
+        // Форма Unity двухшаговая: на первом экране есть только email и кнопка,
+        // поле пароля появляется после её нажатия. Это нормальное состояние.
+        if (hasEmail && hasSubmit)
+        {
+            _logger.Info("ИТОГ: страница входа в порядке. Поле email и кнопка на месте, пароль спросят на следующем шаге.");
+        }
+        else
+        {
+            _logger.Warn("ИТОГ: на странице нет полей для входа. Автовход не сработает, входите руками.");
+        }
+
+        await SaveErrorScreenshotAsync(page, "check-login-page");
+        await SaveHtmlDumpAsync(page, "check-login-page");
+
+        // Отдельно смотрим, какую ссылку на вход даёт сам Asset Store.
+        // Именно она содержит служебные параметры, без которых Unity уводит на регистрацию.
+        _logger.Info("------------------------------------------------------------");
+        _logger.Info(" ССЫЛКА НА ВХОД С САМОГО ASSET STORE");
+        _logger.Info("------------------------------------------------------------");
+
+        await SafeGoToAsync(page, AssetStoreHomeUrl);
+        await WaitForDocumentReadySoftAsync(page, TimeSpan.FromSeconds(15));
+        await Task.Delay(4000);
+
+        var links = await page.EvaluateFunctionAsync<string[]>(@"() => {
+            const out = new Set();
+            for (const a of document.querySelectorAll('a[href]')) {
+                const href = a.href || '';
+                if (/login\.unity\.com|id\.unity\.com|sign-in|signin|oauth/i.test(href)) {
+                    out.add(href);
+                }
+            }
+            return Array.from(out).slice(0, 20);
+        }");
+
+        if (links.Length == 0)
+        {
+            _logger.Warn("Ссылок на вход в разметке нет — кнопка рисуется скриптом уже после загрузки.");
+        }
+
+        foreach (var link in links)
+        {
+            _logger.Info($"  ссылка: {link}");
+        }
+
+        await SaveHtmlDumpAsync(page, "check-store-home");
+    }
+
+    /// <summary>Есть ли на этом компьютере сохранённая сессия для текущего профиля.</summary>
+    private bool HasStoredSession() => File.Exists(_sessionStatePath) || File.Exists(_cookiesPath);
+
     private async Task<bool> EnsureAuthenticatedAsync(IPage page)
     {
         if (await TryLoadSessionStateAsync(page))
@@ -482,17 +643,26 @@ internal sealed class UnityAssetAutomationApp
             }
         }
 
-        _logger.Info("Быстрая проверка не подтвердила сессию. Выполняем одну контрольную навигацию на Asset Store...");
-        await SafeGoToAsync(page, AssetStoreHomeUrl);
-        if (await TryCheckAuthFastAsync(page, "home-check"))
+        // Контрольная навигация на витрину магазина нужна, только если сессия вообще
+        // сохранялась. На новом компьютере она бессмысленна: сразу идём на страницу входа.
+        if (HasStoredSession())
         {
-            var stable = await ValidateSessionForAssetStoreAsync(page, "home-check");
-            if (stable)
+            _logger.Info("Быстрая проверка не подтвердила сессию. Выполняем одну контрольную навигацию на Asset Store...");
+            await SafeGoToAsync(page, AssetStoreHomeUrl);
+            if (await TryCheckAuthFastAsync(page, "home-check"))
             {
-                _logger.Info("Сессия подтверждена после контрольной навигации.");
-                await SaveSessionStateAsync(page);
-                return true;
+                var stable = await ValidateSessionForAssetStoreAsync(page, "home-check");
+                if (stable)
+                {
+                    _logger.Info("Сессия подтверждена после контрольной навигации.");
+                    await SaveSessionStateAsync(page);
+                    return true;
+                }
             }
+        }
+        else
+        {
+            _logger.Info($"Сохранённой сессии для профиля '{_profileName}' нет. Сразу открываем страницу входа.");
         }
 
         if (_lastFullAuthAttemptUtc.HasValue)
@@ -510,6 +680,9 @@ internal sealed class UnityAssetAutomationApp
         _logger.Warn("Требуется вход в Unity.");
         TrySetupCredentialsInteractively();
         _lastFullAuthAttemptUtc = DateTime.UtcNow;
+        _logger.Info(HasCredentials
+            ? "Программа войдёт сама. Окно браузера трогать не нужно."
+            : "Сейчас откроется окно браузера. Войдите в аккаунт Unity — программа дождётся и продолжит сама.");
         var authenticated = await AuthenticateViaAssetStoreAsync(page);
         if (!authenticated)
         {
@@ -919,6 +1092,10 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
+    /// <summary>
+    /// Заполняет форму входа Unity. Форма двухшаговая: сначала спрашивают email,
+    /// и только потом, на следующем экране, пароль.
+    /// </summary>
     private async Task<bool> TryCompleteUnityLoginFormAsync(IPage page)
     {
         if (!HasCredentials)
@@ -928,36 +1105,127 @@ internal sealed class UnityAssetAutomationApp
 
         if (!page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
         {
+            _logger.Debug($"Автовход: страница не похожа на форму Unity ({page.Url}). Пропускаем.");
             return false;
         }
 
-        return await page.EvaluateFunctionAsync<bool>(@"async (email, password) => {
-            const emailInput = document.querySelector('input[type=""email""], input[name*=""email"" i], input[id*=""email"" i]');
-            const passInput = document.querySelector('input[type=""password""], input[name*=""password"" i], input[id*=""password"" i]');
-            if (!emailInput || !passInput) {
+        // Шаг 1. Email.
+        if (await TryFillFieldAsync(page, FieldKind.Email, _unityEmail!))
+        {
+            _logger.Info("Автовход, шаг 1: email введён.");
+            if (await TryClickPrimaryButtonAsync(page))
+            {
+                _logger.Info("Автовход, шаг 1: кнопка продолжения нажата.");
+            }
+        }
+        else
+        {
+            _logger.Debug("Автовход, шаг 1: поле email не найдено — возможно, мы уже на шаге пароля.");
+        }
+
+        // Шаг 2. Пароль. Поле появляется не сразу, поэтому ждём.
+        var passwordAppeared = await WaitForFieldAsync(page, FieldKind.Password, TimeSpan.FromSeconds(25));
+        if (!passwordAppeared)
+        {
+            _logger.Warn("Автовход: поле пароля не появилось. Войдите в браузере вручную.");
+            await SaveErrorScreenshotAsync(page, "autologin-no-password-field");
+            return false;
+        }
+
+        if (!await TryFillFieldAsync(page, FieldKind.Password, _unityPassword!))
+        {
+            _logger.Warn("Автовход: не удалось заполнить поле пароля.");
+            return false;
+        }
+
+        _logger.Info("Автовход, шаг 2: пароль введён.");
+
+        if (!await TryClickPrimaryButtonAsync(page))
+        {
+            _logger.Warn("Автовход: кнопка входа не найдена. Нажмите её в браузере сами.");
+            await SaveErrorScreenshotAsync(page, "autologin-no-submit-button");
+            return false;
+        }
+
+        _logger.Info("Автовход, шаг 2: кнопка входа нажата. Ждём подтверждения сессии.");
+        return true;
+    }
+
+    private enum FieldKind
+    {
+        Email,
+        Password
+    }
+
+    private static string SelectorFor(FieldKind kind) => kind == FieldKind.Email
+        ? "input#email, input[name=\"email\"], input[type=\"email\"], input[id*=\"email\" i]"
+        : "input#password, input[name=\"password\"], input[type=\"password\"], input[id*=\"password\" i]";
+
+    private static async Task<bool> WaitForFieldAsync(IPage page, FieldKind kind, TimeSpan timeout)
+    {
+        var selector = SelectorFor(kind);
+        var stopAt = DateTime.UtcNow.Add(timeout);
+
+        while (DateTime.UtcNow < stopAt)
+        {
+            var visible = await page.EvaluateFunctionAsync<bool>(@"(selector) => {
+                const el = document.querySelector(selector);
+                return !!el && el.offsetParent !== null && !el.disabled;
+            }", selector);
+
+            if (visible)
+            {
+                return true;
+            }
+
+            await Task.Delay(500);
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Заполняет поле так, чтобы изменение заметил React.
+    /// Обычное присваивание value интерфейс Unity игнорирует и стирает.
+    /// </summary>
+    private static async Task<bool> TryFillFieldAsync(IPage page, FieldKind kind, string value)
+    {
+        return await page.EvaluateFunctionAsync<bool>(@"(selector, value) => {
+            const el = document.querySelector(selector);
+            if (!el || el.offsetParent === null || el.disabled) {
                 return false;
             }
 
-            const setValue = (el, value) => {
-                el.focus();
-                el.value = value;
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-            };
+            const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            el.focus();
+            nativeSetter.call(el, value);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return el.value === value;
+        }", SelectorFor(kind), value);
+    }
 
-            setValue(emailInput, email);
-            setValue(passInput, password);
+    /// <summary>Нажимает главную кнопку формы: Continue, Next или Sign in.</summary>
+    private static async Task<bool> TryClickPrimaryButtonAsync(IPage page)
+    {
+        return await page.EvaluateFunctionAsync<bool>(@"() => {
+            const isUsable = (el) => el && !el.disabled && el.offsetParent !== null;
 
-            const submit = passInput.form?.querySelector('button[type=""submit""], input[type=""submit""]')
-                || document.querySelector('button[type=""submit""], button[data-testid*=""sign"" i]');
+            let btn = document.querySelector('button[type=""submit""], input[type=""submit""]');
+            if (!isUsable(btn)) {
+                const words = /continue|next|sign in|log in|submit|войти|продолжить|далее/i;
+                btn = Array.from(document.querySelectorAll('button'))
+                    .filter(isUsable)
+                    .find(b => words.test((b.innerText || b.textContent || '').trim()));
+            }
 
-            if (!submit) {
+            if (!isUsable(btn)) {
                 return false;
             }
 
-            submit.click();
+            btn.click();
             return true;
-        }", _unityEmail!, _unityPassword!);
+        }");
     }
 
     private async Task<bool> IsAuthenticatedAsync(IPage page)
@@ -3581,7 +3849,12 @@ internal sealed class CliOptions
     public bool UseExtendedSources { get; init; }
     public bool UseNoDefaults { get; init; }
     public List<string> ExtraSourceFiles { get; init; } = [];
-    public const string DefaultSignInUrl = "https://login.unity.com/ru/sign-in";
+    /// <summary>
+    /// Точка входа Asset Store. Она сама перебрасывает на страницу входа Unity
+    /// вместе со служебными параметрами. Прямой адрес login.unity.com/.../sign-in
+    /// без этих параметров Unity уводит на страницу регистрации — проверено.
+    /// </summary>
+    public const string DefaultSignInUrl = "https://assetstore.unity.com/auth/login";
 
     /// <summary>
     /// Единственный файл, который нужно прислать при проблемах.
@@ -3593,6 +3866,7 @@ internal sealed class CliOptions
     public string SignInUrl { get; init; } = DefaultSignInUrl;
     public string ProfileName { get; init; } = "default";
     public bool ListProfiles { get; init; }
+    public bool CheckLoginPage { get; init; }
     public bool? SavePassword { get; init; }
     public bool Interactive { get; init; }
     public string LogsDirectory { get; init; } = Path.Combine(AppContext.BaseDirectory, "logs");
@@ -3635,6 +3909,7 @@ internal sealed class CliOptions
         string? cliProfile = null;
         string? cliSetDefaultProfile = null;
         var cliListProfiles = false;
+        var cliCheckLoginPage = false;
         bool? cliSavePassword = null;
         bool? cliInteractive = null;
         string? cliDataDirectory = null;
@@ -3700,6 +3975,9 @@ internal sealed class CliOptions
                     break;
                 case "--profile" when i + 1 < args.Length:
                     cliProfile = args[++i];
+                    break;
+                case "--check-login-page":
+                    cliCheckLoginPage = true;
                     break;
                 case "--list-profiles":
                     cliListProfiles = true;
@@ -3995,6 +4273,7 @@ internal sealed class CliOptions
             SignInUrl = signInUrl,
             ProfileName = profileName,
             ListProfiles = cliListProfiles,
+            CheckLoginPage = cliCheckLoginPage,
             SavePassword = cliSavePassword ?? config?.SavePassword,
             Interactive = interactive,
             DataDirectory = dataDirectory,

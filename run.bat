@@ -50,6 +50,7 @@ echo  6^) Только логин и сохранение cookies  ^<== начн
 echo  7^) Dry-run (проверка без добавления в аккаунт^)
 echo  8^) Telegram каналы из telegram_sources.txt
 echo  9^) Диагностика: Telegram + максимум логов (--trace-network^)
+echo  C^) Проверить страницу входа Unity (быстро, ничего не меняет^)
 echo  P^) Сменить профиль аккаунта (для второго аккаунта на этом компьютере^)
 echo  L^) Собрать логи в архив для отправки
 echo  0^) Выход
@@ -67,6 +68,7 @@ if /i "%opt%"=="6" goto run_login
 if /i "%opt%"=="7" goto run_dry
 if /i "%opt%"=="8" goto run_telegram
 if /i "%opt%"=="9" goto run_diag
+if /i "%opt%"=="C" goto check_login
 if /i "%opt%"=="P" goto choose_profile
 if /i "%opt%"=="L" goto collect_logs
 if /i "%opt%"=="0" goto end
@@ -156,6 +158,13 @@ echo.
 echo Запуск: диагностика. Пишутся максимально подробные логи.
 echo Аккаунт НЕ меняется (--dry-run^).
 dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --trace-network --dry-run --headless false --no-defaults --max-visited-assets 5
+goto after_run
+
+:check_login
+echo.
+echo Проверка страницы входа Unity. Программа откроет её и посмотрит,
+echo на месте ли поле email и кнопка. Ничего не нажимает и никуда не отправляет.
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --check-login-page --headless false
 goto after_run
 
 :choose_profile

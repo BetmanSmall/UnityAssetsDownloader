@@ -86,7 +86,8 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --hea
 | `--set-default-profile <имя>` | Сделать профиль основным на этом компьютере |
 | `--save-password true/false` | `true` — сохранить логин и пароль в Диспетчер учётных данных Windows, `false` — удалить сохранённый. Без параметра программа спросит один раз |
 | `--interactive true/false` | Спрашивать ли про вход в консоли. По умолчанию включено, когда программа запущена из живого окна |
-| `--sign-in-url <url>` | Страница входа Unity. По умолчанию `https://login.unity.com/ru/sign-in` |
+| `--sign-in-url <url>` | Точка входа. По умолчанию `https://assetstore.unity.com/auth/login` |
+| `--check-login-page` | Открыть страницу входа, проверить поля и выйти. Ничего не нажимает и не меняет |
 | `--logs-dir <path>` | Папка для всех логов, отчётов и скриншотов. По умолчанию — `logs` рядом с exe |
 | `--data-dir <path>` | Папка для cookies и состояния сессии. По умолчанию — `data` рядом с exe |
 | `--unity-email <email>` | Email для автовхода |
@@ -244,6 +245,24 @@ control /name Microsoft.CredentialManager
 ```
 --save-password false
 ```
+
+### Почему адрес входа именно такой
+
+Прямой адрес `https://login.unity.com/ru/sign-in` **не работает**: Unity перебрасывает
+с него на страницу регистрации. То же самое с `/en/sign-in`. Проверено запуском.
+
+Работает точка входа Asset Store — `https://assetstore.unity.com/auth/login`.
+Она сама перебрасывает на форму входа Unity вместе со служебными параметрами,
+без которых Unity считает переход посторонним.
+
+Проверить это на своём компьютере: пункт **C** в `run.bat` или
+
+```
+--check-login-page
+```
+
+Форма входа Unity состоит из двух шагов: сначала спрашивают email, и только на
+следующем экране — пароль. Программа это учитывает.
 
 ### Вход руками или автоматически
 

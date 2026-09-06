@@ -5,7 +5,23 @@
         <TargetFramework>net8.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
+        <Version>1.1.0</Version>
     </PropertyGroup>
+
+    <!-- Дописывает к версии короткий номер коммита, чтобы в логе было видно,
+         какой именно код запущен. Если git недоступен, сборка не падает. -->
+    <Target Name="StampGitCommit" BeforeTargets="CoreGenerateAssemblyInfo">
+        <Exec Command="git rev-parse --short HEAD"
+              ConsoleToMSBuild="true"
+              ContinueOnError="true"
+              IgnoreExitCode="true"
+              StandardOutputImportance="low">
+            <Output TaskParameter="ConsoleOutput" PropertyName="GitCommitHash"/>
+        </Exec>
+        <PropertyGroup>
+            <SourceRevisionId Condition="'$(GitCommitHash)' != ''">$(GitCommitHash)</SourceRevisionId>
+        </PropertyGroup>
+    </Target>
 
     <ItemGroup>
         <PackageReference Include="PuppeteerSharp" Version="20.2.4"/>
