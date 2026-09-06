@@ -20,6 +20,8 @@ if errorlevel 1 (
 
 set "PROFILE_ARG="
 set "PROFILE_NAME=%USERNAME%"
+set "CHROME_ARG="
+set "CHROME_MODE=своя папка браузера (личный Chrome не трогаем)"
 
 echo Сборка проекта...
 dotnet build "%PROJECT%" --nologo -v q
@@ -37,6 +39,7 @@ echo ==============================================
 echo  UnityAssetsDownloader - выбор режима
 echo ==============================================
 echo  Профиль аккаунта: %PROFILE_NAME%
+echo  Браузер: %CHROME_MODE%
 echo  Логи пишутся в: %LOGS%
 echo  Учётные данные: %DATA% + Диспетчер учётных данных Windows
 echo ==============================================
@@ -50,6 +53,7 @@ echo  6^) Только логин и сохранение cookies  ^<== начн
 echo  7^) Dry-run (проверка без добавления в аккаунт^)
 echo  8^) Telegram каналы из telegram_sources.txt
 echo  9^) Диагностика: Telegram + максимум логов (--trace-network^)
+echo  B^) Переключить браузер: своя папка ^<-^> мой обычный Chrome
 echo  C^) Проверить страницу входа Unity (быстро, ничего не меняет^)
 echo  P^) Сменить профиль аккаунта (для второго аккаунта на этом компьютере^)
 echo  L^) Собрать логи в архив для отправки
@@ -68,6 +72,7 @@ if /i "%opt%"=="6" goto run_login
 if /i "%opt%"=="7" goto run_dry
 if /i "%opt%"=="8" goto run_telegram
 if /i "%opt%"=="9" goto run_diag
+if /i "%opt%"=="B" goto toggle_chrome
 if /i "%opt%"=="C" goto check_login
 if /i "%opt%"=="P" goto choose_profile
 if /i "%opt%"=="L" goto collect_logs
@@ -89,49 +94,49 @@ goto :eof
 call :ask_limit
 echo.
 echo Запуск: основные источники...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --headless false --extra-source-file "extra_asset_urls.example.txt" %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --headless false --extra-source-file "extra_asset_urls.example.txt" %LIMIT_ARG%
 goto after_run
 
 :run_top_free
 call :ask_limit
 echo.
 echo Запуск: только топ бесплатные...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --headless false --source "https://assetstore.unity.com/top-assets/top-free" %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --headless false --source "https://assetstore.unity.com/top-assets/top-free" %LIMIT_ARG%
 goto after_run
 
 :run_china_list
 call :ask_limit
 echo.
 echo Запуск: только из free_list_GreaterChinaUnityAssetArchiveLinks.txt...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --headless false --no-defaults --extra-source-file "GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt" %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --headless false --no-defaults --extra-source-file "GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt" %LIMIT_ARG%
 goto after_run
 
 :run_extra_list
 call :ask_limit
 echo.
 echo Запуск: только из extra_asset_urls.example.txt...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --headless false --no-defaults --extra-source-file "extra_asset_urls.example.txt" %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --headless false --no-defaults --extra-source-file "extra_asset_urls.example.txt" %LIMIT_ARG%
 goto after_run
 
 :run_extended
 call :ask_limit
 echo.
 echo Запуск: расширенные списки поиска...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --headless false --source "https://assetstore.unity.com/" --extended-sources %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --headless false --source "https://assetstore.unity.com/" --extended-sources %LIMIT_ARG%
 goto after_run
 
 :run_login
 echo.
 echo Запуск: только логин и сохранение cookies.
 echo Откроется окно браузера. Войдите в аккаунт Unity и дождитесь закрытия.
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --login --headless false
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --login --headless false
 goto after_run
 
 :run_dry
 call :ask_limit
 echo.
 echo Запуск: dry-run (аккаунт не меняется^)...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --dry-run --headless false %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --dry-run --headless false %LIMIT_ARG%
 goto after_run
 
 :run_telegram
@@ -150,21 +155,40 @@ echo.
 call :ask_limit
 echo.
 echo Запуск: Telegram каналы...
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --headless false --no-defaults %LIMIT_ARG%
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --headless false --no-defaults %LIMIT_ARG%
 goto after_run
 
 :run_diag
 echo.
 echo Запуск: диагностика. Пишутся максимально подробные логи.
 echo Аккаунт НЕ меняется (--dry-run^).
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --trace-network --dry-run --headless false --no-defaults --max-visited-assets 5
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --trace-network --dry-run --headless false --no-defaults --max-visited-assets 5
 goto after_run
+
+:toggle_chrome
+echo.
+if defined CHROME_ARG (
+    set "CHROME_ARG="
+    set "CHROME_MODE=своя папка браузера (личный Chrome не трогаем)"
+    echo Переключено: программа откроет свой браузер.
+    echo Вход в Unity запоминается между запусками, ваш Chrome не затрагивается.
+) else (
+    set "CHROME_ARG=--use-system-chrome-profile"
+    set "CHROME_MODE=мой обычный Chrome (закройте все окна Chrome!)"
+    echo Переключено: программа откроет ВАШ обычный Chrome.
+    echo.
+    echo ВАЖНО: перед запуском закройте ВСЕ окна Chrome, включая значок у часов.
+    echo Иначе Chrome не отдаст свою папку и программа не запустится.
+)
+echo.
+pause
+goto menu
 
 :check_login
 echo.
 echo Проверка страницы входа Unity. Программа откроет её и посмотрит,
 echo на месте ли поле email и кнопка. Ничего не нажимает и никуда не отправляет.
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --check-login-page --headless false
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --check-login-page --headless false
 goto after_run
 
 :choose_profile

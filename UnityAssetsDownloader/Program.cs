@@ -81,6 +81,7 @@ internal sealed class UnityAssetAutomationApp
     private string? _unityEmail;
     private string? _unityPassword;
     private bool? _savePasswordAnswer;
+    private bool _credentialsAsked;
 
     private bool HasCredentials =>
         !string.IsNullOrWhiteSpace(_unityEmail) && !string.IsNullOrWhiteSpace(_unityPassword);
@@ -257,12 +258,17 @@ internal sealed class UnityAssetAutomationApp
                 _logger.Info($"Прокси включён: {proxyArg}");
             }
 
+            // Постоянная папка браузера. Без неё Chrome каждый раз стартует пустым,
+            // как в режиме инкогнито: ни истории, ни расширений, ни сохранённого входа.
+            var userDataDir = ResolveChromeUserDataDir();
+
             var launchOptions = new LaunchOptions
             {
                 Headless = _options.Headless,
                 DefaultViewport = null,
                 IgnoredDefaultArgs = ["--enable-automation"],
-                Args = [..browserArgs]
+                Args = [..browserArgs],
+                UserDataDir = userDataDir
             };
 
             if (chromePath != null)
@@ -270,7 +276,23 @@ internal sealed class UnityAssetAutomationApp
                 launchOptions.ExecutablePath = chromePath;
             }
 
-            await using var browser = await Puppeteer.LaunchAsync(launchOptions);
+            IBrowser browser;
+            try
+            {
+                browser = await Puppeteer.LaunchAsync(launchOptions);
+            }
+            catch (Exception ex) when (_options.UseSystemChromeProfile)
+            {
+                _logger.Error(
+                    "Не удалось открыть ваш обычный профиль Chrome. Скорее всего, Chrome сейчас запущен: " +
+                    "он не отдаёт свою папку второму окну.");
+                _logger.Error("Закройте ВСЕ окна Chrome (проверьте значок у часов) и запустите заново.");
+                _logger.Error($"Текст ошибки: {ex.Message}");
+                throw;
+            }
+
+            await using (browser)
+            {
             var browserVersion = await browser.GetVersionAsync();
             _logger.Info($"Браузер запущен: {browserVersion} | headless={_options.Headless}");
 
@@ -467,6 +489,7 @@ internal sealed class UnityAssetAutomationApp
 
             PrintSummary(report);
             _logger.Info($"Отчет сохранен: {_reportPath}");
+            }
         }
         finally
         {
@@ -611,6 +634,71 @@ internal sealed class UnityAssetAutomationApp
         await SaveHtmlDumpAsync(page, "check-store-home");
     }
 
+    /// <summary>
+    /// Выбирает папку, в которой Chrome хранит профиль: историю, расширения и вход.
+    ///
+    /// По умолчанию — своя папка внутри профиля программы. Браузер выглядит обычным,
+    /// вход в Unity запоминается между запусками, и при этом ваш личный Chrome не трогается.
+    ///
+    /// С ключом --use-system-chrome-profile берётся ваш настоящий профиль Chrome
+    /// со всеми закладками и уже выполненными входами. Для этого Chrome должен быть закрыт.
+    /// </summary>
+    private string ResolveChromeUserDataDir()
+    {
+        if (!string.IsNullOrWhiteSpace(_options.ChromeUserDataDir))
+        {
+            var custom = Path.GetFullPath(_options.ChromeUserDataDir);
+            _logger.Info($"Папка браузера задана вручную: {custom}");
+            return custom;
+        }
+
+        if (_options.UseSystemChromeProfile)
+        {
+            var system = FindSystemChromeUserDataDir();
+            if (system != null)
+            {
+                _logger.Info($"Используется ваш обычный профиль Chrome: {system}");
+                _logger.Warn("Chrome должен быть полностью закрыт, иначе он не отдаст эту папку.");
+                return system;
+            }
+
+            _logger.Warn("Обычный профиль Chrome не найден. Используем собственную папку программы.");
+        }
+
+        var own = Path.Combine(_profileStore.GetProfileDirectory(_profileName), "chrome");
+        Directory.CreateDirectory(own);
+        _logger.Info($"Папка браузера профиля '{_profileName}': {own}");
+        _logger.Info("Браузер запоминает вход между запусками. Личный Chrome не затрагивается.");
+        return own;
+    }
+
+    /// <summary>Находит папку профиля обычного Chrome для текущей операционной системы.</summary>
+    private static string? FindSystemChromeUserDataDir()
+    {
+        string candidate;
+
+        if (OperatingSystem.IsWindows())
+        {
+            candidate = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Google", "Chrome", "User Data");
+        }
+        else if (OperatingSystem.IsMacOS())
+        {
+            candidate = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "Library", "Application Support", "Google", "Chrome");
+        }
+        else
+        {
+            candidate = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".config", "google-chrome");
+        }
+
+        return Directory.Exists(candidate) ? candidate : null;
+    }
+
     /// <summary>Есть ли на этом компьютере сохранённая сессия для текущего профиля.</summary>
     private bool HasStoredSession() => File.Exists(_sessionStatePath) || File.Exists(_cookiesPath);
 
@@ -679,6 +767,7 @@ internal sealed class UnityAssetAutomationApp
 
         _logger.Warn("Требуется вход в Unity.");
         TrySetupCredentialsInteractively();
+        _credentialsAsked = true;
         _lastFullAuthAttemptUtc = DateTime.UtcNow;
         _logger.Info(HasCredentials
             ? "Программа войдёт сама. Окно браузера трогать не нужно."
@@ -722,6 +811,15 @@ internal sealed class UnityAssetAutomationApp
     /// </summary>
     private void TrySetupCredentialsInteractively()
     {
+        // Спросить можно только один раз за запуск, иначе вопрос повторяется
+        // и в консоли, и позже — пользователь видит его дважды.
+        if (_credentialsAsked)
+        {
+            return;
+        }
+
+        _credentialsAsked = true;
+
         if (HasCredentials)
         {
             _logger.Info($"Автовход: используются учётные данные профиля '{_profileName}'.");
@@ -1024,9 +1122,13 @@ internal sealed class UnityAssetAutomationApp
                url.Contains("cloud.unity.com/login", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>Сколько кругов переадресации OAuth терпим, прежде чем уйти в магазин самим.</summary>
+    private const int MaxOauthSpins = 4;
+
     private async Task<bool> WaitForAuthenticatedSessionAsync(IPage page, TimeSpan timeout)
     {
         var stopAt = DateTime.UtcNow.Add(timeout);
+        var oauthSpins = 0;
 
         while (DateTime.UtcNow < stopAt)
         {
@@ -1044,6 +1146,8 @@ internal sealed class UnityAssetAutomationApp
 
             if (page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
             {
+                oauthSpins = 0;
+
                 if (await HasAuthMarkersAsync(page))
                 {
                     _logger.Info("AuthStep: auth-confirmed");
@@ -1066,6 +1170,22 @@ internal sealed class UnityAssetAutomationApp
                 {
                     _logger.Info($"Вход выполнен, но открыта страница консоли ({page.Url}). Возвращаемся в Asset Store...");
                     await SafeGoToAsync(page, "https://assetstore.unity.com/");
+                    oauthSpins = 0;
+                }
+                else if (page.Url.Contains("api.unity.com/v1/oauth2/authorize", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Страховка. Если Unity крутит выдачу кода по кругу, вход на самом деле
+                    // уже прошёл — просто некуда вернуться. Уходим в магазин сами и проверяем сессию.
+                    oauthSpins++;
+                    _logger.Debug($"AuthWait: страница выдачи прав OAuth, оборот {oauthSpins}/{MaxOauthSpins}.");
+
+                    if (oauthSpins >= MaxOauthSpins)
+                    {
+                        _logger.Warn(
+                            "Unity зациклил переадресацию после входа. Переходим в Asset Store сами и проверяем сессию.");
+                        await SafeGoToAsync(page, "https://assetstore.unity.com/");
+                        oauthSpins = 0;
+                    }
                 }
                 else
                 {
@@ -3853,8 +3973,12 @@ internal sealed class CliOptions
     /// Точка входа Asset Store. Она сама перебрасывает на страницу входа Unity
     /// вместе со служебными параметрами. Прямой адрес login.unity.com/.../sign-in
     /// без этих параметров Unity уводит на страницу регистрации — проверено.
+    ///
+    /// Параметр redirect_to обязателен. Без него Unity после успешного входа
+    /// возвращает обратно на /auth/login, тот снова начинает вход, и так по кругу
+    /// без конца. С redirect_to=/ пользователь попадает на витрину магазина.
     /// </summary>
-    public const string DefaultSignInUrl = "https://assetstore.unity.com/auth/login";
+    public const string DefaultSignInUrl = "https://assetstore.unity.com/auth/login?redirect_to=%2F";
 
     /// <summary>
     /// Единственный файл, который нужно прислать при проблемах.
@@ -3867,6 +3991,8 @@ internal sealed class CliOptions
     public string ProfileName { get; init; } = "default";
     public bool ListProfiles { get; init; }
     public bool CheckLoginPage { get; init; }
+    public string? ChromeUserDataDir { get; init; }
+    public bool UseSystemChromeProfile { get; init; }
     public bool? SavePassword { get; init; }
     public bool Interactive { get; init; }
     public string LogsDirectory { get; init; } = Path.Combine(AppContext.BaseDirectory, "logs");
@@ -3910,6 +4036,8 @@ internal sealed class CliOptions
         string? cliSetDefaultProfile = null;
         var cliListProfiles = false;
         var cliCheckLoginPage = false;
+        string? cliChromeUserDataDir = null;
+        var cliUseSystemChromeProfile = false;
         bool? cliSavePassword = null;
         bool? cliInteractive = null;
         string? cliDataDirectory = null;
@@ -3975,6 +4103,12 @@ internal sealed class CliOptions
                     break;
                 case "--profile" when i + 1 < args.Length:
                     cliProfile = args[++i];
+                    break;
+                case "--chrome-user-data-dir" when i + 1 < args.Length:
+                    cliChromeUserDataDir = args[++i];
+                    break;
+                case "--use-system-chrome-profile":
+                    cliUseSystemChromeProfile = true;
                     break;
                 case "--check-login-page":
                     cliCheckLoginPage = true;
@@ -4274,6 +4408,8 @@ internal sealed class CliOptions
             ProfileName = profileName,
             ListProfiles = cliListProfiles,
             CheckLoginPage = cliCheckLoginPage,
+            ChromeUserDataDir = FirstNonEmpty(cliChromeUserDataDir, config?.ChromeUserDataDir),
+            UseSystemChromeProfile = cliUseSystemChromeProfile || config?.UseSystemChromeProfile == true,
             SavePassword = cliSavePassword ?? config?.SavePassword,
             Interactive = interactive,
             DataDirectory = dataDirectory,
@@ -4410,6 +4546,8 @@ internal sealed class AppConfig
     public string? Profile { get; init; }
     public bool? SavePassword { get; init; }
     public bool? Interactive { get; init; }
+    public string? ChromeUserDataDir { get; init; }
+    public bool? UseSystemChromeProfile { get; init; }
     public string? LogsDirectory { get; init; }
     public string? DataDirectory { get; init; }
     public string? UnityEmail { get; init; }
