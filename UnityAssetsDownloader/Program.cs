@@ -46,9 +46,12 @@ catch (Exception ex)
     try
     {
         Directory.CreateDirectory(options.LogsDirectory);
-        var crashPath = Path.Combine(options.LogsDirectory, $"crash-{DateTime.Now:yyyyMMdd-HHmmss}.log");
-        await File.WriteAllTextAsync(crashPath, crashText);
-        Console.Error.WriteLine($"Полный текст ошибки сохранен: {crashPath}");
+        var problemsPath = Path.Combine(options.LogsDirectory, CliOptions.ProblemsFileName);
+        await File.AppendAllTextAsync(problemsPath, crashText + Environment.NewLine);
+        Console.Error.WriteLine();
+        Console.Error.WriteLine("============================================================");
+        Console.Error.WriteLine($" ПРОГРАММА УПАЛА. ПРИШЛИТЕ ЭТОТ ФАЙЛ: {problemsPath}");
+        Console.Error.WriteLine("============================================================");
     }
     catch (Exception writeEx)
     {
@@ -127,12 +130,12 @@ internal sealed class UnityAssetAutomationApp
         var logFilePath = string.IsNullOrWhiteSpace(options.LogFilePath)
             ? Path.Combine(_logsDirectory, $"run-log-{DateTime.Now:yyyyMMdd-HHmmss}.log")
             : Path.GetFullPath(options.LogFilePath);
-        var errorsFilePath = Path.Combine(_logsDirectory, $"errors-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+        var errorsFilePath = Path.Combine(_logsDirectory, CliOptions.ProblemsFileName);
         _logger = new AppLogger(options.Verbose, options.TraceNetwork, logFilePath, errorsFilePath);
         _logger.Info($"Каталог логов: {_logsDirectory}");
         _logger.Info($"Каталог данных (cookies): {_dataDirectory}");
         _logger.Info($"Профиль аккаунта: {_profileName} | папка: {profileDirectory}");
-        _logger.Info($"Файл только с ошибками: {errorsFilePath}");
+        _logger.Info($"ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК — ПРИШЛИТЕ ЭТОТ ФАЙЛ: {errorsFilePath}");
     }
 
     public async Task RunAsync()
@@ -441,6 +444,11 @@ internal sealed class UnityAssetAutomationApp
         }
         finally
         {
+            var problemsPath = Path.Combine(_logsDirectory, CliOptions.ProblemsFileName);
+            _logger.Info("============================================================");
+            _logger.Info($" ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК — ПРИШЛИТЕ ЭТОТ ОДИН ФАЙЛ:");
+            _logger.Info($" {problemsPath}");
+            _logger.Info("============================================================");
             _logger.Dispose();
         }
     }
@@ -3492,8 +3500,14 @@ internal sealed class AppLogger : IDisposable
         _traceNetwork = traceNetwork;
 
         _writer = CreateWriter(logFilePath);
-        // Отдельный файл только с WARN/ERROR — его удобно прислать целиком, он короткий.
+
+        // Один файл с постоянным именем, куда дописываются только WARN/ERROR.
+        // Постоянное имя важно: пользователю не приходится выбирать нужный файл из десятка.
         _errorWriter = CreateWriter(errorsFilePath);
+        _errorWriter?.WriteLine();
+        _errorWriter?.WriteLine("============================================================");
+        _errorWriter?.WriteLine($"ЗАПУСК {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        _errorWriter?.WriteLine("============================================================");
 
         if (!string.IsNullOrWhiteSpace(logFilePath))
         {
@@ -3568,6 +3582,12 @@ internal sealed class CliOptions
     public bool UseNoDefaults { get; init; }
     public List<string> ExtraSourceFiles { get; init; } = [];
     public const string DefaultSignInUrl = "https://login.unity.com/ru/sign-in";
+
+    /// <summary>
+    /// Единственный файл, который нужно прислать при проблемах.
+    /// Имя постоянное, содержимое дописывается — историю запусков видно в одном месте.
+    /// </summary>
+    public const string ProblemsFileName = "ПРИШЛИТЕ-ЭТОТ-ФАЙЛ.log";
 
     public string? LogFilePath { get; init; }
     public string SignInUrl { get; init; } = DefaultSignInUrl;
