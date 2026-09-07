@@ -242,7 +242,34 @@ internal sealed class ProfileStore
 
             if (Directory.Exists(from))
             {
-                Directory.Move(from, to);
+                // Windows не отдаёт папку, пока Chrome не закрылся до конца.
+                // На это уходит секунда-другая, поэтому пробуем несколько раз.
+                Exception? last = null;
+                var moved = false;
+
+                for (var attempt = 1; attempt <= 6 && !moved; attempt++)
+                {
+                    try
+                    {
+                        Directory.Move(from, to);
+                        moved = true;
+                    }
+                    catch (IOException ex)
+                    {
+                        last = ex;
+                        Thread.Sleep(1500);
+                    }
+                    catch (UnauthorizedAccessException ex)
+                    {
+                        last = ex;
+                        Thread.Sleep(1500);
+                    }
+                }
+
+                if (!moved)
+                {
+                    throw last ?? new IOException("Папку профиля переместить не удалось.");
+                }
             }
             else
             {

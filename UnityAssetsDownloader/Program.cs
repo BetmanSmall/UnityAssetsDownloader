@@ -4197,7 +4197,8 @@ internal sealed class UnityAssetAutomationApp
                         if (!visible(el)) return false;
                         const txt = normalize(el.innerText || '');
                         return txt.includes('checkout') || txt.includes('place order') || txt.includes('proceed') || txt.includes('order') || txt.includes('pay') || txt.includes('complete purchase') ||
-                               txt.includes('оформить') || txt.includes('оплатить') || txt.includes('купить') || txt.includes('заказать');
+                               txt.includes('оформить') || txt.includes('оплатить') || txt.includes('заплатить') ||
+                               txt.includes('купить') || txt.includes('заказать');
                     });
 
                     return hasPromoInput || hasCheckoutBtn;
