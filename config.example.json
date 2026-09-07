@@ -18,7 +18,7 @@
   "dataDirectory": "",
   "unityEmail": "",
   "unityPassword": "",
-  "delayMs": 1200,
+  "delayMs": 700,
   "navigationTimeoutMs": 120000,
   "authTimeoutMs": 300000,
   "assetUiTimeoutMs": 30000,

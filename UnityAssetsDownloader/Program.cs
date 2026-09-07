@@ -764,43 +764,105 @@ internal sealed class UnityAssetAutomationApp
             //   4. если напрямую не вышло — сам ищем рабочий прокси и повторяем.
             var proxy = _options.TelegramProxy;
 
-            if (string.IsNullOrWhiteSpace(proxy))
+            var probeChannel = _options.TelegramChannels.FirstOrDefault() ?? "telegram";
+
+            // Кандидаты пробуются по порядку: сначала заданный или запомненный адрес,
+            // потом подобранные из списка. Первый, через который посты действительно
+            // прочитались, становится рабочим и запоминается.
+            var candidates = new List<string>();
+
+            if (!string.IsNullOrWhiteSpace(_options.TelegramProxy))
             {
-                proxy = ReadRememberedProxy();
-                if (!string.IsNullOrWhiteSpace(proxy))
+                candidates.Add(_options.TelegramProxy);
+            }
+            else
+            {
+                var remembered = ReadRememberedProxy();
+
+                if (!string.IsNullOrWhiteSpace(remembered))
                 {
-                    _logger.Info($"Берём прокси, который работал в прошлый раз: {proxy}");
+                    _logger.Info($"Проверяем прокси из прошлого запуска: {remembered}");
+                    if (await TestProxyAsync(remembered, probeChannel))
+                    {
+                        _logger.Info("Работает, берём его.");
+                        candidates.Add(remembered);
+                    }
+                    else
+                    {
+                        _logger.Info("Не отвечает, ищем замену.");
+                    }
+                }
+                else
+                {
+                    _logger.Info("Проверяем, открывается ли Telegram напрямую...");
+                    if (await TestProxyAsync(null, probeChannel))
+                    {
+                        _logger.Info("Открывается. Прокси не нужен.");
+                        candidates.Add(string.Empty);
+                    }
+                    else
+                    {
+                        _logger.Info("Не открывается — похоже на блокировку.");
+                    }
+                }
+
+                if (candidates.Count == 0 && _options.TelegramAutoProxy)
+                {
+                    candidates.AddRange(await AutoSelectTelegramProxiesAsync());
                 }
             }
 
-            if (!string.IsNullOrWhiteSpace(proxy))
+            if (candidates.Count == 0)
             {
-                ownBrowser = await LaunchTelegramBrowserAsync(proxy);
-                tgBrowser = ownBrowser;
-                _logger.Info($"Telegram идёт через отдельный прокси: {proxy}");
-                _logger.Info("Unity при этом работает напрямую, без прокси.");
+                candidates.Add(string.Empty);
             }
 
-            var result = await RunParserAsync(tgBrowser);
+            TelegramParseResult result = new();
 
-            // Не получилось — пробуем подобрать прокси и зайти ещё раз.
-            var blocked = result.AllPosts.Count == 0 && LooksBlocked(result);
-            if (blocked && _options.TelegramAutoProxy)
+            for (var i = 0; i < candidates.Count && i < 4; i++)
             {
-                _logger.Warn("Telegram не открылся. Подбираем рабочий прокси и пробуем снова.");
+                var candidate = candidates[i];
 
-                var found = await AutoSelectTelegramProxyAsync();
-                if (!string.IsNullOrWhiteSpace(found))
+                if (ownBrowser is not null)
                 {
-                    if (ownBrowser is not null)
+                    await ownBrowser.CloseAsync();
+                    await ownBrowser.DisposeAsync();
+                    ownBrowser = null;
+                }
+
+                if (string.IsNullOrWhiteSpace(candidate))
+                {
+                    _logger.Info("Telegram открываем напрямую, без прокси.");
+                    tgBrowser = mainBrowser;
+                }
+                else
+                {
+                    if (i > 0)
                     {
-                        await ownBrowser.CloseAsync();
-                        await ownBrowser.DisposeAsync();
+                        _logger.Warn($"Пробуем запасной прокси: {candidate}");
                     }
 
-                    ownBrowser = await LaunchTelegramBrowserAsync(found);
-                    _logger.Info($"Telegram идёт через отдельный прокси: {found}");
-                    result = await RunParserAsync(ownBrowser);
+                    ownBrowser = await LaunchTelegramBrowserAsync(candidate);
+                    tgBrowser = ownBrowser;
+                    _logger.Info($"Telegram идёт через отдельный прокси: {candidate}");
+                    _logger.Info("Unity при этом работает напрямую, без прокси.");
+                }
+
+                result = await RunParserAsync(tgBrowser);
+
+                if (result.AllPosts.Count > 0)
+                {
+                    if (!string.IsNullOrWhiteSpace(candidate))
+                    {
+                        await RememberProxyAsync(candidate);
+                    }
+
+                    break;
+                }
+
+                if (!LooksBlocked(result))
+                {
+                    break;
                 }
             }
 
@@ -879,19 +941,18 @@ internal sealed class UnityAssetAutomationApp
     /// Через прокси идут только открытые страницы каналов Telegram.
     /// Вход в Unity и cookies через него не проходят никогда.
     /// </summary>
-    private async Task<string?> AutoSelectTelegramProxyAsync()
+    private async Task<List<string>> AutoSelectTelegramProxiesAsync()
     {
         var testChannel = _options.TelegramChannels.FirstOrDefault() ?? "telegram";
-        var rememberedPath = RememberedProxyPath;
 
         var candidates = await LoadProxyCandidatesAsync();
         if (candidates.Count == 0)
         {
             _logger.Warn("Не удалось получить список прокси. Задайте свой через --tg-proxy.");
-            return null;
+            return [];
         }
 
-        _logger.Info($"Список получен: {candidates.Count} адресов. Ищем рабочий, проверяем пачками по 25.");
+        _logger.Info($"Список получен: {candidates.Count} адресов. Ищем рабочие, проверяем пачками по 25.");
         _logger.Info("Через прокси пойдут только открытые страницы Telegram. Unity — напрямую.");
 
         var shuffled = candidates.OrderBy(_ => Random.Shared.Next()).ToList();
@@ -907,22 +968,14 @@ internal sealed class UnityAssetAutomationApp
             var results = await Task.WhenAll(tasks);
             checkedCount += batch.Count;
 
-            var working = results.FirstOrDefault(r => r != null);
-            if (working != null)
+            // Берём все рабочие из пачки: если первый подведёт в браузере,
+            // сразу есть запасные, и не придётся искать заново.
+            var working = results.Where(r => r != null).Select(r => r!).ToList();
+            if (working.Count > 0)
             {
-                _logger.Info($"Найден рабочий прокси: {working} (проверено адресов: {checkedCount})");
-
-                try
-                {
-                    Directory.CreateDirectory(Path.GetDirectoryName(rememberedPath)!);
-                    await File.WriteAllTextAsync(rememberedPath, working);
-                    _logger.Info($"Запомнили его для профиля '{_profileName}', в следующий раз проверим сразу его.");
-                }
-                catch (Exception ex)
-                {
-                    _logger.Debug($"Не удалось запомнить прокси: {ex.Message}");
-                }
-
+                _logger.Info(
+                    $"Найдено рабочих прокси: {working.Count} (проверено адресов: {checkedCount}). " +
+                    $"Основной: {working[0]}");
                 return working;
             }
 
@@ -930,7 +983,22 @@ internal sealed class UnityAssetAutomationApp
         }
 
         _logger.Warn("Ни один прокси из списка не подошёл. Попробуйте позже или задайте свой через --tg-proxy.");
-        return null;
+        return [];
+    }
+
+    /// <summary>Запоминает рабочий прокси, чтобы следующий запуск начинался сразу с него.</summary>
+    private async Task RememberProxyAsync(string proxy)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(RememberedProxyPath)!);
+            await File.WriteAllTextAsync(RememberedProxyPath, proxy);
+            _logger.Info($"Запомнили {proxy} для профиля '{_profileName}'.");
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"Не удалось запомнить прокси: {ex.Message}");
+        }
     }
 
     /// <summary>Читает список прокси: по ссылке или из локального файла.</summary>
@@ -972,18 +1040,29 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
-    /// <summary>Проверяет один прокси: открывается ли через него страница канала.</summary>
-    private static async Task<bool> TestProxyAsync(string proxy, string channel)
+    /// <summary>
+    /// Проверяет один прокси: открывается ли через него страница канала.
+    ///
+    /// Восемь секунд — намеренно немного. Живой прокси отдаёт страницу за одну-две,
+    /// а тот, что думает дольше, будет мучительно медленным и в работе.
+    /// </summary>
+    private static async Task<bool> TestProxyAsync(string? proxy, string channel)
     {
         try
         {
-            using var handler = new HttpClientHandler
-            {
-                Proxy = new WebProxy(proxy),
-                UseProxy = true
-            };
+            using var handler = new HttpClientHandler();
 
-            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
+            if (string.IsNullOrWhiteSpace(proxy))
+            {
+                handler.UseProxy = false;
+            }
+            else
+            {
+                handler.Proxy = new WebProxy(proxy);
+                handler.UseProxy = true;
+            }
+
+            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(8) };
             var html = await client.GetStringAsync($"https://t.me/s/{channel}");
 
             // Признак того, что страница действительно отдала посты, а не заглушку провайдера.
@@ -3207,10 +3286,31 @@ internal sealed class UnityAssetAutomationApp
 
                 if (!status.HasAddToMyAssets)
                 {
+                    // Кнопка иногда дорисовывается позже остальной страницы.
+                    // Одна короткая повторная проверка дешевле, чем потерянный ассет.
+                    _logger.Debug("Кнопка добавления не найдена. Ждём 3с и проверяем ещё раз...");
+                    await Task.Delay(3000);
+                    status = await DetectStatusAsync(page);
+                    result.DetectedFree = status.IsFree;
+                    result.DetectedOwned = status.IsOwned;
+                    result.DetectionSummary = status.DetectionSummary;
+
+                    if (status.HasOpenInUnity || status.IsOwned)
+                    {
+                        _logger.Info($"[Пропуск] Ассет уже принадлежит вашему аккаунту: {assetUrl}");
+                        result.Status = AssetProcessStatus.AlreadyOwned;
+                        return result;
+                    }
+                }
+
+                if (!status.HasAddToMyAssets)
+                {
                     result.Status = AssetProcessStatus.Failed;
                     result.Message =
-                        "Кнопка Add to My Assets не найдена (возможно требуется вход или изменена верстка).";
-                    _logger.Info($"[Ошибка] Не удалось обработать ассет: {assetUrl}. Причина: {result.Message}");
+                        "Кнопки добавления нет на странице. Скорее всего раздача закончилась и ассет снова платный.";
+                    _logger.Info($"[Пропуск] {assetUrl}");
+                    _logger.Info($"          {result.Message}");
+                    _logger.Debug($"          Сигналы страницы: {status.DetectionSummary}");
                     await SaveErrorScreenshotAsync(page, "add-button-not-found");
                     return result;
                 }
@@ -3314,7 +3414,7 @@ internal sealed class UnityAssetAutomationApp
             stepSw.Restart();
             _logger.Info($"[Промокод][Шаг 2] Ожидание редиректа в корзину/чекаут...");
             var redirected = false;
-            for (var i = 0; i < 15; i++)
+            for (var i = 0; i < 8; i++)
             {
                 _logger.Debug($"[Промокод][Шаг 2] Проверка URL [{i+1}/15]: {page.Url}");
                 if (page.Url.Contains("pay.unity.com", StringComparison.OrdinalIgnoreCase) ||
@@ -3330,7 +3430,7 @@ internal sealed class UnityAssetAutomationApp
 
             if (!redirected)
             {
-                _logger.Info($"[Промокод][Шаг 2] Авторедирект не произошёл за 15с. Принудительный переход на /cart | URL сейчас: {page.Url}");
+                _logger.Info($"[Промокод][Шаг 2] Авторедирект не произошёл за 8с. Принудительный переход на /cart | URL сейчас: {page.Url}");
                 await SafeGoToAsync(page, "https://assetstore.unity.com/cart");
                 await Task.Delay(3000);
                 _logger.Debug($"[Промокод][Шаг 2] URL после принудительного перехода: {page.Url}");
@@ -3341,13 +3441,19 @@ internal sealed class UnityAssetAutomationApp
             // 3. Ожидание полей ввода
             stepSw.Restart();
             _logger.Info($"[Промокод][Шаг 3] Ожидание элементов страницы корзины (poле промо / кнопка оплаты) | URL: {page.Url}");
-            var elementsReady = await WaitForCartPageElementsAsync(page, TimeSpan.FromSeconds(30));
+            var elementsReady = await WaitForCartPageElementsAsync(page, TimeSpan.FromSeconds(15));
             _logger.Info($"[Промокод][Шаг 3] elementsReady={elementsReady} | {stepSw.ElapsedMilliseconds}мс");
             if (!elementsReady)
             {
                 result.Status = AssetProcessStatus.Failed;
-                result.Message = "Не удалось загрузить элементы оформления заказа (поле ввода или кнопки оплаты).";
-                _logger.Warn($"[Ошибка][Шаг 3] {result.Message}");
+                result.Message =
+                    "Страница оформления заказа не открылась: нет ни поля промокода, ни кнопки оплаты. " +
+                    "Обычно это значит, что корзина пуста — ассет в неё не попал.";
+                _logger.Warn("============================================================");
+                _logger.Warn(" ПРОМОКОД ПРИМЕНИТЬ НЕ УДАЛОСЬ");
+                _logger.Warn($" {result.Message}");
+                _logger.Warn(" Покупка отменена, деньги не списаны.");
+                _logger.Warn("============================================================");
 
                 await LogAllInputFieldsAsync(page, "Шаг 3 - элементы не найдены");
                 await LogAllButtonsAsync(page, "Шаг 3 - кнопки");
@@ -4724,7 +4830,7 @@ internal sealed class CliOptions
     public string DataDirectory { get; init; } = Path.Combine(AppContext.BaseDirectory, "data");
     public string? UnityEmail { get; init; }
     public string? UnityPassword { get; init; }
-    public int DelayMs { get; init; } = 1200;
+    public int DelayMs { get; init; } = 700;
     public int NavigationTimeoutMs { get; init; } = 120000;
     public int AuthTimeoutMs { get; init; } = 300000;
     public int AssetUiTimeoutMs { get; init; } = 30000;
