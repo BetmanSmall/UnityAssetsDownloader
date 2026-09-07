@@ -7,7 +7,7 @@ cd /d "%~dp0"
 set "PROJECT=UnityAssetsDownloader\UnityAssetsDownloader.csproj"
 set "LOGS=%~dp0logs"
 set "DATA=%~dp0data"
-set "COMMON=--logs-dir "%LOGS%" --data-dir "%DATA%" --verbose"
+set "COMMON=--logs-dir "%LOGS%" --data-dir "%DATA%" --quiet"
 
 where dotnet >nul 2>&1
 if errorlevel 1 (
@@ -166,7 +166,7 @@ goto after_run
 echo.
 echo Запуск: диагностика. Пишутся максимально подробные логи.
 echo Аккаунт НЕ меняется (--dry-run^).
-dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --trace-network --dry-run --headless false --no-defaults --max-visited-assets 5
+dotnet run --project "%PROJECT%" --no-build -- --logs-dir "%LOGS%" --data-dir "%DATA%" %PROFILE_ARG% %CHROME_ARG% --verbose --trace-network --dry-run --headless false --no-defaults --max-visited-assets 5
 goto after_run
 
 :toggle_chrome

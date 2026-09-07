@@ -78,6 +78,7 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --hea
 | `--dry-run` | Проверка без нажатия кнопки добавления (без изменений аккаунта) |
 | `--headless true/false` | Режим браузера без UI или с UI |
 | `--verbose` | Подробные логи |
+| `--quiet` | Только важное. Перебивает `verbose` из `config.json`. `run.bat` включает его на обычных запусках |
 | `--trace-network` | Сетевые логи (включает verbose) |
 | `--extended-sources` | Добавить расширенный список источников (страницы search + archive URL) к базовым источникам по умолчанию |
 | `--log-file <path>` | Путь к файлу лога |

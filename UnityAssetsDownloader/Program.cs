@@ -476,7 +476,7 @@ internal sealed class UnityAssetAutomationApp
                 }
 
                 index++;
-                _logger.Info($"[{index}/{assetUrls.Count}] Обработка: {assetUrl}");
+                _logger.Info($"[{index}/{assetUrls.Count}] {assetUrl}");
 
                 assetPromocodes.TryGetValue(assetUrl, out var promoCode);
                 var result = await ProcessAssetAsync(page, assetUrl, promoCode);
@@ -1833,7 +1833,7 @@ internal sealed class UnityAssetAutomationApp
 
     private void AttachPageDiagnostics(IPage page)
     {
-        page.FrameNavigated += (_, e) => _logger.Debug($"FrameNavigated => {e.Frame.Url}");
+        page.FrameNavigated += (_, e) => _logger.Debug($"FrameNavigated => {ShortUrl(e.Frame.Url)}");
 
         page.Request += (_, e) =>
         {
@@ -1875,14 +1875,14 @@ internal sealed class UnityAssetAutomationApp
 
         page.Console += (_, e) =>
         {
-            if (_options.Verbose)
+            if (_options.TraceNetwork)
             {
                 if (IsKnownNoiseConsoleMessage(e.Message))
                 {
                     return;
                 }
 
-                _logger.Debug($"BROWSER CONSOLE [{e.Message.Type}] {e.Message.Text}");
+                _logger.Debug($"BROWSER CONSOLE [{e.Message.Type}] {ShortUrl(e.Message.Text)}");
             }
         };
 
@@ -2125,11 +2125,15 @@ internal sealed class UnityAssetAutomationApp
     {
         var all = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        // Прямые ссылки на ассеты не требуют разбора страницы. Их бывают сотни,
+        // и построчный лог по каждой делает файл нечитаемым. Считаем их и пишем итог.
+        var directLinks = 0;
+        var failedSources = 0;
+
         foreach (var source in sourceUrls)
         {
             try
             {
-                _logger.Info($"Чтение источника: {source}");
                 List<string> sourceUrlsExtracted;
 
                 if (Uri.TryCreate(source, UriKind.Absolute, out var sourceUri) &&
@@ -2137,17 +2141,18 @@ internal sealed class UnityAssetAutomationApp
                 {
                     if (TryNormalizeDirectAssetUrl(sourceUri, out var directAssetUrl))
                     {
-                        _logger.Info(
-                            $"Источник является прямой ссылкой на ассет, добавляем без парсинга карточек: {directAssetUrl}");
-                        sourceUrlsExtracted = [directAssetUrl];
+                        directLinks++;
+                        _logger.Debug($"Прямая ссылка на ассет: {directAssetUrl}");
+                        all.Add(directAssetUrl);
+                        continue;
                     }
-                    else
-                    {
-                        sourceUrlsExtracted = await CollectAssetUrlsFromAssetStorePageAsync(page, source);
-                    }
+
+                    _logger.Info($"Разбор страницы Asset Store: {source}");
+                    sourceUrlsExtracted = await CollectAssetUrlsFromAssetStorePageAsync(page, source);
                 }
                 else
                 {
+                    _logger.Info($"Чтение источника: {source}");
                     var html = await _httpClient.GetStringAsync(source);
                     sourceUrlsExtracted = ExtractAssetUrlsFromHtml(html, source).ToList();
                 }
@@ -2157,13 +2162,23 @@ internal sealed class UnityAssetAutomationApp
                     all.Add(url);
                 }
 
-                _logger.Info(
-                    $"Источник обработан: добавлено ссылок {sourceUrlsExtracted.Count} (после фильтра PURCHASED/You own this asset).");
+                _logger.Info($"  найдено ссылок: {sourceUrlsExtracted.Count}");
             }
             catch (Exception ex)
             {
-                _logger.Warn($"Ошибка источника {source}: {ex.Message}");
+                failedSources++;
+                _logger.Warn($"Ошибка источника {ShortUrl(source)}: {ex.Message}");
             }
+        }
+
+        if (directLinks > 0)
+        {
+            _logger.Info($"Прямых ссылок на ассеты в списках: {directLinks}");
+        }
+
+        if (failedSources > 0)
+        {
+            _logger.Warn($"Источников с ошибками: {failedSources}");
         }
 
         return all.ToList();
@@ -3974,17 +3989,43 @@ internal sealed class UnityAssetAutomationApp
     }
 
 
-    private static void PrintSummary(RunReport report)
+    private void PrintSummary(RunReport report)
     {
         var groups = report.Items.GroupBy(x => x.Status).ToDictionary(g => g.Key, g => g.Count());
 
-        Console.WriteLine("\nИтоги:");
+        _logger.Info("============================================================");
+        _logger.Info($" ИТОГИ. Профиль: {_profileName}");
+        _logger.Info("============================================================");
+
         foreach (AssetProcessStatus status in Enum.GetValues<AssetProcessStatus>())
         {
             groups.TryGetValue(status, out var count);
-            Console.WriteLine($"- {status}: {count}");
+            if (count > 0)
+            {
+                _logger.Info($" {DescribeStatus(status)}: {count}");
+            }
         }
+
+        if (report.Items.Count == 0)
+        {
+            _logger.Warn(" Ни одного ассета не обработано.");
+        }
+
+        _logger.Info($" Всего обработано: {report.Items.Count}");
+        _logger.Info("============================================================");
     }
+
+    /// <summary>Переводит технический статус в понятную строку.</summary>
+    private static string DescribeStatus(AssetProcessStatus status) => status switch
+    {
+        AssetProcessStatus.Added => "Добавлено на аккаунт",
+        AssetProcessStatus.AlreadyOwned => "Уже было на аккаунте",
+        AssetProcessStatus.PaidSkipped => "Платные, пропущены",
+        AssetProcessStatus.WouldAddInDryRun => "Добавились бы (проверочный запуск)",
+        AssetProcessStatus.UnknownAfterClick => "Непонятный результат после нажатия",
+        AssetProcessStatus.Failed => "Ошибка",
+        _ => status.ToString()
+    };
 }
 
 internal sealed class AppLogger : IDisposable
@@ -4139,6 +4180,7 @@ internal sealed class CliOptions
         var cliDryRun = false;
         bool? cliHeadless = null;
         var cliVerbose = false;
+        var cliQuiet = false;
         var cliTraceNetwork = false;
         var cliUseExtendedSources = false;
         var cliUseNoDefaults = false;
@@ -4192,6 +4234,9 @@ internal sealed class CliOptions
                     cliHeadless = parsed;
                     break;
                 }
+                case "--quiet":
+                    cliQuiet = true;
+                    break;
                 case "--verbose":
                     cliVerbose = true;
                     break;
@@ -4334,8 +4379,10 @@ internal sealed class CliOptions
         var dryRun = cliDryRun || (config?.DryRun ?? false);
 
         var headless = cliHeadless ?? config?.Headless ?? false;
-        var verbose = cliVerbose || (config?.Verbose ?? false);
-        var traceNetwork = cliTraceNetwork || (config?.TraceNetwork ?? false);
+        // --quiet сильнее всего остального: он нужен, чтобы обычный запуск давал
+        // читаемый лог даже там, где в config.json когда-то включили подробности.
+        var verbose = !cliQuiet && (cliVerbose || (config?.Verbose ?? false));
+        var traceNetwork = !cliQuiet && (cliTraceNetwork || (config?.TraceNetwork ?? false));
         var useExtendedSources = cliUseExtendedSources || (config?.ExtendedSources ?? false);
         var useNoDefaults = cliUseNoDefaults || (config?.NoDefaults ?? false);
         if (traceNetwork)

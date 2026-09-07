@@ -6,7 +6,7 @@
   "loginOnly": false,
   "dryRun": false,
   "headless": false,
-  "verbose": true,
+  "verbose": false,
   "traceNetwork": false,
   "extendedSources": false,
   "extraSourceFiles": [
