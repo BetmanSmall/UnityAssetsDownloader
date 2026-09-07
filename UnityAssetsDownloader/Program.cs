@@ -242,10 +242,38 @@ internal sealed class UnityAssetAutomationApp
 
             var browserArgs = new List<string>
             {
-                "--start-maximized",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars"
             };
+
+            // Делим экран: консоль с логами слева, браузер справа.
+            // Так видно и то, и другое, не переключая окна.
+            var splitApplied = false;
+            if (_options.SplitScreen && !_options.Headless)
+            {
+                var right = ScreenLayout.RightHalf();
+                if (right is not null)
+                {
+                    var r = right.Value;
+                    browserArgs.Add($"--window-position={r.X},{r.Y}");
+                    browserArgs.Add($"--window-size={r.Width},{r.Height}");
+
+                    var consoleMoved = ScreenLayout.MoveConsoleToLeftHalf();
+                    splitApplied = true;
+
+                    _logger.Info($"Экран поделён: браузер справа ({r.Width}x{r.Height}), " +
+                                 (consoleMoved ? "консоль слева." : "консоль подвинуть не удалось."));
+                }
+                else
+                {
+                    _logger.Debug("Размер экрана не определяется, окна оставляем как есть.");
+                }
+            }
+
+            if (!splitApplied)
+            {
+                browserArgs.Add("--start-maximized");
+            }
 
             // В контейнерах Linux (Flatpak, Docker, Steam Deck) песочница Chrome недоступна,
             // и браузер просто не стартует. На Windows и macOS это не нужно и не добавляется.
@@ -272,6 +300,8 @@ internal sealed class UnityAssetAutomationApp
             // Постоянная папка браузера. Без неё Chrome каждый раз стартует пустым,
             // как в режиме инкогнито: ни истории, ни расширений, ни сохранённого входа.
             var userDataDir = ResolveChromeUserDataDir();
+
+            _logger.Debug($"Аргументы браузера: {string.Join(" ", browserArgs)}");
 
             var launchOptions = new LaunchOptions
             {
@@ -406,7 +436,11 @@ internal sealed class UnityAssetAutomationApp
 
                 if (tgResult.PostsWithoutLinks.Count > 0)
                 {
-                    _logger.Warn($"Telegram: постов без ссылок: {tgResult.PostsWithoutLinks.Count}. Скриншоты сохранены в logs/telegram/");
+                    var where = _options.TelegramScreenshotOnNoLinks
+                        ? " Скриншоты сохранены в logs/telegram/"
+                        : " Их тексты есть в telegram_posts_raw.log.";
+                    _logger.Info(
+                        $"Telegram: постов без ссылок на Asset Store: {tgResult.PostsWithoutLinks.Count}.{where}");
                 }
 
                 if (tgResult.Errors.Count > 0)
@@ -4580,6 +4614,7 @@ internal sealed class CliOptions
     public bool ListProfiles { get; init; }
     public bool CheckLoginPage { get; init; }
     public bool CheckTelegram { get; init; }
+    public bool SplitScreen { get; init; } = true;
     public string? TelegramProxy { get; init; }
     public string? TelegramProxyList { get; init; }
     public bool TelegramAutoProxy { get; init; }
@@ -4630,6 +4665,7 @@ internal sealed class CliOptions
         var cliListProfiles = false;
         var cliCheckLoginPage = false;
         var cliCheckTelegram = false;
+        bool? cliSplitScreen = null;
         string? cliTelegramProxy = null;
         string? cliTelegramProxyList = null;
         var cliTelegramAutoProxy = false;
@@ -4709,6 +4745,9 @@ internal sealed class CliOptions
                     break;
                 case "--use-system-chrome-profile":
                     cliUseSystemChromeProfile = true;
+                    break;
+                case "--split-screen" when i + 1 < args.Length:
+                    cliSplitScreen = ParseBool(args[++i], true);
                     break;
                 case "--check-telegram":
                     cliCheckTelegram = true;
@@ -5032,6 +5071,7 @@ internal sealed class CliOptions
             ListProfiles = cliListProfiles,
             CheckLoginPage = cliCheckLoginPage,
             CheckTelegram = cliCheckTelegram,
+            SplitScreen = cliSplitScreen ?? config?.SplitScreen ?? true,
             TelegramProxy = FirstNonEmpty(cliTelegramProxy, config?.Telegram?.Proxy),
             TelegramProxyList = FirstNonEmpty(cliTelegramProxyList, config?.Telegram?.ProxyList),
             TelegramAutoProxy = cliTelegramAutoProxy || config?.Telegram?.AutoProxy == true,
@@ -5173,6 +5213,7 @@ internal sealed class AppConfig
     public string? Profile { get; init; }
     public bool? SavePassword { get; init; }
     public bool? Interactive { get; init; }
+    public bool? SplitScreen { get; init; }
     public string? ChromeUserDataDir { get; init; }
     public bool? UseSystemChromeProfile { get; init; }
     public string? LogsDirectory { get; init; }

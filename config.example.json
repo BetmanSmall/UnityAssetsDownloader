@@ -6,6 +6,7 @@
   "loginOnly": false,
   "dryRun": false,
   "headless": false,
+  "splitScreen": true,
   "verbose": false,
   "traceNetwork": false,
   "extendedSources": false,
