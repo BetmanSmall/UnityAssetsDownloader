@@ -447,6 +447,16 @@ internal sealed class UnityAssetAutomationApp
                 Sources = sources
             };
 
+            var ownedCache = new OwnedAssetsCache(_profileStore.GetProfileDirectory(_profileName));
+            var skippedKnown = 0;
+
+            if (ownedCache.Count > 0 && !_options.RecheckOwned)
+            {
+                _logger.Info(
+                    $"В памяти профиля {ownedCache.Count} ассетов, уже добавленных на аккаунт. " +
+                    "Их страницы открывать не будем.");
+            }
+
             var newlyAddedCount = 0;
             if (_options.MaxAddAttempts.HasValue)
             {
@@ -475,12 +485,30 @@ internal sealed class UnityAssetAutomationApp
                     break;
                 }
 
+                // Ассеты, про которые уже известно, что они на аккаунте, не открываем вовсе.
+                if (!_options.RecheckOwned && ownedCache.Contains(assetUrl))
+                {
+                    skippedKnown++;
+                    report.Items.Add(new ProcessResult
+                    {
+                        Url = assetUrl,
+                        Status = AssetProcessStatus.AlreadyOwned,
+                        Message = "Уже был на аккаунте (известно с прошлых запусков, страница не открывалась)."
+                    });
+                    continue;
+                }
+
                 index++;
                 _logger.Info($"[{index}/{assetUrls.Count}] {assetUrl}");
 
                 assetPromocodes.TryGetValue(assetUrl, out var promoCode);
                 var result = await ProcessAssetAsync(page, assetUrl, promoCode);
                 report.Items.Add(result);
+
+                if (result.Status is AssetProcessStatus.Added or AssetProcessStatus.AlreadyOwned)
+                {
+                    ownedCache.Add(assetUrl);
+                }
 
                 // В лимит попадают только фактически добавленные ассеты.
                 // AlreadyOwned / PaidSkipped / Failed не считаются.
@@ -505,6 +533,15 @@ internal sealed class UnityAssetAutomationApp
                 }
 
                 await Task.Delay(TimeSpan.FromMilliseconds(_options.DelayMs));
+            }
+
+            ownedCache.Save();
+
+            if (skippedKnown > 0)
+            {
+                _logger.Info(
+                    $"Пропущено без открытия страницы: {skippedKnown} (уже на аккаунте). " +
+                    $"Это сэкономило примерно {skippedKnown * 4} секунд.");
             }
 
             report.FinishedAtUtc = DateTime.UtcNow;
@@ -4819,6 +4856,7 @@ internal sealed class CliOptions
     public bool CheckLoginPage { get; init; }
     public bool CheckTelegram { get; init; }
     public bool SplitScreen { get; init; } = true;
+    public bool RecheckOwned { get; init; }
     public string? TelegramProxy { get; init; }
     public string? TelegramProxyList { get; init; }
     public bool TelegramAutoProxy { get; init; }
@@ -4870,6 +4908,7 @@ internal sealed class CliOptions
         var cliCheckLoginPage = false;
         var cliCheckTelegram = false;
         bool? cliSplitScreen = null;
+        var cliRecheckOwned = false;
         string? cliTelegramProxy = null;
         string? cliTelegramProxyList = null;
         bool? cliTelegramAutoProxy = null;
@@ -4949,6 +4988,9 @@ internal sealed class CliOptions
                     break;
                 case "--use-system-chrome-profile":
                     cliUseSystemChromeProfile = true;
+                    break;
+                case "--recheck-owned":
+                    cliRecheckOwned = true;
                     break;
                 case "--split-screen" when i + 1 < args.Length:
                     cliSplitScreen = ParseBool(args[++i], true);
@@ -5279,6 +5321,7 @@ internal sealed class CliOptions
             CheckLoginPage = cliCheckLoginPage,
             CheckTelegram = cliCheckTelegram,
             SplitScreen = cliSplitScreen ?? config?.SplitScreen ?? true,
+            RecheckOwned = cliRecheckOwned,
             TelegramProxy = FirstNonEmpty(cliTelegramProxy, config?.Telegram?.Proxy),
             TelegramProxyList = FirstNonEmpty(cliTelegramProxyList, config?.Telegram?.ProxyList),
             TelegramAutoProxy = cliTelegramAutoProxy ?? config?.Telegram?.AutoProxy ?? true,
