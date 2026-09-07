@@ -30,7 +30,7 @@
     "proxyList": "",
     "channels": [],
     "postLimit": 40,
-    "screenshotOnNoLinks": true
+    "screenshotOnNoLinks": false
   },
   "proxy": {
     "type": "socks5",

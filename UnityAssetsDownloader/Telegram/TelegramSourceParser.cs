@@ -53,6 +53,23 @@ internal sealed class TelegramSourceParser
         foreach (var channel in channelNames)
         {
             var channelResult = await ParseSingleChannelAsync(channel);
+
+            // Бесплатные прокси часто срываются на первом же запросе.
+            // Одна повторная попытка почти всегда спасает, поэтому делаем её.
+            if (channelResult.AssetUrls.Count == 0 && channelResult.Errors.Count > 0 &&
+                channelResult.Errors.Any(e => e.Contains("ERR_", StringComparison.OrdinalIgnoreCase)))
+            {
+                _logger.Warn($"[Telegram] Канал {channel} не открылся. Пробуем ещё раз...");
+                await Task.Delay(2000);
+                var retry = await ParseSingleChannelAsync(channel);
+
+                if (retry.Errors.Count == 0 || retry.AssetUrls.Count > 0)
+                {
+                    _logger.Info($"[Telegram] Со второй попытки канал {channel} открылся.");
+                    channelResult = retry;
+                }
+            }
+
             result.AssetUrls.AddRange(channelResult.AssetUrls);
             result.GitLinks.AddRange(channelResult.GitLinks);
             result.Promocodes.AddRange(channelResult.Promocodes);
@@ -125,8 +142,8 @@ internal sealed class TelegramSourceParser
                     PostId = postId,
                     Text = text
                 });
-                _logger.Info($"[Telegram] ---- ПОСТ {channelName}/#{postId} ({text.Length} символов) ----");
-                _logger.Info($"[Telegram] {text}");
+                _logger.Debug($"[Telegram] ---- ПОСТ {channelName}/#{postId} ({text.Length} символов) ----");
+                _logger.Debug($"[Telegram] {text}");
 
                 // Ищем ссылки на ассеты
                 var assetMatches = AssetUrlRegex.Matches(text);
@@ -164,15 +181,22 @@ internal sealed class TelegramSourceParser
                     }
                 }
 
-                _logger.Info(
-                    $"[Telegram] ---- Найдено: assets={assetUrls.Count}, promos=[{string.Join(",", promocodes)}], git={gitUrls.Count} ----");
-
-                if (assetUrls.Count > 0)
+                if (assetUrls.Count > 0 || promocodes.Count > 0)
                 {
+                    var promoPart = promocodes.Count > 0
+                        ? $", промокод: {string.Join(", ", promocodes)}"
+                        : string.Empty;
+                    _logger.Info($"[Telegram] пост {postId}: ассетов {assetUrls.Count}{promoPart}");
+
                     foreach (var url in assetUrls)
                     {
-                        _logger.Info($"[Telegram]   Asset URL: {url}");
+                        _logger.Info($"[Telegram]   {url}");
                     }
+                }
+                else
+                {
+                    _logger.Debug(
+                        $"[Telegram] пост {postId}: ссылок на Asset Store нет (текст в telegram_posts_raw.log)");
                 }
 
                 if (gitUrls.Count > 0)
@@ -370,7 +394,7 @@ internal sealed class TelegramSourceParser
             await Task.Delay(500);
             await page.ScreenshotAsync(filePath, new ScreenshotOptions { FullPage = false });
 
-            _logger.Info($"[Telegram] Скриншот поста без ссылок сохранён: {fileName} (текст: {(text.Length > 100 ? text[..100] + "..." : text)})");
+            _logger.Debug($"[Telegram] Скриншот поста без ссылок сохранён: {fileName}");
         }
         catch (Exception ex)
         {

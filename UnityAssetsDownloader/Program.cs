@@ -374,28 +374,6 @@ internal sealed class UnityAssetAutomationApp
             {
                 var tgResult = await ParseTelegramChannelsAsync(browser);
 
-                var tgPostsLogPath = Path.Combine(_logsDirectory, "telegram_posts_raw.log");
-                var tgPostLines = new List<string>
-                {
-                    string.Empty,
-                    "############################################################",
-                    $"# ЗАПУСК: {DateTime.Now:yyyy-MM-dd HH:mm:ss}",
-                    $"# КАНАЛЫ: {string.Join(", ", _options.TelegramChannels)}",
-                    $"# ПОСТОВ СОБРАНО: {tgResult.AllPosts.Count}",
-                    "############################################################"
-                };
-                foreach (var post in tgResult.AllPosts)
-                {
-                    tgPostLines.Add("============================================================");
-                    tgPostLines.Add($"CHANNEL: {post.ChannelName} | POST ID: {post.PostId}");
-                    tgPostLines.Add("============================================================");
-                    tgPostLines.Add(post.Text);
-                    tgPostLines.Add(string.Empty);
-                }
-
-                await File.AppendAllLinesAsync(tgPostsLogPath, tgPostLines);
-                _logger.Info($"Telegram: тексты постов ({tgResult.AllPosts.Count}) дописаны в: {tgPostsLogPath}");
-
                 if (tgResult.AssetUrls.Count > 0)
                 {
                     _logger.Info($"Telegram: найдено ссылок на ассеты: {tgResult.AssetUrls.Count}");
@@ -784,6 +762,7 @@ internal sealed class UnityAssetAutomationApp
                 _options.TelegramScreenshotOnNoLinks);
 
             var result = await parser.ParseChannelsAsync(_options.TelegramChannels);
+            await SaveTelegramPostsAsync(result);
             ExplainTelegramFailure(result);
             return result;
         }
@@ -943,6 +922,37 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
+    /// <summary>
+    /// Складывает полные тексты постов в отдельный файл.
+    /// В основном логе их нет намеренно: они занимают сотни строк и мешают читать.
+    /// </summary>
+    private async Task SaveTelegramPostsAsync(TelegramParseResult result)
+    {
+        var path = Path.Combine(_logsDirectory, "telegram_posts_raw.log");
+
+        var lines = new List<string>
+        {
+            string.Empty,
+            "############################################################",
+            $"# ЗАПУСК: {DateTime.Now:yyyy-MM-dd HH:mm:ss}",
+            $"# КАНАЛЫ: {string.Join(", ", _options.TelegramChannels)}",
+            $"# ПОСТОВ СОБРАНО: {result.AllPosts.Count}",
+            "############################################################"
+        };
+
+        foreach (var post in result.AllPosts)
+        {
+            lines.Add("============================================================");
+            lines.Add($"CHANNEL: {post.ChannelName} | POST ID: {post.PostId}");
+            lines.Add("============================================================");
+            lines.Add(post.Text);
+            lines.Add(string.Empty);
+        }
+
+        await File.AppendAllLinesAsync(path, lines);
+        _logger.Info($"Полные тексты постов ({result.AllPosts.Count}) дописаны в: {path}");
+    }
+
     /// <summary>Поднимает отдельный браузер с прокси только для Telegram.</summary>
     private async Task<IBrowser> LaunchTelegramBrowserAsync(string proxy)
     {
@@ -1039,7 +1049,12 @@ internal sealed class UnityAssetAutomationApp
         _logger.Info("============================================================");
         _logger.Info(" ПРОВЕРКА TELEGRAM");
         _logger.Info($" Каналы: {string.Join(", ", _options.TelegramChannels)}");
-        _logger.Info($" Прокси: {(string.IsNullOrWhiteSpace(_options.TelegramProxy) ? "не задан, идём напрямую" : _options.TelegramProxy)}");
+        var proxyLabel = !string.IsNullOrWhiteSpace(_options.TelegramProxy)
+            ? _options.TelegramProxy
+            : _options.TelegramAutoProxy
+                ? "автоподбор из общего списка"
+                : "не задан, идём напрямую";
+        _logger.Info($" Прокси: {proxyLabel}");
         _logger.Info("============================================================");
 
         if (_options.TelegramChannels.Count == 0)
@@ -4904,7 +4919,7 @@ internal sealed class CliOptions
         var interactive = cliInteractive ?? config?.Interactive ?? !Console.IsInputRedirected;
 
         var telegramPostLimit = config?.Telegram?.PostLimit ?? 20;
-        var telegramScreenshotOnNoLinks = config?.Telegram?.ScreenshotOnNoLinks ?? true;
+        var telegramScreenshotOnNoLinks = config?.Telegram?.ScreenshotOnNoLinks ?? false;
 
         return new CliOptions
         {
