@@ -25,6 +25,7 @@
   "maxVisitedAssets": null,
   "sources": [],
   "telegram": {
+    "proxy": "",
     "channels": [],
     "postLimit": 40,
     "screenshotOnNoLinks": true

@@ -84,6 +84,7 @@ internal sealed class UnityAssetAutomationApp
     private bool _credentialsAsked;
     private bool _googleWarningShown;
     private string? _lastWaitMessage;
+    private string? _chromePath;
 
     private bool HasCredentials =>
         !string.IsNullOrWhiteSpace(_unityEmail) && !string.IsNullOrWhiteSpace(_unityPassword);
@@ -225,6 +226,8 @@ internal sealed class UnityAssetAutomationApp
                 }
             }
 
+            _chromePath = chromePath;
+
             if (chromePath != null)
             {
                 _logger.Info($"Используем локальный браузер: {chromePath}");
@@ -325,6 +328,14 @@ internal sealed class UnityAssetAutomationApp
                 return;
             }
 
+            // Проверка Telegram идёт до входа в Unity: так можно настраивать прокси,
+            // не трогая аккаунт и не дожидаясь авторизации.
+            if (_options.CheckTelegram)
+            {
+                await CheckTelegramAsync(browser);
+                return;
+            }
+
             var authenticated = await EnsureAuthenticatedAsync(page);
             if (!authenticated)
             {
@@ -360,16 +371,7 @@ internal sealed class UnityAssetAutomationApp
             // Парсинг Telegram каналов (если указаны)
             if (_options.TelegramChannels.Count > 0)
             {
-                _logger.Info($"Запуск парсинга Telegram каналов: {string.Join(", ", _options.TelegramChannels)}");
-                var tgParser = new TelegramSourceParser(
-                    browser,
-                    _logger,
-                    _logsDirectory,
-                    _options.NavigationTimeoutMs,
-                    _options.TelegramPostLimit,
-                    _options.TelegramScreenshotOnNoLinks);
-
-                var tgResult = await tgParser.ParseChannelsAsync(_options.TelegramChannels);
+                var tgResult = await ParseTelegramChannelsAsync(browser);
 
                 var tgPostsLogPath = Path.Combine(_logsDirectory, "telegram_posts_raw.log");
                 var tgPostLines = new List<string>
@@ -742,6 +744,175 @@ internal sealed class UnityAssetAutomationApp
         }
 
         return Directory.Exists(candidate) ? candidate : null;
+    }
+
+    /// <summary>
+    /// Разбирает Telegram-каналы. Если задан отдельный прокси для Telegram,
+    /// поднимает под это второй браузер, чтобы Unity продолжал ходить напрямую.
+    /// </summary>
+    private async Task<TelegramParseResult> ParseTelegramChannelsAsync(IBrowser mainBrowser)
+    {
+        _logger.Info($"Запуск парсинга Telegram каналов: {string.Join(", ", _options.TelegramChannels)}");
+
+        IBrowser tgBrowser = mainBrowser;
+        IBrowser? ownBrowser = null;
+
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(_options.TelegramProxy))
+            {
+                _logger.Info($"Telegram идёт через отдельный прокси: {_options.TelegramProxy}");
+                _logger.Info("Unity при этом работает напрямую, без прокси.");
+                ownBrowser = await LaunchTelegramBrowserAsync(_options.TelegramProxy);
+                tgBrowser = ownBrowser;
+            }
+
+            var parser = new TelegramSourceParser(
+                tgBrowser,
+                _logger,
+                _logsDirectory,
+                _options.NavigationTimeoutMs,
+                _options.TelegramPostLimit,
+                _options.TelegramScreenshotOnNoLinks);
+
+            var result = await parser.ParseChannelsAsync(_options.TelegramChannels);
+            ExplainTelegramFailure(result);
+            return result;
+        }
+        finally
+        {
+            if (ownBrowser is not null)
+            {
+                await ownBrowser.CloseAsync();
+                await ownBrowser.DisposeAsync();
+            }
+        }
+    }
+
+    /// <summary>Поднимает отдельный браузер с прокси только для Telegram.</summary>
+    private async Task<IBrowser> LaunchTelegramBrowserAsync(string proxy)
+    {
+        var args = new List<string>
+        {
+            $"--proxy-server={proxy}",
+            "--disable-blink-features=AutomationControlled"
+        };
+
+        if (OperatingSystem.IsLinux())
+        {
+            args.Add("--no-sandbox");
+            args.Add("--disable-dev-shm-usage");
+        }
+
+        var options = new LaunchOptions
+        {
+            Headless = true,
+            DefaultViewport = null,
+            IgnoredDefaultArgs = ["--enable-automation"],
+            Args = [..args]
+        };
+
+        if (_chromePath != null)
+        {
+            options.ExecutablePath = _chromePath;
+        }
+
+        return await Puppeteer.LaunchAsync(options);
+    }
+
+    /// <summary>
+    /// Объясняет человеческими словами, почему Telegram не открылся.
+    /// Самая частая причина — блокировка провайдером, и без прокси она не лечится.
+    /// </summary>
+    private void ExplainTelegramFailure(TelegramParseResult result)
+    {
+        if (result.AllPosts.Count > 0 || result.Errors.Count == 0)
+        {
+            return;
+        }
+
+        bool HasError(params string[] codes) =>
+            result.Errors.Any(e => codes.Any(c => e.Contains(c, StringComparison.OrdinalIgnoreCase)));
+
+        // Прокси задан, но сам не отвечает — это отдельная беда, и лечится она иначе.
+        if (HasError("ERR_PROXY_CONNECTION_FAILED", "ERR_SOCKS_CONNECTION_FAILED",
+                "ERR_PROXY_AUTH_UNSUPPORTED", "ERR_TUNNEL_CONNECTION_FAILED"))
+        {
+            _logger.Warn("============================================================");
+            _logger.Warn(" ПРОКСИ ДЛЯ TELEGRAM НЕ ОТВЕЧАЕТ");
+            _logger.Warn($" Указан: {_options.TelegramProxy}");
+            _logger.Warn("");
+            _logger.Warn(" До самого прокси достучаться не удалось. Проверьте:");
+            _logger.Warn("   - запущена ли программа, которая его раздаёт;");
+            _logger.Warn("   - верны ли адрес и порт;");
+            _logger.Warn("   - тот ли вид: socks5:// или http://");
+            _logger.Warn("");
+            _logger.Warn(" Пример правильной записи: socks5://127.0.0.1:1080");
+            _logger.Warn("============================================================");
+            return;
+        }
+
+        var blocked = HasError("ERR_CONNECTION_TIMED_OUT", "ERR_CONNECTION_RESET",
+            "ERR_NAME_NOT_RESOLVED", "ERR_CONNECTION_REFUSED", "ERR_CONNECTION_CLOSED",
+            "ERR_TIMED_OUT", "ERR_ADDRESS_UNREACHABLE");
+
+        if (!blocked)
+        {
+            return;
+        }
+
+        _logger.Warn("============================================================");
+        _logger.Warn(" TELEGRAM НЕ ОТКРЫВАЕТСЯ");
+        _logger.Warn(" Соединение с t.me не устанавливается. Так выглядит блокировка");
+        _logger.Warn(" со стороны провайдера: сайт недоступен ещё до начала обмена.");
+        _logger.Warn("");
+        _logger.Warn(" ЧТО ПОМОЖЕТ:");
+        _logger.Warn("   1. Прокси только для Telegram (Unity останется напрямую):");
+        _logger.Warn("      --tg-proxy socks5://127.0.0.1:1080");
+        _logger.Warn("      или пункт T в меню run.bat");
+        _logger.Warn("   2. VPN на весь компьютер. Тогда через него пойдёт и Unity.");
+        _logger.Warn("");
+        _logger.Warn(" ЧТО НЕ ПОМОЖЕТ: смена протокола, WebSocket, другие таймауты.");
+        _logger.Warn(" Блокировка стоит на маршруте, а не в способе подключения.");
+        _logger.Warn("");
+        _logger.Warn(" Остальные источники (пункты 1-5) работают без Telegram.");
+        _logger.Warn("============================================================");
+    }
+
+    /// <summary>Проверка Telegram без входа в Unity: удобно подбирать прокси.</summary>
+    private async Task CheckTelegramAsync(IBrowser browser)
+    {
+        _logger.Info("============================================================");
+        _logger.Info(" ПРОВЕРКА TELEGRAM");
+        _logger.Info($" Каналы: {string.Join(", ", _options.TelegramChannels)}");
+        _logger.Info($" Прокси: {(string.IsNullOrWhiteSpace(_options.TelegramProxy) ? "не задан, идём напрямую" : _options.TelegramProxy)}");
+        _logger.Info("============================================================");
+
+        if (_options.TelegramChannels.Count == 0)
+        {
+            _logger.Warn("Каналы не заданы. Впишите их в telegram_sources.txt, по одному на строку.");
+            return;
+        }
+
+        var result = await ParseTelegramChannelsAsync(browser);
+
+        _logger.Info("============================================================");
+        _logger.Info(" ИТОГ ПРОВЕРКИ TELEGRAM");
+        _logger.Info($" Постов прочитано: {result.AllPosts.Count}");
+        _logger.Info($" Ссылок на ассеты: {result.AssetUrls.Count}");
+        _logger.Info($" Промокодов найдено: {result.Promocodes.Count}");
+        _logger.Info($" Ассетов с промокодом: {result.AssetPromocodes.Count}");
+        _logger.Info($" Ошибок: {result.Errors.Count}");
+
+        foreach (var pair in result.AssetPromocodes.Take(10))
+        {
+            _logger.Info($"   {pair.Value}  ->  {pair.Key}");
+        }
+
+        _logger.Info(result.AllPosts.Count > 0
+            ? " Telegram доступен, разбор работает."
+            : " Telegram недоступен. Смотрите объяснение выше.");
+        _logger.Info("============================================================");
     }
 
     /// <summary>Есть ли на этом компьютере сохранённая сессия для текущего профиля.</summary>
@@ -4145,6 +4316,8 @@ internal sealed class CliOptions
     public string ProfileName { get; init; } = "default";
     public bool ListProfiles { get; init; }
     public bool CheckLoginPage { get; init; }
+    public bool CheckTelegram { get; init; }
+    public string? TelegramProxy { get; init; }
     public string? ChromeUserDataDir { get; init; }
     public bool UseSystemChromeProfile { get; init; }
     public bool? SavePassword { get; init; }
@@ -4191,6 +4364,8 @@ internal sealed class CliOptions
         string? cliSetDefaultProfile = null;
         var cliListProfiles = false;
         var cliCheckLoginPage = false;
+        var cliCheckTelegram = false;
+        string? cliTelegramProxy = null;
         string? cliChromeUserDataDir = null;
         var cliUseSystemChromeProfile = false;
         bool? cliSavePassword = null;
@@ -4267,6 +4442,12 @@ internal sealed class CliOptions
                     break;
                 case "--use-system-chrome-profile":
                     cliUseSystemChromeProfile = true;
+                    break;
+                case "--check-telegram":
+                    cliCheckTelegram = true;
+                    break;
+                case "--tg-proxy" when i + 1 < args.Length:
+                    cliTelegramProxy = args[++i];
                     break;
                 case "--check-login-page":
                     cliCheckLoginPage = true;
@@ -4577,6 +4758,8 @@ internal sealed class CliOptions
             ProfileName = profileName,
             ListProfiles = cliListProfiles,
             CheckLoginPage = cliCheckLoginPage,
+            CheckTelegram = cliCheckTelegram,
+            TelegramProxy = FirstNonEmpty(cliTelegramProxy, config?.Telegram?.Proxy),
             ChromeUserDataDir = FirstNonEmpty(cliChromeUserDataDir, config?.ChromeUserDataDir),
             UseSystemChromeProfile = cliUseSystemChromeProfile || config?.UseSystemChromeProfile == true,
             SavePassword = cliSavePassword ?? config?.SavePassword,
@@ -4779,6 +4962,7 @@ internal sealed class ProxyConfig
 
 internal sealed class TelegramConfig
 {
+    public string? Proxy { get; init; }
     public List<string> Channels { get; init; } = [];
     public int PostLimit { get; init; } = 20;
     public bool ScreenshotOnNoLinks { get; init; } = true;
