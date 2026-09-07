@@ -240,7 +240,6 @@ internal sealed class UnityAssetAutomationApp
                 await new BrowserFetcher().DownloadAsync();
             }
 
-
             var browserArgs = new List<string>
             {
                 "--start-maximized",
@@ -311,7 +310,6 @@ internal sealed class UnityAssetAutomationApp
             await using var page = await browser.NewPageAsync();
             page.DefaultNavigationTimeout = _options.NavigationTimeoutMs;
             page.DefaultTimeout = _options.NavigationTimeoutMs;
-
 
             // Скрываем признаки Puppeteer (чтобы пускал Google OAuth)
             await page.EvaluateFunctionOnNewDocumentAsync(@"() => {
@@ -1550,6 +1548,109 @@ internal sealed class UnityAssetAutomationApp
         catch
         {
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Читает итоговую стоимость заказа со страницы оформления.
+    ///
+    /// Ищем именно строку итога, а не любое число на странице. Раньше проверка
+    /// смотрела, встречается ли где-нибудь "0.00" — под это подходит и "$10.00",
+    /// из-за чего платный ассет мог быть принят за бесплатный.
+    /// </summary>
+    private async Task<CartPriceSnapshot> ReadCartPriceAsync(IPage page)
+    {
+        try
+        {
+            var json = await page.EvaluateFunctionAsync<string>(@"() => {
+                const norm = (v) => (v || '').replace(/\s+/g, ' ').trim();
+                const lower = (v) => norm(v).toLowerCase();
+
+                const visible = (el) => {
+                    if (!el) return false;
+                    const st = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+                };
+
+                // Превращает '$1,234.56' или '1.234,56 $' в число.
+                const parseAmount = (text) => {
+                    const m = norm(text).match(/(?:US)?\s*\$\s*([0-9][0-9\s.,]*)/i);
+                    if (!m) return null;
+                    let n = m[1].replace(/\s/g, '').replace(/[.,]$/, '');
+                    if (/,\d{2}$/.test(n)) n = n.replace(/\./g, '').replace(',', '.');
+                    else n = n.replace(/,/g, '');
+                    const v = parseFloat(n);
+                    return isNaN(v) ? null : v;
+                };
+
+                const bodyText = document.body ? document.body.innerText : '';
+                const normBody = lower(bodyText);
+
+                const errorKeywords = [
+                    'expired', 'invalid', 'is not valid', 'not valid', 'coupon limit',
+                    'no longer', 'has ended', 'недействителен', 'истек', 'истёк',
+                    'больше не действует', 'ошибка'
+                ];
+                let hasPromoError = false;
+                let foundError = '';
+                for (const kw of errorKeywords) {
+                    if (normBody.includes(kw)) { hasPromoError = true; foundError = kw; break; }
+                }
+
+                const totalWords = ['order total', 'total', 'итого', 'к оплате', 'grand total', 'amount due'];
+                const nodes = Array.from(document.querySelectorAll('div, span, p, td, li, section'))
+                    .filter(visible);
+
+                // Сначала ищем узел, где рядом со словом 'итого' стоит сумма.
+                let best = null;
+                for (const el of nodes) {
+                    const t = norm(el.innerText || '');
+                    if (!t || t.length > 200) continue;
+                    const lt = t.toLowerCase();
+                    if (!totalWords.some(w => lt.includes(w))) continue;
+                    const amount = parseAmount(t);
+                    if (amount === null) continue;
+                    // Берём самый мелкий подходящий узел: он ближе всего к самой сумме.
+                    if (!best || t.length < best.raw.length) best = { raw: t, amount };
+                }
+
+                // Явное 'Free' в строке итога тоже считаем нулём.
+                if (!best) {
+                    for (const el of nodes) {
+                        const t = norm(el.innerText || '');
+                        if (!t || t.length > 60) continue;
+                        const lt = t.toLowerCase();
+                        if (!totalWords.some(w => lt.includes(w))) continue;
+                        if (/\bfree\b|бесплатно/.test(lt)) { best = { raw: t, amount: 0 }; break; }
+                    }
+                }
+
+                return JSON.stringify({
+                    found: best !== null,
+                    amount: best ? best.amount : 0,
+                    rawText: best ? best.raw : '',
+                    hasPromoError,
+                    foundError
+                });
+            }");
+
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            return new CartPriceSnapshot
+            {
+                Found = root.GetProperty("found").GetBoolean(),
+                Amount = root.GetProperty("amount").GetDecimal(),
+                RawText = root.GetProperty("rawText").GetString() ?? string.Empty,
+                HasPromoError = root.GetProperty("hasPromoError").GetBoolean(),
+                FoundError = root.GetProperty("foundError").GetString() ?? string.Empty
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[Промокод] Не удалось прочитать стоимость: {ex.Message}");
+            return new CartPriceSnapshot { Found = false };
         }
     }
 
@@ -3073,7 +3174,6 @@ internal sealed class UnityAssetAutomationApp
                 return result;
             }
 
-
             await Task.Delay(3000);
             _logger.Debug($"[Промокод][Шаг 1] URL после клика: {page.Url}");
             await SaveErrorScreenshotAsync(page, $"promo_added_to_cart_{sanitizedId}");
@@ -3096,7 +3196,6 @@ internal sealed class UnityAssetAutomationApp
                 await Task.Delay(1000);
             }
 
-
             if (!redirected)
             {
                 _logger.Info($"[Промокод][Шаг 2] Авторедирект не произошёл за 15с. Принудительный переход на /cart | URL сейчас: {page.Url}");
@@ -3104,7 +3203,6 @@ internal sealed class UnityAssetAutomationApp
                 await Task.Delay(3000);
                 _logger.Debug($"[Промокод][Шаг 2] URL после принудительного перехода: {page.Url}");
             }
-
 
             await SaveErrorScreenshotAsync(page, $"promo_pay_page_{sanitizedId}");
 
@@ -3324,7 +3422,6 @@ internal sealed class UnityAssetAutomationApp
                 return result;
             }
 
-
             var applyClicked = await page.EvaluateFunctionAsync<bool>(@"() => {
                 const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
                 const visible = (el) => {
@@ -3378,6 +3475,7 @@ internal sealed class UnityAssetAutomationApp
 
             // 5.5 - Apply button
             stepSw.Restart();
+            var priceBefore = await ReadCartPriceAsync(page);
             _logger.Info($"[Промокод][Шаг 5.5] Нажатие кнопки Apply/Redeem | URL: {page.Url}");
             if (!applyClicked)
             {
@@ -3393,75 +3491,72 @@ internal sealed class UnityAssetAutomationApp
 
             _logger.Info($"[Промокод][Шаг 5.5] Кнопка Apply нажата | {stepSw.ElapsedMilliseconds}мс. Ожидание обновления стоимости (4с)...");
             await Task.Delay(4000);
+            _logger.Info($"[Промокод] Стоимость до промокода: {priceBefore.Describe()}");
             _logger.Debug($"[Промокод][Шаг 5.5] URL после Apply: {page.Url}");
 
             await SaveErrorScreenshotAsync(page, $"promo_coupon_applied_{sanitizedId}");
 
-            // 6. Проверка ошибок применения промокода и обнуления цены
+            // 6. Промокод сработал только если итоговая цена стала ровно нулём.
+            // Сравнение с ценой до применения — единственный надёжный признак.
             stepSw.Restart();
-            _logger.Info($"[Промокод][Шаг 6] Проверка статуса корзины (ошибки кода / цена = $0) | URL: {page.Url}");
-            var cartState = await page.EvaluateFunctionAsync<string>(@"() => {
-                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                const visible = (el) => {
-                    if (!el) return false;
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-                };
+            var priceAfter = await ReadCartPriceAsync(page);
+            _logger.Info($"[Промокод] Стоимость после промокода: {priceAfter.Describe()}");
 
-                const bodyText = (document.body?.innerText || '');
-                const normBody = normalize(bodyText);
-
-                const errorKeywords = ['expired', 'invalid', 'is not valid', 'недействителен', 'истек', 'ошибка', 'coupon limit'];
-                let hasPromoError = false;
-                let foundError = '';
-                for (const kw of errorKeywords) {
-                    if (normBody.includes(kw)) {
-                        hasPromoError = true;
-                        foundError = kw;
-                        break;
-                    }
-                }
-
-                const candidates = Array.from(document.querySelectorAll('span, div, p, strong, td')).filter(visible);
-                
-                const hasZero = candidates.some(x => {
-                    const t = normalize(x.innerText || '');
-                    return t === '$0.00' || t === '$0,00' || t === '$0' || t === 'free' || t === 'бесплатно' || 
-                           t.includes('0.00') || t.includes('0,00') || t.includes('free') || t.includes('бесплатно');
-                });
-
-                return JSON.stringify({
-                    hasPromoError,
-                    foundError,
-                    hasZeroPrice: hasZero,
-                    bodyTextPreview: bodyText.substring(0, 500)
-                    bodyTextPreview: bodyText.substring(0, 3000)
-                });
-            }");
-
-            var state = JsonSerializer.Deserialize<CartStateSnapshot>(cartState, _runtimeJsonOptions) ?? new CartStateSnapshot();
-            _logger.Debug($"[Промокод] Статус корзины: hasPromoError={state.HasPromoError} (код: {state.FoundError}), hasZeroPrice={state.HasZeroPrice}");
-            _logger.Info($"[Промокод][Шаг 6] CartState: hasPromoError={state.HasPromoError} (keyword: '{state.FoundError}'), hasZeroPrice={state.HasZeroPrice} | {stepSw.ElapsedMilliseconds}мс");
-            _logger.Debug($"[Промокод][Шаг 6] BodyText (первые 3000 символов):\n{state.BodyTextPreview}");
-
-            if (state.HasPromoError || !state.HasZeroPrice)
+            if (priceAfter.HasPromoError)
             {
-                result.Status = AssetProcessStatus.Failed;
-                result.Message = state.HasPromoError
-                    ? $"Промокод не был применен: обнаружена ошибка '{state.FoundError}'."
-                    : "Промокод введен, но итоговая стоимость не стала бесплатной ($0.00).";
-                _logger.Warn($"[Ошибка][Шаг 6] {result.Message} Абортируем оформление. URL: {page.Url}");
+                result.Status = AssetProcessStatus.PromoNotApplied;
+                result.Message =
+                    $"Промокод не принят: страница пишет '{priceAfter.FoundError}'. Скорее всего раздача закончилась.";
+                _logger.Warn("============================================================");
+                _logger.Warn(" ПРОМОКОД НЕ СРАБОТАЛ");
+                _logger.Warn($" {result.Message}");
+                _logger.Warn(" Ассет пропущен, покупка отменена, деньги не списаны.");
+                _logger.Warn("============================================================");
                 await SaveErrorScreenshotAsync(page, $"promo_failed_error_{sanitizedId}");
-                await SaveHtmlDumpAsync(page, $"promo_dump_step6_promo_failed_{sanitizedId}");
                 await ClearCartAsync(page);
                 return result;
             }
 
+            if (!priceAfter.Found)
+            {
+                result.Status = AssetProcessStatus.Failed;
+                result.Message = "Не удалось прочитать итоговую стоимость на странице оформления.";
+                _logger.Warn("============================================================");
+                _logger.Warn(" СТОИМОСТЬ НЕ ЧИТАЕТСЯ");
+                _logger.Warn(" Не рискуем и отменяем покупку: без уверенности в цене платить нельзя.");
+                _logger.Warn("============================================================");
+                await SaveErrorScreenshotAsync(page, $"promo_price_unknown_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step6_price_unknown_{sanitizedId}");
+                await ClearCartAsync(page);
+                return result;
+            }
+
+            if (priceAfter.Amount > 0)
+            {
+                result.Status = AssetProcessStatus.PromoNotApplied;
+                result.Message =
+                    $"Промокод введён, но цена осталась {priceAfter.Describe()}. Скидка не применилась.";
+                _logger.Warn("============================================================");
+                _logger.Warn(" ПРОМОКОД НЕ СРАБОТАЛ");
+                _logger.Warn($" Цена не изменилась: {priceAfter.Describe()}");
+                if (priceBefore.Found)
+                {
+                    _logger.Warn($" Было до промокода: {priceBefore.Describe()}");
+                }
+
+                _logger.Warn(" Скорее всего раздача уже закончилась.");
+                _logger.Warn(" Ассет пропущен, покупка отменена, деньги не списаны.");
+                _logger.Warn("============================================================");
+                await SaveErrorScreenshotAsync(page, $"promo_price_not_zero_{sanitizedId}");
+                await ClearCartAsync(page);
+                return result;
+            }
+
+            _logger.Info($"[Промокод][Шаг 6] Итоговая стоимость обнулилась: {priceAfter.Describe()} | {stepSw.ElapsedMilliseconds}мс");
+
             // 7. Прохождение EULA (согласие с EULA чекбоксом)
             stepSw.Restart();
             _logger.Info($"[Промокод][Шаг 7] Поиск и принятие EULA-чекбокса | URL: {page.Url}");
-
 
             var eulaHandled = await page.EvaluateFunctionAsync<bool>(@"() => {
                 const visible = (el) => {
@@ -3616,7 +3711,6 @@ internal sealed class UnityAssetAutomationApp
             return result;
         }
     }
-
 
     private async Task ClearCartAsync(IPage page)
     {
@@ -4328,7 +4422,6 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
-
     private void PrintSummary(RunReport report)
     {
         var groups = report.Items.GroupBy(x => x.Status).ToDictionary(g => g.Key, g => g.Count());
@@ -4363,6 +4456,7 @@ internal sealed class UnityAssetAutomationApp
         AssetProcessStatus.PaidSkipped => "Платные, пропущены",
         AssetProcessStatus.WouldAddInDryRun => "Добавились бы (проверочный запуск)",
         AssetProcessStatus.UnknownAfterClick => "Непонятный результат после нажатия",
+        AssetProcessStatus.PromoNotApplied => "Промокод не сработал (раздача кончилась)",
         AssetProcessStatus.Failed => "Ошибка",
         _ => status.ToString()
     };
@@ -5260,13 +5354,25 @@ internal enum AssetProcessStatus
     PaidSkipped,
     WouldAddInDryRun,
     UnknownAfterClick,
+    PromoNotApplied,
     Failed
 }
 
-internal sealed class CartStateSnapshot
+/// <summary>
+/// Итоговая стоимость в корзине. Amount = 0 означает именно ноль,
+/// а не "на странице где-то встретилось 0.00" — на этом раньше можно было
+/// принять платный ассет за бесплатный и нажать оплату.
+/// </summary>
+internal sealed class CartPriceSnapshot
 {
+    public bool Found { get; set; }
+    public decimal Amount { get; set; }
+    public string RawText { get; set; } = string.Empty;
     public bool HasPromoError { get; set; }
     public string FoundError { get; set; } = string.Empty;
-    public bool HasZeroPrice { get; set; }
-    public string BodyTextPreview { get; set; } = string.Empty;
+
+    public string Describe() => Found
+        ? (Amount == 0 ? $"бесплатно ({RawText})" : $"{RawText}")
+        : "не удалось прочитать";
 }
+
