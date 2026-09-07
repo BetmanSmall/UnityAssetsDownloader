@@ -210,6 +210,75 @@ internal sealed class ProfileStore
         }
     }
 
+    /// <summary>
+    /// Переименовывает профиль, когда стало известно имя аккаунта Unity.
+    /// Папка переезжает целиком: и сессия, и папка браузера.
+    ///
+    /// Операция необязательная. Если что-то помешало — остаёмся на старом имени
+    /// и попробуем в следующий раз. Ничего не теряется.
+    /// </summary>
+    public bool TryRename(string oldName, string newName, out string message)
+    {
+        message = string.Empty;
+
+        if (string.Equals(oldName, newName, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var from = GetProfileDirectory(oldName);
+        var to = GetProfileDirectory(newName);
+
+        try
+        {
+            if (Directory.Exists(to))
+            {
+                // Такой профиль уже есть — значит этим аккаунтом уже пользовались.
+                // Ничего не двигаем, просто переключаемся на него со следующего раза.
+                SetDefault(newName);
+                message = $"Профиль для этого аккаунта уже есть: '{newName}'. Следующий запуск пойдёт под ним.";
+                return false;
+            }
+
+            if (Directory.Exists(from))
+            {
+                Directory.Move(from, to);
+            }
+            else
+            {
+                Directory.CreateDirectory(to);
+            }
+
+            var registry = Load();
+            var profile = registry.Profiles
+                .FirstOrDefault(x => string.Equals(x.Name, oldName, StringComparison.OrdinalIgnoreCase));
+
+            if (profile is not null)
+            {
+                profile.Name = newName;
+            }
+            else
+            {
+                registry.Profiles.Add(new ProfileInfo { Name = newName, LastUsedUtc = DateTime.UtcNow });
+            }
+
+            if (string.Equals(registry.DefaultProfile, oldName, StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(registry.DefaultProfile))
+            {
+                registry.DefaultProfile = newName;
+            }
+
+            Save(registry);
+            message = $"Профиль переименован: '{oldName}' -> '{newName}'.";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            message = $"Профиль переименовать не удалось ({ex.Message}). Останемся на '{oldName}', попробуем позже.";
+            return false;
+        }
+    }
+
     public string Describe()
     {
         var registry = Load();

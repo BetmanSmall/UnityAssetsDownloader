@@ -86,6 +86,7 @@ internal sealed class UnityAssetAutomationApp
     private bool _googleWarningShown;
     private string? _lastWaitMessage;
     private string? _chromePath;
+    private string? _unityAccount;
 
     private bool HasCredentials =>
         !string.IsNullOrWhiteSpace(_unityEmail) && !string.IsNullOrWhiteSpace(_unityPassword);
@@ -553,6 +554,8 @@ internal sealed class UnityAssetAutomationApp
         }
         finally
         {
+            FinalizeProfileName();
+
             var problemsPath = Path.Combine(_logsDirectory, CliOptions.ProblemsFileName);
             _logger.Info("============================================================");
             _logger.Info($" ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК — ПРИШЛИТЕ ЭТОТ ОДИН ФАЙЛ:");
@@ -1344,6 +1347,7 @@ internal sealed class UnityAssetAutomationApp
                 if (stable)
                 {
                     _logger.Info("Сессия активна.");
+                    await RememberUnityAccountAsync(page);
                     return true;
                 }
 
@@ -1412,6 +1416,7 @@ internal sealed class UnityAssetAutomationApp
 
         await SaveSessionStateAsync(page);
         TrySavePassword();
+        await RememberUnityAccountAsync(page);
         _logger.Info("Авторизация подтверждена, состояние сессии сохранено.");
         return true;
     }
@@ -1775,29 +1780,142 @@ internal sealed class UnityAssetAutomationApp
         _logger.Info(message);
     }
 
-    /// <summary>Пытается прочитать, под каким аккаунтом выполнен вход.</summary>
+    /// <summary>
+    /// Пытается узнать, под каким аккаунтом Unity выполнен вход.
+    /// Пробует несколько источников: не все из них работают на всех страницах.
+    /// Если ничего не вышло — вернёт пусто, и программа просто обойдётся без имени.
+    /// </summary>
     private async Task<string?> TryReadSignedInUserAsync(IPage page)
     {
         try
         {
             var raw = await page.EvaluateFunctionAsync<string?>(@"async () => {
-                try {
-                    const res = await fetch('https://assetstore.unity.com/api/user/info', { credentials: 'include' });
-                    if (!res.ok) return null;
-                    const data = await res.json();
-                    return data?.user?.email || data?.email || data?.user?.username || null;
-                } catch (e) {
+                const pickEmail = (obj) => {
+                    if (!obj || typeof obj !== 'object') return null;
+                    const keys = ['email', 'username', 'userName', 'displayName', 'name'];
+                    for (const k of keys) {
+                        const v = obj[k];
+                        if (typeof v === 'string' && v.trim().length > 0) return v.trim();
+                    }
+                    for (const k of Object.keys(obj)) {
+                        const found = pickEmail(obj[k]);
+                        if (found) return found;
+                    }
                     return null;
+                };
+
+                // 1. Служебный адрес магазина с данными о пользователе.
+                for (const url of ['/api/user/info', '/api/user', '/api/account']) {
+                    try {
+                        const res = await fetch(url, { credentials: 'include' });
+                        if (!res.ok) continue;
+                        const data = await res.json();
+                        const found = pickEmail(data);
+                        if (found) return found;
+                    } catch (e) { /* пробуем следующий */ }
                 }
+
+                // 2. Данные, которые магазин сохранил в браузере.
+                try {
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const value = localStorage.getItem(localStorage.key(i)) || '';
+                        const m = value.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+                        if (m) return m[0];
+                    }
+                } catch (e) { /* localStorage может быть закрыт */ }
+
+                // 3. Почта, показанная в самом интерфейсе.
+                const text = document.body ? document.body.innerText : '';
+                const m = text.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+                return m ? m[0] : null;
             }");
 
-            return string.IsNullOrWhiteSpace(raw) ? null : raw;
+            return string.IsNullOrWhiteSpace(raw) ? null : raw.Trim();
         }
         catch
         {
             return null;
         }
     }
+
+    /// <summary>
+    /// Запоминает аккаунт Unity, под которым выполнен вход.
+    /// Переименование профиля произойдёт в конце запуска, когда браузер закрыт.
+    /// </summary>
+    private async Task RememberUnityAccountAsync(IPage page)
+    {
+        if (!string.IsNullOrWhiteSpace(_unityAccount))
+        {
+            return;
+        }
+
+        _unityAccount = await TryReadSignedInUserAsync(page);
+
+        if (!string.IsNullOrWhiteSpace(_unityAccount))
+        {
+            _logger.Info($"Вход выполнен под аккаунтом Unity: {_unityAccount}");
+            _profileStore.Touch(_profileName, _unityAccount);
+        }
+        else
+        {
+            _logger.Debug("Имя аккаунта Unity определить не удалось. Профиль останется с прежним именем.");
+        }
+    }
+
+    /// <summary>
+    /// Приводит имя профиля к виду «пользователь компьютера + аккаунт Unity».
+    /// Вызывается в самом конце, когда браузер уже закрыт и папку можно двигать.
+    /// </summary>
+    private void FinalizeProfileName()
+    {
+        if (string.IsNullOrWhiteSpace(_unityAccount))
+        {
+            return;
+        }
+
+        var wanted = BuildProfileName(_options.ProfileBaseName, _unityAccount);
+
+        if (string.Equals(wanted, _profileName, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        if (_profileStore.TryRename(_profileName, wanted, out var message))
+        {
+            _logger.Info(message);
+            _logger.Info("Так на одном компьютере уживаются несколько аккаунтов Unity.");
+        }
+        else if (!string.IsNullOrWhiteSpace(message))
+        {
+            _logger.Info(message);
+        }
+    }
+
+    /// <summary>
+    /// Собирает имя профиля из имени пользователя компьютера и аккаунта Unity.
+    /// Так на одном компьютере уживаются несколько аккаунтов: у каждого своя папка.
+    /// </summary>
+    public static string BuildProfileName(string machineUser, string? unityAccount)
+    {
+        var baseName = ProfileStore.Sanitize(machineUser);
+
+        if (string.IsNullOrWhiteSpace(unityAccount))
+        {
+            return baseName;
+        }
+
+        // От почты берём часть до собаки: она короткая и узнаваемая.
+        var account = unityAccount.Trim();
+        var at = account.IndexOf('@');
+        if (at > 0)
+        {
+            account = account[..at];
+        }
+
+        account = ProfileStore.Sanitize(account);
+        return account.Length == 0 || account == "default" ? baseName : $"{baseName}__{account}";
+    }
+
 
     /// <summary>
     /// Читает итоговую стоимость заказа со страницы оформления.
@@ -4852,6 +4970,12 @@ internal sealed class CliOptions
     public string? LogFilePath { get; init; }
     public string SignInUrl { get; init; } = DefaultSignInUrl;
     public string ProfileName { get; init; } = "default";
+
+    /// <summary>
+    /// Основа имени профиля — обычно имя пользователя компьютера.
+    /// К ней после входа добавляется имя аккаунта Unity.
+    /// </summary>
+    public string ProfileBaseName { get; init; } = "default";
     public bool ListProfiles { get; init; }
     public bool CheckLoginPage { get; init; }
     public bool CheckTelegram { get; init; }
@@ -5273,6 +5397,13 @@ internal sealed class CliOptions
         // Имя профиля становится именем папки. Приводим его сразу, иначе в логе
         // видно одно имя, а на диске лежит другое — и непонятно, куда всё делось.
         var profileName = ProfileStore.Sanitize(rawProfileName);
+
+        // Основа — имя пользователя компьютера. Если профиль задали руками,
+        // основой становится оно, чтобы имя не превращалось в кашу.
+        var machineUser = Environment.UserName;
+        var profileBase = !string.IsNullOrWhiteSpace(cliProfile) || !string.IsNullOrWhiteSpace(config?.Profile)
+            ? profileName.Split("__")[0]
+            : ProfileStore.Sanitize(string.IsNullOrWhiteSpace(machineUser) ? "default" : machineUser);
         if (!string.Equals(profileName, rawProfileName, StringComparison.Ordinal))
         {
             Console.WriteLine($"[Профиль] Имя '{rawProfileName}' содержит символы, которых не может быть в имени папки.");
@@ -5317,6 +5448,7 @@ internal sealed class CliOptions
             LogsDirectory = logsDirectory,
             SignInUrl = signInUrl,
             ProfileName = profileName,
+            ProfileBaseName = profileBase,
             ListProfiles = cliListProfiles,
             CheckLoginPage = cliCheckLoginPage,
             CheckTelegram = cliCheckTelegram,
