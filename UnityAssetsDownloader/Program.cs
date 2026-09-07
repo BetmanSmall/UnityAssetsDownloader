@@ -317,20 +317,7 @@ internal sealed class UnityAssetAutomationApp
                 launchOptions.ExecutablePath = chromePath;
             }
 
-            IBrowser browser;
-            try
-            {
-                browser = await Puppeteer.LaunchAsync(launchOptions);
-            }
-            catch (Exception ex) when (_options.UseSystemChromeProfile)
-            {
-                _logger.Error(
-                    "Не удалось открыть ваш обычный профиль Chrome. Скорее всего, Chrome сейчас запущен: " +
-                    "он не отдаёт свою папку второму окну.");
-                _logger.Error("Закройте ВСЕ окна Chrome (проверьте значок у часов) и запустите заново.");
-                _logger.Error($"Текст ошибки: {ex.Message}");
-                throw;
-            }
+            var browser = await LaunchBrowserWithRetryAsync(launchOptions);
 
             await using (browser)
             {
@@ -770,33 +757,69 @@ internal sealed class UnityAssetAutomationApp
 
         try
         {
+            // Порядок такой, чтобы ничего не приходилось настраивать руками:
+            //   1. прокси, заданный явно;
+            //   2. прокси, который сработал в прошлый раз (лежит в профиле);
+            //   3. напрямую;
+            //   4. если напрямую не вышло — сам ищем рабочий прокси и повторяем.
             var proxy = _options.TelegramProxy;
 
-            if (string.IsNullOrWhiteSpace(proxy) && _options.TelegramAutoProxy)
+            if (string.IsNullOrWhiteSpace(proxy))
             {
-                proxy = await AutoSelectTelegramProxyAsync();
+                proxy = ReadRememberedProxy();
+                if (!string.IsNullOrWhiteSpace(proxy))
+                {
+                    _logger.Info($"Берём прокси, который работал в прошлый раз: {proxy}");
+                }
             }
 
             if (!string.IsNullOrWhiteSpace(proxy))
             {
-                _logger.Info($"Telegram идёт через отдельный прокси: {proxy}");
-                _logger.Info("Unity при этом работает напрямую, без прокси.");
                 ownBrowser = await LaunchTelegramBrowserAsync(proxy);
                 tgBrowser = ownBrowser;
+                _logger.Info($"Telegram идёт через отдельный прокси: {proxy}");
+                _logger.Info("Unity при этом работает напрямую, без прокси.");
             }
 
-            var parser = new TelegramSourceParser(
-                tgBrowser,
-                _logger,
-                _logsDirectory,
-                _options.NavigationTimeoutMs,
-                _options.TelegramPostLimit,
-                _options.TelegramScreenshotOnNoLinks);
+            var result = await RunParserAsync(tgBrowser);
 
-            var result = await parser.ParseChannelsAsync(_options.TelegramChannels);
+            // Не получилось — пробуем подобрать прокси и зайти ещё раз.
+            var blocked = result.AllPosts.Count == 0 && LooksBlocked(result);
+            if (blocked && _options.TelegramAutoProxy)
+            {
+                _logger.Warn("Telegram не открылся. Подбираем рабочий прокси и пробуем снова.");
+
+                var found = await AutoSelectTelegramProxyAsync();
+                if (!string.IsNullOrWhiteSpace(found))
+                {
+                    if (ownBrowser is not null)
+                    {
+                        await ownBrowser.CloseAsync();
+                        await ownBrowser.DisposeAsync();
+                    }
+
+                    ownBrowser = await LaunchTelegramBrowserAsync(found);
+                    _logger.Info($"Telegram идёт через отдельный прокси: {found}");
+                    result = await RunParserAsync(ownBrowser);
+                }
+            }
+
             await SaveTelegramPostsAsync(result);
             ExplainTelegramFailure(result);
             return result;
+
+            async Task<TelegramParseResult> RunParserAsync(IBrowser browser)
+            {
+                var parser = new TelegramSourceParser(
+                    browser,
+                    _logger,
+                    _logsDirectory,
+                    _options.NavigationTimeoutMs,
+                    _options.TelegramPostLimit,
+                    _options.TelegramScreenshotOnNoLinks);
+
+                return await parser.ParseChannelsAsync(_options.TelegramChannels);
+            }
         }
         finally
         {
@@ -806,6 +829,42 @@ internal sealed class UnityAssetAutomationApp
                 await ownBrowser.DisposeAsync();
             }
         }
+    }
+
+    /// <summary>Путь к файлу, где лежит последний сработавший прокси профиля.</summary>
+    private string RememberedProxyPath =>
+        Path.Combine(_profileStore.GetProfileDirectory(_profileName), "telegram_proxy.txt");
+
+    /// <summary>Читает прокси, сработавший в прошлый раз. Пусто, если такого нет.</summary>
+    private string? ReadRememberedProxy()
+    {
+        try
+        {
+            if (!File.Exists(RememberedProxyPath))
+            {
+                return null;
+            }
+
+            var value = File.ReadAllText(RememberedProxyPath).Trim();
+            return string.IsNullOrWhiteSpace(value) ? null : value;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Похожи ли ошибки на блокировку или мёртвый прокси.</summary>
+    private static bool LooksBlocked(TelegramParseResult result)
+    {
+        string[] codes =
+        [
+            "ERR_CONNECTION_TIMED_OUT", "ERR_CONNECTION_RESET", "ERR_CONNECTION_CLOSED",
+            "ERR_NAME_NOT_RESOLVED", "ERR_CONNECTION_REFUSED", "ERR_TIMED_OUT",
+            "ERR_PROXY_CONNECTION_FAILED", "ERR_SOCKS_CONNECTION_FAILED", "ERR_ADDRESS_UNREACHABLE"
+        ];
+
+        return result.Errors.Any(e => codes.Any(c => e.Contains(c, StringComparison.OrdinalIgnoreCase)));
     }
 
     /// <summary>Список бесплатных SOCKS5-прокси, обновляемый сообществом.</summary>
@@ -823,25 +882,7 @@ internal sealed class UnityAssetAutomationApp
     private async Task<string?> AutoSelectTelegramProxyAsync()
     {
         var testChannel = _options.TelegramChannels.FirstOrDefault() ?? "telegram";
-        var rememberedPath = Path.Combine(
-            _profileStore.GetProfileDirectory(_profileName), "telegram_proxy.txt");
-
-        // Быстрый путь: прошлый рабочий прокси обычно ещё жив.
-        if (File.Exists(rememberedPath))
-        {
-            var remembered = (await File.ReadAllTextAsync(rememberedPath)).Trim();
-            if (!string.IsNullOrWhiteSpace(remembered))
-            {
-                _logger.Info($"Пробуем прокси, который работал в прошлый раз: {remembered}");
-                if (await TestProxyAsync(remembered, testChannel))
-                {
-                    _logger.Info("Он всё ещё работает.");
-                    return remembered;
-                }
-
-                _logger.Info("Больше не отвечает, ищем новый.");
-            }
-        }
+        var rememberedPath = RememberedProxyPath;
 
         var candidates = await LoadProxyCandidatesAsync();
         if (candidates.Count == 0)
@@ -985,6 +1026,63 @@ internal sealed class UnityAssetAutomationApp
         _logger.Info($"Полные тексты постов ({result.AllPosts.Count}) дописаны в: {path}");
     }
 
+    /// <summary>
+    /// Запускает браузер, повторяя попытку при неудаче.
+    ///
+    /// Самая частая причина отказа — Chrome от прошлого запуска ещё не закрылся
+    /// и держит папку профиля. Так бывает после Ctrl+C. Через несколько секунд
+    /// он завершается сам, и вторая попытка проходит.
+    /// </summary>
+    private async Task<IBrowser> LaunchBrowserWithRetryAsync(LaunchOptions options)
+    {
+        const int attempts = 3;
+
+        for (var attempt = 1; attempt <= attempts; attempt++)
+        {
+            try
+            {
+                return await Puppeteer.LaunchAsync(options);
+            }
+            catch (Exception ex) when (attempt < attempts)
+            {
+                _logger.Warn($"Браузер не запустился (попытка {attempt} из {attempts}): {ex.Message}");
+                _logger.Warn("Обычно это Chrome от прошлого запуска: он ещё держит папку профиля.");
+                _logger.Warn("Ждём 6 секунд и пробуем снова...");
+                await Task.Delay(6000);
+            }
+        }
+
+        // Последняя попытка — уже без перехвата, чтобы текст ошибки попал в файл.
+        try
+        {
+            return await Puppeteer.LaunchAsync(options);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error("============================================================");
+            _logger.Error(" БРАУЗЕР НЕ ЗАПУСКАЕТСЯ");
+            _logger.Error("");
+
+            if (_options.UseSystemChromeProfile)
+            {
+                _logger.Error(" Включён режим вашего обычного Chrome, а Chrome сейчас запущен.");
+                _logger.Error(" Закройте ВСЕ окна Chrome, включая значок у часов, и повторите.");
+                _logger.Error(" Либо вернитесь к своей папке браузера — пункт B в меню.");
+            }
+            else
+            {
+                _logger.Error(" Скорее всего, окно Chrome от прошлого запуска ещё живо.");
+                _logger.Error(" Закройте лишние окна Chrome и запустите снова.");
+                _logger.Error(" Если не помогает — перезагрузите компьютер: зависший процесс уйдёт.");
+            }
+
+            _logger.Error("");
+            _logger.Error($" Текст ошибки: {ex.Message}");
+            _logger.Error("============================================================");
+            throw;
+        }
+    }
+
     /// <summary>Поднимает отдельный браузер с прокси только для Telegram.</summary>
     private async Task<IBrowser> LaunchTelegramBrowserAsync(string proxy)
     {
@@ -1013,7 +1111,7 @@ internal sealed class UnityAssetAutomationApp
             options.ExecutablePath = _chromePath;
         }
 
-        return await Puppeteer.LaunchAsync(options);
+        return await LaunchBrowserWithRetryAsync(options);
     }
 
     /// <summary>
@@ -4668,7 +4766,7 @@ internal sealed class CliOptions
         bool? cliSplitScreen = null;
         string? cliTelegramProxy = null;
         string? cliTelegramProxyList = null;
-        var cliTelegramAutoProxy = false;
+        bool? cliTelegramAutoProxy = null;
         string? cliChromeUserDataDir = null;
         var cliUseSystemChromeProfile = false;
         bool? cliSavePassword = null;
@@ -4756,7 +4854,10 @@ internal sealed class CliOptions
                     cliTelegramProxy = args[++i];
                     break;
                 case "--tg-auto-proxy":
-                    cliTelegramAutoProxy = true;
+                    // Работает и как флаг, и с явным значением: --tg-auto-proxy false
+                    cliTelegramAutoProxy = i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal)
+                        ? ParseBool(args[++i], true)
+                        : true;
                     break;
                 case "--tg-proxy-list" when i + 1 < args.Length:
                     cliTelegramProxyList = args[++i];
@@ -5074,7 +5175,7 @@ internal sealed class CliOptions
             SplitScreen = cliSplitScreen ?? config?.SplitScreen ?? true,
             TelegramProxy = FirstNonEmpty(cliTelegramProxy, config?.Telegram?.Proxy),
             TelegramProxyList = FirstNonEmpty(cliTelegramProxyList, config?.Telegram?.ProxyList),
-            TelegramAutoProxy = cliTelegramAutoProxy || config?.Telegram?.AutoProxy == true,
+            TelegramAutoProxy = cliTelegramAutoProxy ?? config?.Telegram?.AutoProxy ?? true,
             ChromeUserDataDir = FirstNonEmpty(cliChromeUserDataDir, config?.ChromeUserDataDir),
             UseSystemChromeProfile = cliUseSystemChromeProfile || config?.UseSystemChromeProfile == true,
             SavePassword = cliSavePassword ?? config?.SavePassword,

@@ -23,7 +23,7 @@ set "PROFILE_NAME=%USERNAME%"
 set "CHROME_ARG="
 set "CHROME_MODE=своя папка браузера (личный Chrome не трогаем)"
 set "TGPROXY_ARG="
-set "TGPROXY_MODE=не задан (Telegram напрямую)"
+set "TGPROXY_MODE=подбирается сам, если понадобится"
 
 echo Сборка проекта...
 dotnet build "%PROJECT%" --nologo -v q
@@ -57,7 +57,7 @@ echo  6^) Только логин и сохранение cookies  ^<== начн
 echo  7^) Dry-run (проверка без добавления в аккаунт^)
 echo  8^) Telegram каналы из telegram_sources.txt
 echo  9^) Диагностика: Telegram + максимум логов (--trace-network^)
-echo  T^) Проверить Telegram / задать прокси только для Telegram
+echo  T^) Проверить Telegram / задать свой прокси
 echo  B^) Переключить браузер: своя папка ^<-^> мой обычный Chrome
 echo  C^) Проверить страницу входа Unity (быстро, ничего не меняет^)
 echo  P^) Сменить профиль аккаунта (для второго аккаунта на этом компьютере^)
@@ -178,27 +178,31 @@ goto after_run
 :telegram_proxy
 echo.
 echo Telegram у многих провайдеров заблокирован. Помогает прокси.
-echo Он будет использоваться ТОЛЬКО для Telegram, Unity пойдёт напрямую.
-echo Через прокси проходят лишь открытые страницы каналов - ни входа, ни паролей.
+echo.
+echo НАСТРАИВАТЬ НИЧЕГО НЕ НУЖНО: если Telegram не открылся, программа сама
+echo найдёт рабочий прокси и запомнит его для следующих запусков.
+echo Этот пункт нужен, только если хотите свой прокси или проверить связь.
+echo.
+echo Прокси используется ТОЛЬКО для Telegram, Unity ходит напрямую.
+echo Через него проходят лишь открытые страницы каналов - ни входа, ни паролей.
 echo.
 echo Сейчас задан: %TGPROXY_MODE%
 echo.
-echo   A = автоподбор. Программа сама скачает список бесплатных прокси,
-echo       найдёт рабочий и запомнит его. Занимает 1-3 минуты в первый раз.
+echo   Enter = ничего не менять, только проверить связь с Telegram
 echo   свой адрес, например socks5://127.0.0.1:1080
-echo   Enter = убрать прокси, ходить напрямую
+echo   N = запретить автоподбор, ходить только напрямую
 echo.
 set "tgproxy="
 set /p "tgproxy=Ваш выбор: "
-if /i "%tgproxy%"=="A" (
-    set "TGPROXY_ARG=--tg-auto-proxy"
-    set "TGPROXY_MODE=автоподбор из общего списка"
+if /i "%tgproxy%"=="N" (
+    set "TGPROXY_ARG=--tg-auto-proxy false"
+    set "TGPROXY_MODE=только напрямую, без прокси"
 ) else if defined tgproxy (
     set "TGPROXY_ARG=--tg-proxy "%tgproxy%""
     set "TGPROXY_MODE=%tgproxy%"
 ) else (
     set "TGPROXY_ARG="
-    set "TGPROXY_MODE=не задан (Telegram напрямую)"
+    set "TGPROXY_MODE=подбирается сам, если понадобится"
 )
 echo.
 echo Проверяем. Вход в Unity для этого не нужен.
