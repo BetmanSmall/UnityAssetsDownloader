@@ -1,20 +1,23 @@
 /// <summary>
-/// Помнит, какие ассеты уже есть на аккаунте.
+/// Помнит ассеты, которые не нужно проверять заново: уже добавленные на аккаунт
+/// или удалённые из магазина.
 ///
-/// Без этого каждый запуск заново открывает страницу каждого ассета,
-/// чтобы узнать то, что уже известно. На двадцати ассетах это больше минуты.
+/// Без этого каждый запуск заново открывает страницу каждого ассета, чтобы узнать
+/// то, что уже известно. На удалённом ассете уходит до полутора минут.
 ///
 /// Список хранится в профиле: у разных аккаунтов он свой.
 /// </summary>
 internal sealed class OwnedAssetsCache
 {
     private readonly string _path;
+    private readonly string _title;
     private readonly HashSet<string> _urls = new(StringComparer.OrdinalIgnoreCase);
     private bool _changed;
 
-    public OwnedAssetsCache(string profileDirectory)
+    public OwnedAssetsCache(string profileDirectory, string fileName = "owned_assets.txt", string? title = null)
     {
-        _path = Path.Combine(profileDirectory, "owned_assets.txt");
+        _path = Path.Combine(profileDirectory, fileName);
+        _title = title ?? "Ассеты, которые уже есть на аккаунте этого профиля.";
         Load();
     }
 
@@ -69,7 +72,7 @@ internal sealed class OwnedAssetsCache
             Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
             var lines = new List<string>
             {
-                "# Ассеты, которые уже есть на аккаунте этого профиля.",
+                $"# {_title}",
                 "# Программа их пропускает, не открывая страницу.",
                 "# Можно удалить файл целиком — тогда всё проверится заново."
             };

@@ -448,14 +448,18 @@ internal sealed class UnityAssetAutomationApp
                 Sources = sources
             };
 
-            var ownedCache = new OwnedAssetsCache(_profileStore.GetProfileDirectory(_profileName));
+            var profileDirectory = _profileStore.GetProfileDirectory(_profileName);
+            var ownedCache = new OwnedAssetsCache(profileDirectory);
+            var deprecatedCache = new OwnedAssetsCache(
+                profileDirectory, "deprecated_assets.txt", "Ассеты, удалённые издателем из магазина.");
             var skippedKnown = 0;
+            var skippedDeprecated = 0;
 
-            if (ownedCache.Count > 0 && !_options.RecheckOwned)
+            if (!_options.RecheckOwned && (ownedCache.Count > 0 || deprecatedCache.Count > 0))
             {
                 _logger.Info(
-                    $"В памяти профиля {ownedCache.Count} ассетов, уже добавленных на аккаунт. " +
-                    "Их страницы открывать не будем.");
+                    $"В памяти профиля: {ownedCache.Count} уже добавленных ассетов, " +
+                    $"{deprecatedCache.Count} удалённых из магазина. Их страницы открывать не будем.");
             }
 
             var newlyAddedCount = 0;
@@ -486,7 +490,7 @@ internal sealed class UnityAssetAutomationApp
                     break;
                 }
 
-                // Ассеты, про которые уже известно, что они на аккаунте, не открываем вовсе.
+                // Ассеты, про которые уже всё известно, не открываем вовсе.
                 if (!_options.RecheckOwned && ownedCache.Contains(assetUrl))
                 {
                     skippedKnown++;
@@ -495,6 +499,18 @@ internal sealed class UnityAssetAutomationApp
                         Url = assetUrl,
                         Status = AssetProcessStatus.AlreadyOwned,
                         Message = "Уже был на аккаунте (известно с прошлых запусков, страница не открывалась)."
+                    });
+                    continue;
+                }
+
+                if (!_options.RecheckOwned && deprecatedCache.Contains(assetUrl))
+                {
+                    skippedDeprecated++;
+                    report.Items.Add(new ProcessResult
+                    {
+                        Url = assetUrl,
+                        Status = AssetProcessStatus.Deprecated,
+                        Message = "Удалён из магазина (известно с прошлых запусков, страница не открывалась)."
                     });
                     continue;
                 }
@@ -509,6 +525,10 @@ internal sealed class UnityAssetAutomationApp
                 if (result.Status is AssetProcessStatus.Added or AssetProcessStatus.AlreadyOwned)
                 {
                     ownedCache.Add(assetUrl);
+                }
+                else if (result.Status == AssetProcessStatus.Deprecated)
+                {
+                    deprecatedCache.Add(assetUrl);
                 }
 
                 // В лимит попадают только фактически добавленные ассеты.
@@ -537,12 +557,15 @@ internal sealed class UnityAssetAutomationApp
             }
 
             ownedCache.Save();
+            deprecatedCache.Save();
 
-            if (skippedKnown > 0)
+            if (skippedKnown + skippedDeprecated > 0)
             {
+                // Удалённый ассет обходится дороже: его страницу приходится долго ждать.
+                var saved = skippedKnown * 4 + skippedDeprecated * 60;
                 _logger.Info(
-                    $"Пропущено без открытия страницы: {skippedKnown} (уже на аккаунте). " +
-                    $"Это сэкономило примерно {skippedKnown * 4} секунд.");
+                    $"Пропущено без открытия страницы: {skippedKnown} уже добавленных, " +
+                    $"{skippedDeprecated} удалённых из магазина. Сэкономлено примерно {saved} секунд.");
             }
 
             report.FinishedAtUtc = DateTime.UtcNow;
@@ -1331,6 +1354,39 @@ internal sealed class UnityAssetAutomationApp
             ? " Telegram доступен, разбор работает."
             : " Telegram недоступен. Смотрите объяснение выше.");
         _logger.Info("============================================================");
+    }
+
+    /// <summary>
+    /// Ошибка, которая проходит сама: страница сменилась во время проверки.
+    /// Такое случается на медленной сети и не означает, что с ассетом что-то не так.
+    /// </summary>
+    private static bool IsTransientPageError(Exception ex) =>
+        ex.Message.Contains("Execution context was destroyed", StringComparison.OrdinalIgnoreCase) ||
+        ex.Message.Contains("Target closed", StringComparison.OrdinalIgnoreCase) ||
+        ex.Message.Contains("Session closed", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Убрал ли издатель ассет из магазина.
+    /// Unity показывает на такой странице прямое предупреждение и не рисует кнопку добавления.
+    /// </summary>
+    private async Task<bool> IsDeprecatedAssetPageAsync(IPage page)
+    {
+        try
+        {
+            return await page.EvaluateFunctionAsync<bool>(@"() => {
+                const text = (document.body ? document.body.innerText : '').toLowerCase();
+                return text.includes('has been deprecated from the unity asset store') ||
+                       text.includes('no longer available for purchase') ||
+                       text.includes('deprecated from the asset store') ||
+                       text.includes('удален из unity asset store') ||
+                       text.includes('удалён из unity asset store') ||
+                       text.includes('больше не доступен для покупки');
+            }");
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>Есть ли на этом компьютере сохранённая сессия для текущего профиля.</summary>
@@ -3318,7 +3374,8 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
-    private async Task<ProcessResult> ProcessAssetAsync(IPage page, string assetUrl, string? promoCode = null)
+    private async Task<ProcessResult> ProcessAssetAsync(
+        IPage page, string assetUrl, string? promoCode = null, bool retriedAfterNavigation = false)
     {
         var result = new ProcessResult
         {
@@ -3331,6 +3388,16 @@ internal sealed class UnityAssetAutomationApp
             for (var processingAttempt = 1; processingAttempt <= 2; processingAttempt++)
             {
                 await SafeGoToAsync(page, assetUrl);
+
+                // Издатель мог убрать ассет из магазина. Такую страницу узнаём сразу:
+                // иначе программа ждёт кнопку добавления полторы минуты, а её там нет и не будет.
+                if (await IsDeprecatedAssetPageAsync(page))
+                {
+                    result.Status = AssetProcessStatus.Deprecated;
+                    result.Message = "Ассет удалён из магазина издателем. Добавить его нельзя.";
+                    _logger.Info($"[Пропуск] Ассет удалён из магазина: {assetUrl}");
+                    return result;
+                }
 
                 var ready = await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(_options.AssetUiTimeoutMs));
                 if (!ready)
@@ -3526,6 +3593,15 @@ internal sealed class UnityAssetAutomationApp
             _logger.Info($"[Ошибка] {result.Message} ({assetUrl})");
             await SaveErrorScreenshotAsync(page, "reauth-loop-failed");
             return result;
+        }
+        catch (Exception ex) when (IsTransientPageError(ex) && !retriedAfterNavigation)
+        {
+            // Страница ушла на другой адрес прямо во время проверки — обычное дело
+            // на медленной сети. Просто пробуем этот ассет ещё раз.
+            _logger.Debug($"Страница сменилась во время проверки. Повторяем: {assetUrl}");
+            retriedAfterNavigation = true;
+            await Task.Delay(2000);
+            return await ProcessAssetAsync(page, assetUrl, promoCode, true);
         }
         catch (Exception ex)
         {
@@ -4851,6 +4927,7 @@ internal sealed class UnityAssetAutomationApp
         AssetProcessStatus.WouldAddInDryRun => "Добавились бы (проверочный запуск)",
         AssetProcessStatus.UnknownAfterClick => "Непонятный результат после нажатия",
         AssetProcessStatus.PromoNotApplied => "Промокод не сработал (раздача кончилась)",
+        AssetProcessStatus.Deprecated => "Удалены из магазина издателем",
         AssetProcessStatus.Failed => "Ошибка",
         _ => status.ToString()
     };
@@ -5779,6 +5856,7 @@ internal enum AssetProcessStatus
     WouldAddInDryRun,
     UnknownAfterClick,
     PromoNotApplied,
+    Deprecated,
     Failed
 }
 
