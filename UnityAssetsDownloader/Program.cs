@@ -87,6 +87,8 @@ internal sealed class UnityAssetAutomationApp
     private string? _lastWaitMessage;
     private string? _chromePath;
     private string? _unityAccount;
+    private OwnedAssetsCache? _ownedCache;
+    private OwnedAssetsCache? _deprecatedCache;
 
     private bool HasCredentials =>
         !string.IsNullOrWhiteSpace(_unityEmail) && !string.IsNullOrWhiteSpace(_unityPassword);
@@ -153,6 +155,9 @@ internal sealed class UnityAssetAutomationApp
         {
             Directory.CreateDirectory(_dataDirectory);
             Directory.CreateDirectory(_logsDirectory);
+
+            // Ctrl+C не должен стирать то, что программа уже успела выяснить.
+            Console.CancelKeyPress += OnCancelRequested;
 
             _profileStore.Touch(_profileName, _unityEmail);
             if (_profileStore.TryMigrateLegacySession(_profileName, out var migrationMessage))
@@ -452,6 +457,9 @@ internal sealed class UnityAssetAutomationApp
             var ownedCache = new OwnedAssetsCache(profileDirectory);
             var deprecatedCache = new OwnedAssetsCache(
                 profileDirectory, "deprecated_assets.txt", "Ассеты, удалённые издателем из магазина.");
+
+            _ownedCache = ownedCache;
+            _deprecatedCache = deprecatedCache;
             var skippedKnown = 0;
             var skippedDeprecated = 0;
 
@@ -531,6 +539,14 @@ internal sealed class UnityAssetAutomationApp
                     deprecatedCache.Add(assetUrl);
                 }
 
+                // Сохраняем по ходу дела, а не только в конце: проход по сотням ассетов
+                // занимает много минут, и обрыв не должен стирать уже узнанное.
+                if (index % 10 == 0)
+                {
+                    ownedCache.Save();
+                    deprecatedCache.Save();
+                }
+
                 // В лимит попадают только фактически добавленные ассеты.
                 // AlreadyOwned / PaidSkipped / Failed не считаются.
                 // В режиме --dry-run считаем то, что было бы добавлено, иначе лимит не сработает никогда.
@@ -577,6 +593,8 @@ internal sealed class UnityAssetAutomationApp
         }
         finally
         {
+            Console.CancelKeyPress -= OnCancelRequested;
+            SaveCaches();
             FinalizeProfileName();
 
             var problemsPath = Path.Combine(_logsDirectory, CliOptions.ProblemsFileName);
@@ -1364,6 +1382,53 @@ internal sealed class UnityAssetAutomationApp
         ex.Message.Contains("Execution context was destroyed", StringComparison.OrdinalIgnoreCase) ||
         ex.Message.Contains("Target closed", StringComparison.OrdinalIgnoreCase) ||
         ex.Message.Contains("Session closed", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Сохраняет память профиля. Вызывать можно сколько угодно раз.</summary>
+    private void SaveCaches()
+    {
+        _ownedCache?.Save();
+        _deprecatedCache?.Save();
+    }
+
+    /// <summary>Пользователь нажал Ctrl+C — успеваем записать память профиля.</summary>
+    private void OnCancelRequested(object? sender, ConsoleCancelEventArgs e)
+    {
+        try
+        {
+            SaveCaches();
+            Console.WriteLine();
+            Console.WriteLine("Прервано. Всё, что программа успела узнать про ассеты, сохранено.");
+            Console.WriteLine("Следующий запуск не станет проверять их заново.");
+        }
+        catch
+        {
+            // На выходе из программы падать нельзя.
+        }
+    }
+
+    /// <summary>
+    /// Ждёт, пока короткая ссылка вида /packages/package/123 сама перейдёт
+    /// на настоящий адрес ассета. До перехода страница ещё пустая,
+    /// и проверять на ней нечего.
+    /// </summary>
+    private static async Task WaitForShortLinkRedirectAsync(IPage page, string assetUrl)
+    {
+        if (!assetUrl.Contains("/packages/package/", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var stopAt = DateTime.UtcNow.AddSeconds(8);
+        while (DateTime.UtcNow < stopAt)
+        {
+            if (!page.Url.Contains("/packages/package/", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            await Task.Delay(400);
+        }
+    }
 
     /// <summary>
     /// Убрал ли издатель ассет из магазина.
@@ -3388,6 +3453,7 @@ internal sealed class UnityAssetAutomationApp
             for (var processingAttempt = 1; processingAttempt <= 2; processingAttempt++)
             {
                 await SafeGoToAsync(page, assetUrl);
+                await WaitForShortLinkRedirectAsync(page, assetUrl);
 
                 // Издатель мог убрать ассет из магазина. Такую страницу узнаём сразу:
                 // иначе программа ждёт кнопку добавления полторы минуты, а её там нет и не будет.
@@ -3402,6 +3468,16 @@ internal sealed class UnityAssetAutomationApp
                 var ready = await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(_options.AssetUiTimeoutMs));
                 if (!ready)
                 {
+                    // Предупреждение о снятии с продажи могло появиться уже после загрузки.
+                    // Проверяем ещё раз, пока не начали ждать кнопку ещё сорок секунд.
+                    if (await IsDeprecatedAssetPageAsync(page))
+                    {
+                        result.Status = AssetProcessStatus.Deprecated;
+                        result.Message = "Ассет удалён из магазина издателем. Добавить его нельзя.";
+                        _logger.Info($"[Пропуск] Ассет удалён из магазина: {assetUrl}");
+                        return result;
+                    }
+
                     _logger.Warn(
                         "Не удалось дождаться появления ключевых элементов ассета (Add/Open/Sign in/Buy). Продолжаем с текущими данными страницы.");
                 }
