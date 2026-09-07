@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -759,11 +760,18 @@ internal sealed class UnityAssetAutomationApp
 
         try
         {
-            if (!string.IsNullOrWhiteSpace(_options.TelegramProxy))
+            var proxy = _options.TelegramProxy;
+
+            if (string.IsNullOrWhiteSpace(proxy) && _options.TelegramAutoProxy)
             {
-                _logger.Info($"Telegram идёт через отдельный прокси: {_options.TelegramProxy}");
+                proxy = await AutoSelectTelegramProxyAsync();
+            }
+
+            if (!string.IsNullOrWhiteSpace(proxy))
+            {
+                _logger.Info($"Telegram идёт через отдельный прокси: {proxy}");
                 _logger.Info("Unity при этом работает напрямую, без прокси.");
-                ownBrowser = await LaunchTelegramBrowserAsync(_options.TelegramProxy);
+                ownBrowser = await LaunchTelegramBrowserAsync(proxy);
                 tgBrowser = ownBrowser;
             }
 
@@ -786,6 +794,152 @@ internal sealed class UnityAssetAutomationApp
                 await ownBrowser.CloseAsync();
                 await ownBrowser.DisposeAsync();
             }
+        }
+    }
+
+    /// <summary>Список бесплатных SOCKS5-прокси, обновляемый сообществом.</summary>
+    private const string DefaultProxyListUrl =
+        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt";
+
+    /// <summary>
+    /// Подбирает рабочий прокси для Telegram.
+    /// Сначала пробует тот, что сработал в прошлый раз, потом берёт список
+    /// и проверяет адреса пачками, пока не найдёт живой.
+    ///
+    /// Через прокси идут только открытые страницы каналов Telegram.
+    /// Вход в Unity и cookies через него не проходят никогда.
+    /// </summary>
+    private async Task<string?> AutoSelectTelegramProxyAsync()
+    {
+        var testChannel = _options.TelegramChannels.FirstOrDefault() ?? "telegram";
+        var rememberedPath = Path.Combine(
+            _profileStore.GetProfileDirectory(_profileName), "telegram_proxy.txt");
+
+        // Быстрый путь: прошлый рабочий прокси обычно ещё жив.
+        if (File.Exists(rememberedPath))
+        {
+            var remembered = (await File.ReadAllTextAsync(rememberedPath)).Trim();
+            if (!string.IsNullOrWhiteSpace(remembered))
+            {
+                _logger.Info($"Пробуем прокси, который работал в прошлый раз: {remembered}");
+                if (await TestProxyAsync(remembered, testChannel))
+                {
+                    _logger.Info("Он всё ещё работает.");
+                    return remembered;
+                }
+
+                _logger.Info("Больше не отвечает, ищем новый.");
+            }
+        }
+
+        var candidates = await LoadProxyCandidatesAsync();
+        if (candidates.Count == 0)
+        {
+            _logger.Warn("Не удалось получить список прокси. Задайте свой через --tg-proxy.");
+            return null;
+        }
+
+        _logger.Info($"Список получен: {candidates.Count} адресов. Ищем рабочий, проверяем пачками по 25.");
+        _logger.Info("Через прокси пойдут только открытые страницы Telegram. Unity — напрямую.");
+
+        var shuffled = candidates.OrderBy(_ => Random.Shared.Next()).ToList();
+        const int batchSize = 25;
+        var checkedCount = 0;
+
+        for (var offset = 0; offset < shuffled.Count; offset += batchSize)
+        {
+            var batch = shuffled.Skip(offset).Take(batchSize).ToList();
+            var tasks = batch.Select(async candidate =>
+                await TestProxyAsync(candidate, testChannel) ? candidate : null).ToList();
+
+            var results = await Task.WhenAll(tasks);
+            checkedCount += batch.Count;
+
+            var working = results.FirstOrDefault(r => r != null);
+            if (working != null)
+            {
+                _logger.Info($"Найден рабочий прокси: {working} (проверено адресов: {checkedCount})");
+
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(rememberedPath)!);
+                    await File.WriteAllTextAsync(rememberedPath, working);
+                    _logger.Info($"Запомнили его для профиля '{_profileName}', в следующий раз проверим сразу его.");
+                }
+                catch (Exception ex)
+                {
+                    _logger.Debug($"Не удалось запомнить прокси: {ex.Message}");
+                }
+
+                return working;
+            }
+
+            _logger.Info($"Проверено {checkedCount} из {shuffled.Count}, рабочих пока нет...");
+        }
+
+        _logger.Warn("Ни один прокси из списка не подошёл. Попробуйте позже или задайте свой через --tg-proxy.");
+        return null;
+    }
+
+    /// <summary>Читает список прокси: по ссылке или из локального файла.</summary>
+    private async Task<List<string>> LoadProxyCandidatesAsync()
+    {
+        var source = string.IsNullOrWhiteSpace(_options.TelegramProxyList)
+            ? DefaultProxyListUrl
+            : _options.TelegramProxyList;
+
+        try
+        {
+            string text;
+
+            if (File.Exists(source))
+            {
+                _logger.Info($"Читаем список прокси из файла: {source}");
+                text = await File.ReadAllTextAsync(source);
+            }
+            else
+            {
+                _logger.Info($"Скачиваем список прокси: {source}");
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                text = await _httpClient.GetStringAsync(source, cts.Token);
+            }
+
+            return text
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(line => !line.StartsWith('#'))
+                .Select(line => line.Contains("://", StringComparison.Ordinal) ? line : "socks5://" + line)
+                .Where(line => Uri.TryCreate(line, UriKind.Absolute, out _))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"Список прокси не получен: {ex.Message}");
+            _logger.Warn("Если GitHub тоже заблокирован — сохраните список в файл и укажите его в --tg-proxy-list.");
+            return [];
+        }
+    }
+
+    /// <summary>Проверяет один прокси: открывается ли через него страница канала.</summary>
+    private static async Task<bool> TestProxyAsync(string proxy, string channel)
+    {
+        try
+        {
+            using var handler = new HttpClientHandler
+            {
+                Proxy = new WebProxy(proxy),
+                UseProxy = true
+            };
+
+            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
+            var html = await client.GetStringAsync($"https://t.me/s/{channel}");
+
+            // Признак того, что страница действительно отдала посты, а не заглушку провайдера.
+            return html.Contains("tgme_widget_message", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -4318,6 +4472,8 @@ internal sealed class CliOptions
     public bool CheckLoginPage { get; init; }
     public bool CheckTelegram { get; init; }
     public string? TelegramProxy { get; init; }
+    public string? TelegramProxyList { get; init; }
+    public bool TelegramAutoProxy { get; init; }
     public string? ChromeUserDataDir { get; init; }
     public bool UseSystemChromeProfile { get; init; }
     public bool? SavePassword { get; init; }
@@ -4366,6 +4522,8 @@ internal sealed class CliOptions
         var cliCheckLoginPage = false;
         var cliCheckTelegram = false;
         string? cliTelegramProxy = null;
+        string? cliTelegramProxyList = null;
+        var cliTelegramAutoProxy = false;
         string? cliChromeUserDataDir = null;
         var cliUseSystemChromeProfile = false;
         bool? cliSavePassword = null;
@@ -4448,6 +4606,12 @@ internal sealed class CliOptions
                     break;
                 case "--tg-proxy" when i + 1 < args.Length:
                     cliTelegramProxy = args[++i];
+                    break;
+                case "--tg-auto-proxy":
+                    cliTelegramAutoProxy = true;
+                    break;
+                case "--tg-proxy-list" when i + 1 < args.Length:
+                    cliTelegramProxyList = args[++i];
                     break;
                 case "--check-login-page":
                     cliCheckLoginPage = true;
@@ -4760,6 +4924,8 @@ internal sealed class CliOptions
             CheckLoginPage = cliCheckLoginPage,
             CheckTelegram = cliCheckTelegram,
             TelegramProxy = FirstNonEmpty(cliTelegramProxy, config?.Telegram?.Proxy),
+            TelegramProxyList = FirstNonEmpty(cliTelegramProxyList, config?.Telegram?.ProxyList),
+            TelegramAutoProxy = cliTelegramAutoProxy || config?.Telegram?.AutoProxy == true,
             ChromeUserDataDir = FirstNonEmpty(cliChromeUserDataDir, config?.ChromeUserDataDir),
             UseSystemChromeProfile = cliUseSystemChromeProfile || config?.UseSystemChromeProfile == true,
             SavePassword = cliSavePassword ?? config?.SavePassword,
@@ -4963,6 +5129,8 @@ internal sealed class ProxyConfig
 internal sealed class TelegramConfig
 {
     public string? Proxy { get; init; }
+    public string? ProxyList { get; init; }
+    public bool? AutoProxy { get; init; }
     public List<string> Channels { get; init; } = [];
     public int PostLimit { get; init; } = 20;
     public bool ScreenshotOnNoLinks { get; init; } = true;

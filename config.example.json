@@ -26,6 +26,8 @@
   "sources": [],
   "telegram": {
     "proxy": "",
+    "autoProxy": false,
+    "proxyList": "",
     "channels": [],
     "postLimit": 40,
     "screenshotOnNoLinks": true

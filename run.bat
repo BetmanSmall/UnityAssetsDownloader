@@ -178,16 +178,21 @@ goto after_run
 echo.
 echo Telegram у многих провайдеров заблокирован. Помогает прокси.
 echo Он будет использоваться ТОЛЬКО для Telegram, Unity пойдёт напрямую.
-echo.
-echo Примеры записи:
-echo   socks5://127.0.0.1:1080
-echo   http://127.0.0.1:8080
+echo Через прокси проходят лишь открытые страницы каналов - ни входа, ни паролей.
 echo.
 echo Сейчас задан: %TGPROXY_MODE%
 echo.
+echo   A = автоподбор. Программа сама скачает список бесплатных прокси,
+echo       найдёт рабочий и запомнит его. Занимает 1-3 минуты в первый раз.
+echo   свой адрес, например socks5://127.0.0.1:1080
+echo   Enter = убрать прокси, ходить напрямую
+echo.
 set "tgproxy="
-set /p "tgproxy=Адрес прокси [Enter = убрать прокси]: "
-if defined tgproxy (
+set /p "tgproxy=Ваш выбор: "
+if /i "%tgproxy%"=="A" (
+    set "TGPROXY_ARG=--tg-auto-proxy"
+    set "TGPROXY_MODE=автоподбор из общего списка"
+) else if defined tgproxy (
     set "TGPROXY_ARG=--tg-proxy "%tgproxy%""
     set "TGPROXY_MODE=%tgproxy%"
 ) else (
