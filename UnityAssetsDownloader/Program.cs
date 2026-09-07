@@ -82,6 +82,8 @@ internal sealed class UnityAssetAutomationApp
     private string? _unityPassword;
     private bool? _savePasswordAnswer;
     private bool _credentialsAsked;
+    private bool _googleWarningShown;
+    private string? _lastWaitMessage;
 
     private bool HasCredentials =>
         !string.IsNullOrWhiteSpace(_unityEmail) && !string.IsNullOrWhiteSpace(_unityPassword);
@@ -244,6 +246,12 @@ internal sealed class UnityAssetAutomationApp
 
             // В контейнерах Linux (Flatpak, Docker, Steam Deck) песочница Chrome недоступна,
             // и браузер просто не стартует. На Windows и macOS это не нужно и не добавляется.
+            if (_options.UseSystemChromeProfile)
+            {
+                // Без явного указания Chrome может открыть чужой профиль внутри общей папки.
+                browserArgs.Add("--profile-directory=Default");
+            }
+
             if (OperatingSystem.IsLinux())
             {
                 browserArgs.Add("--no-sandbox");
@@ -320,13 +328,28 @@ internal sealed class UnityAssetAutomationApp
             var authenticated = await EnsureAuthenticatedAsync(page);
             if (!authenticated)
             {
-                _logger.Error("Не удалось подтвердить авторизацию. Завершение.");
+                _logger.Error("============================================================");
+                _logger.Error(" НЕ ПОЛУЧИЛОСЬ ВОЙТИ");
+                _logger.Error($" Профиль: {_profileName}");
+                _logger.Error(" Что делать написано выше. Обычно помогает вход по email и паролю.");
+                _logger.Error("============================================================");
                 return;
             }
 
             if (_options.LoginOnly)
             {
-                _logger.Info("Режим --login завершен: cookies обновлены.");
+                var whoami = await TryReadSignedInUserAsync(page);
+                _logger.Info("============================================================");
+                _logger.Info(" ГОТОВО. ВЫ ВОШЛИ В UNITY.");
+                _logger.Info($" Профиль: {_profileName}");
+                if (!string.IsNullOrWhiteSpace(whoami))
+                {
+                    _logger.Info($" Аккаунт: {whoami}");
+                }
+
+                _logger.Info(" Вход сохранён. В следующий раз программа войдёт сама, без окна браузера.");
+                _logger.Info(" Теперь можно запускать пункты 1-8 в меню.");
+                _logger.Info("============================================================");
                 return;
             }
 
@@ -544,8 +567,27 @@ internal sealed class UnityAssetAutomationApp
         await WaitForDocumentReadySoftAsync(page, TimeSpan.FromSeconds(15));
         await Task.Delay(3000);
 
-        _logger.Info($"Адрес после загрузки: {page.Url}");
+        _logger.Info($"Адрес после загрузки: {ShortUrl(page.Url)}");
         _logger.Info($"Заголовок страницы: {await page.GetTitleAsync()}");
+
+        // Если Unity сразу вернул нас в магазин — значит вход уже выполнен,
+        // формы входа на странице просто нет, и искать её бессмысленно.
+        if (page.Url.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
+        {
+            var user = await TryReadSignedInUserAsync(page);
+            _logger.Info("============================================================");
+            _logger.Info(" ВЫ УЖЕ ВОШЛИ. Unity сразу вернул в магазин, форма входа не нужна.");
+            _logger.Info($" Профиль: {_profileName}");
+            if (!string.IsNullOrWhiteSpace(user))
+            {
+                _logger.Info($" Аккаунт: {user}");
+            }
+
+            _logger.Info(" Можно запускать пункты 1-8 в меню.");
+            _logger.Info("============================================================");
+            await SaveErrorScreenshotAsync(page, "check-login-page");
+            return;
+        }
 
         if (!page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
         {
@@ -659,6 +701,9 @@ internal sealed class UnityAssetAutomationApp
             {
                 _logger.Info($"Используется ваш обычный профиль Chrome: {system}");
                 _logger.Warn("Chrome должен быть полностью закрыт, иначе он не отдаст эту папку.");
+                _logger.Warn(
+                    "Если окно откроется пустым (about:blank) и ничего не произойдёт — значит Chrome всё ещё запущен. " +
+                    "Закройте его через диспетчер задач и повторите, либо вернитесь к своей папке (пункт B).");
                 return system;
             }
 
@@ -1122,6 +1167,52 @@ internal sealed class UnityAssetAutomationApp
                url.Contains("cloud.unity.com/login", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// Обрезает длинный адрес. Ссылки OAuth бывают по две тысячи знаков,
+    /// и в логе от них не остаётся ничего читаемого.
+    /// </summary>
+    private static string ShortUrl(string url)
+    {
+        const int max = 110;
+        return url.Length <= max ? url : url[..max] + $"... (всего {url.Length} знаков)";
+    }
+
+    /// <summary>Пишет сообщение ожидания только когда оно изменилось, чтобы не забивать лог.</summary>
+    private void LogWaitOnce(string message)
+    {
+        if (_lastWaitMessage == message)
+        {
+            return;
+        }
+
+        _lastWaitMessage = message;
+        _logger.Info(message);
+    }
+
+    /// <summary>Пытается прочитать, под каким аккаунтом выполнен вход.</summary>
+    private async Task<string?> TryReadSignedInUserAsync(IPage page)
+    {
+        try
+        {
+            var raw = await page.EvaluateFunctionAsync<string?>(@"async () => {
+                try {
+                    const res = await fetch('https://assetstore.unity.com/api/user/info', { credentials: 'include' });
+                    if (!res.ok) return null;
+                    const data = await res.json();
+                    return data?.user?.email || data?.email || data?.user?.username || null;
+                } catch (e) {
+                    return null;
+                }
+            }");
+
+            return string.IsNullOrWhiteSpace(raw) ? null : raw;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     /// <summary>Сколько кругов переадресации OAuth терпим, прежде чем уйти в магазин самим.</summary>
     private const int MaxOauthSpins = 4;
 
@@ -1158,7 +1249,7 @@ internal sealed class UnityAssetAutomationApp
                 {
                     // В режиме ручного входа не пытаемся агрессивно кликать по меню каждую секунду,
                     // так как это мешает пользователю. Просто ждем, пока он сам войдет.
-                    _logger.Debug("Ожидание авторизации пользователем...");
+                    LogWaitOnce("Ожидание авторизации пользователем...");
                 }
             }
             else
@@ -1187,9 +1278,31 @@ internal sealed class UnityAssetAutomationApp
                         oauthSpins = 0;
                     }
                 }
+                else if (page.Url.Contains("accounts.google.com", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Google намеренно не пускает вход в браузере, которым управляет программа.
+                    // Это его защита, и обходить её не нужно — есть рабочий путь через пароль Unity.
+                    if (!_googleWarningShown)
+                    {
+                        _googleWarningShown = true;
+                        _logger.Warn("============================================================");
+                        _logger.Warn(" ОТКРЫТ ВХОД ЧЕРЕЗ GOOGLE");
+                        _logger.Warn(" Google не разрешает входить в браузере под управлением программы.");
+                        _logger.Warn(" Это его защита от автоматизации, она не обходится.");
+                        _logger.Warn("");
+                        _logger.Warn(" ЧТО ДЕЛАТЬ: задайте своему Unity ID обычный пароль.");
+                        _logger.Warn(" 1. Откройте https://id.unity.com в обычном браузере");
+                        _logger.Warn(" 2. Войдите через Google, зайдите в настройки безопасности");
+                        _logger.Warn(" 3. Задайте пароль (или воспользуйтесь 'Забыли пароль?')");
+                        _logger.Warn(" 4. Вернитесь сюда и входите по email и паролю — это работает");
+                        _logger.Warn("");
+                        _logger.Warn(" Либо нажмите в окне браузера 'Назад' и войдите по паролю Unity.");
+                        _logger.Warn("============================================================");
+                    }
+                }
                 else
                 {
-                    _logger.Debug($"AuthWait: промежуточный или сторонний URL '{page.Url}'. Ожидаем завершения входа...");
+                    LogWaitOnce($"AuthWait: ждём завершения входа на стороннем сайте: {ShortUrl(page.Url)}");
                 }
             }
             await Task.Delay(1500);
@@ -4366,12 +4479,21 @@ internal sealed class CliOptions
         // Профиль решается до всего остального: от него зависит, где лежит сессия
         // и какие учётные данные брать из Диспетчера учётных данных Windows.
         var profileStore = new ProfileStore(dataDirectory);
-        var profileName = cliSetDefaultProfile ?? profileStore.ResolveProfileName(cliProfile, config?.Profile);
+        var rawProfileName = cliSetDefaultProfile ?? profileStore.ResolveProfileName(cliProfile, config?.Profile);
+
+        // Имя профиля становится именем папки. Приводим его сразу, иначе в логе
+        // видно одно имя, а на диске лежит другое — и непонятно, куда всё делось.
+        var profileName = ProfileStore.Sanitize(rawProfileName);
+        if (!string.Equals(profileName, rawProfileName, StringComparison.Ordinal))
+        {
+            Console.WriteLine($"[Профиль] Имя '{rawProfileName}' содержит символы, которых не может быть в имени папки.");
+            Console.WriteLine($"[Профиль] Используется имя: {profileName}");
+        }
 
         if (!string.IsNullOrWhiteSpace(cliSetDefaultProfile))
         {
-            profileStore.SetDefault(cliSetDefaultProfile.Trim());
-            Console.WriteLine($"Профиль по умолчанию: {cliSetDefaultProfile.Trim()}");
+            profileStore.SetDefault(profileName);
+            Console.WriteLine($"Профиль по умолчанию: {profileName}");
         }
 
         // Если логин и пароль не заданы явно, пробуем взять их из хранилища ОС.

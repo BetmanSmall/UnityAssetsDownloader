@@ -128,7 +128,11 @@ goto after_run
 :run_login
 echo.
 echo Запуск: только логин и сохранение cookies.
-echo Откроется окно браузера. Войдите в аккаунт Unity и дождитесь закрытия.
+echo Откроется окно браузера. Войдите в аккаунт Unity и дождитесь подтверждения.
+echo.
+echo ВАЖНО: вход через Google в этом окне не сработает - Google не пускает
+echo браузеры под управлением программ. Входите по email и паролю Unity.
+echo Нет пароля? Задайте его на https://id.unity.com (Забыли пароль^).
 dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --login --headless false
 goto after_run
 

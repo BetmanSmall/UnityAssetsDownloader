@@ -52,8 +52,14 @@ internal sealed class ProfileStore
             return "default";
         }
 
-        var invalid = Path.GetInvalidFileNameChars();
-        var safe = new string(trimmed.Select(c => invalid.Contains(c) || c == ' ' ? '_' : c).ToArray());
+        // Список специально жёстче, чем требует Linux: имя профиля должно получаться
+        // одинаковым на всех компьютерах, а Windows запрещает больше символов.
+        const string invalid = "<>:\"/\\|?*";
+        var safe = new string(trimmed
+            .Select(c => invalid.Contains(c) || c == ' ' || char.IsControl(c) ? '_' : c)
+            .ToArray())
+            .Trim('_', '.');
+
         return safe.Length == 0 ? "default" : safe;
     }
 
