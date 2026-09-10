@@ -7,9 +7,12 @@
   "dryRun": false,
   "headless": false,
   "splitScreen": true,
+  "useSystemChromeProfile": false,
+  "chromeUserDataDir": "",
   "verbose": false,
   "traceNetwork": false,
   "extendedSources": false,
+  "noDefaults": false,
   "extraSourceFiles": [
     "extra_asset_urls.example.txt"
   ],
