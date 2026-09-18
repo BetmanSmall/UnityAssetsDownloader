@@ -89,6 +89,7 @@ internal sealed class UnityAssetAutomationApp
     private string? _unityAccount;
     private OwnedAssetsCache? _ownedCache;
     private OwnedAssetsCache? _deprecatedCache;
+    private OwnedAssetsCache? _rejectedPromoCache;
 
     private bool HasCredentials =>
         !string.IsNullOrWhiteSpace(_unityEmail) && !string.IsNullOrWhiteSpace(_unityPassword);
@@ -458,8 +459,13 @@ internal sealed class UnityAssetAutomationApp
             var deprecatedCache = new OwnedAssetsCache(
                 profileDirectory, "deprecated_assets.txt", "Ассеты, удалённые издателем из магазина.");
 
+            var rejectedPromoCache = new OwnedAssetsCache(
+                profileDirectory, "rejected_promocodes.txt",
+                "Промокоды, которые магазин уже не принял: адрес ассета и код через пробел.");
+
             _ownedCache = ownedCache;
             _deprecatedCache = deprecatedCache;
+            _rejectedPromoCache = rejectedPromoCache;
             var skippedKnown = 0;
             var skippedDeprecated = 0;
 
@@ -527,6 +533,14 @@ internal sealed class UnityAssetAutomationApp
                 _logger.Info($"[{index}/{assetUrls.Count}] {assetUrl}");
 
                 assetPromocodes.TryGetValue(assetUrl, out var promoCode);
+                if (promoCode != null && !_options.RecheckOwned &&
+                    rejectedPromoCache.Contains(PromoCacheKey(assetUrl, promoCode)))
+                {
+                    // Истёкший код заново не оживёт, а проверка стоит почти минуту.
+                    _logger.Info($"[Промокод] Код '{promoCode}' для этого ассета магазин уже не принял раньше. Не пробуем.");
+                    promoCode = null;
+                }
+
                 var result = await ProcessAssetAsync(page, assetUrl, promoCode);
                 report.Items.Add(result);
 
@@ -538,13 +552,16 @@ internal sealed class UnityAssetAutomationApp
                 {
                     deprecatedCache.Add(assetUrl);
                 }
+                else if (result.Status == AssetProcessStatus.PromoNotApplied && promoCode != null)
+                {
+                    rejectedPromoCache.Add(PromoCacheKey(assetUrl, promoCode));
+                }
 
                 // Сохраняем по ходу дела, а не только в конце: проход по сотням ассетов
                 // занимает много минут, и обрыв не должен стирать уже узнанное.
                 if (index % 10 == 0)
                 {
-                    ownedCache.Save();
-                    deprecatedCache.Save();
+                    SaveCaches();
                 }
 
                 // В лимит попадают только фактически добавленные ассеты.
@@ -572,8 +589,7 @@ internal sealed class UnityAssetAutomationApp
                 await Task.Delay(TimeSpan.FromMilliseconds(_options.DelayMs));
             }
 
-            ownedCache.Save();
-            deprecatedCache.Save();
+            SaveCaches();
 
             if (skippedKnown + skippedDeprecated > 0)
             {
@@ -1383,11 +1399,15 @@ internal sealed class UnityAssetAutomationApp
         ex.Message.Contains("Target closed", StringComparison.OrdinalIgnoreCase) ||
         ex.Message.Contains("Session closed", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>Запись в памяти отвергнутых промокодов: адрес ассета и код через пробел.</summary>
+    private static string PromoCacheKey(string assetUrl, string promoCode) => $"{assetUrl} {promoCode}";
+
     /// <summary>Сохраняет память профиля. Вызывать можно сколько угодно раз.</summary>
     private void SaveCaches()
     {
         _ownedCache?.Save();
         _deprecatedCache?.Save();
+        _rejectedPromoCache?.Save();
     }
 
     /// <summary>Пользователь нажал Ctrl+C — успеваем записать память профиля.</summary>
@@ -3567,7 +3587,7 @@ internal sealed class UnityAssetAutomationApp
                     if (promoCode != null)
                     {
                         _logger.Info($"[Промокод] Ассет платный, но найден промокод '{promoCode}'. Запуск процесса чекаута...");
-                        return await ProcessPromoAssetAsync(page, assetUrl, promoCode, result);
+                        return await TryPromoCheckoutAsync(page, assetUrl, promoCode, result);
                     }
 
                     _logger.Info($"[Пропуск] Ассет является платным: {assetUrl} (Сигналы: {status.DetectionSummary})");
@@ -3599,6 +3619,14 @@ internal sealed class UnityAssetAutomationApp
                         result.Status = AssetProcessStatus.AlreadyOwned;
                         return result;
                     }
+                }
+
+                if (!status.HasAddToMyAssets && promoCode != null)
+                {
+                    // Кнопки бесплатного добавления нет, зато в Telegram к ассету дали промокод.
+                    // Признаки цены на странице бывают обманчивы, поэтому пробуем код.
+                    _logger.Info($"[Промокод] Бесплатно добавить нельзя, но есть промокод '{promoCode}'. Запуск процесса чекаута...");
+                    return await TryPromoCheckoutAsync(page, assetUrl, promoCode, result);
                 }
 
                 if (!status.HasAddToMyAssets)
@@ -3689,73 +3717,130 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
+    /// <summary>Выкуп по промокоду. В проверочном запуске (dry-run) ничего не покупаем.</summary>
+    private async Task<ProcessResult> TryPromoCheckoutAsync(IPage page, string assetUrl, string promoCode, ProcessResult result)
+    {
+        if (_options.DryRun)
+        {
+            _logger.Info($"[Имитация] Есть промокод '{promoCode}'. В настоящем запуске программа попробовала бы его: {assetUrl}");
+            result.Status = AssetProcessStatus.PaidSkipped;
+            result.Message = $"Проверочный запуск: промокод '{promoCode}' не проверялся.";
+            return result;
+        }
+
+        return await ProcessPromoAssetAsync(page, assetUrl, promoCode, result);
+    }
+
     private async Task<ProcessResult> ProcessPromoAssetAsync(IPage page, string assetUrl, string promoCode, ProcessResult result)
     {
         var sanitizedId = SanitizeFileName(assetUrl.Split('/').Last());
         var totalSw = Stopwatch.StartNew();
         _logger.Info($"[Промокод] ===== НАЧАЛО выкупа по промокоду '{promoCode}' | ассет: {assetUrl} =====");
 
+        // По номеру ассета отличаем его от остального содержимого корзины.
+        var packageId = ExtractPackageId(page.Url) ?? ExtractPackageId(assetUrl);
+        if (packageId is null)
+        {
+            result.Status = AssetProcessStatus.Failed;
+            result.Message = "Не удалось узнать номер ассета из адреса, а без него его не отличить от других в корзине.";
+            _logger.Warn($"[Промокод] {result.Message}");
+            return result;
+        }
+
         try
         {
-            // 1. Нажимаем кнопку "Add to Cart" или "Buy Now"
+            // 1. Кладём ассет в корзину. Только кнопкой «Add to Cart»: «Buy Now» на странице
+            // ассета — это Express Purchase, он списывает деньги с привязанной карты
+            // сразу, без шага с промокодом.
             var stepSw = Stopwatch.StartNew();
-            _logger.Info($"[Промокод][Шаг 1] Попытка нажать 'Add to Cart' / 'Buy Now' | URL: {page.Url}");
+            _logger.Info($"[Промокод][Шаг 1] Кладём ассет #{packageId} в корзину (кнопка 'Add to Cart') | URL: {page.Url}");
             await LogAllButtonsAsync(page, "Шаг 1 - кнопки до клика");
-            var clicked = await TryClickAddToCartOrBuyNowButtonAsync(page);
-            _logger.Info($"[Промокод][Шаг 1] clicked={clicked} | {stepSw.ElapsedMilliseconds}мс");
-            if (!clicked)
+            var addState = await TryClickAddToCartOnlyAsync(page);
+            _logger.Info($"[Промокод][Шаг 1] результат: {addState} | {stepSw.ElapsedMilliseconds}мс");
+
+            if (addState == "none")
             {
                 result.Status = AssetProcessStatus.Failed;
-                result.Message = "Не удалось нажать кнопку Add to Cart или Buy Now на странице ассета.";
+                result.Message = "На странице ассета нет кнопки 'Add to Cart'.";
                 _logger.Warn($"[Ошибка][Шаг 1] {result.Message}");
                 await SaveErrorScreenshotAsync(page, $"promo_failed_click_{sanitizedId}");
                 await SaveHtmlDumpAsync(page, $"promo_dump_step1_no_btn_{sanitizedId}");
                 return result;
             }
 
-            await Task.Delay(3000);
-            _logger.Debug($"[Промокод][Шаг 1] URL после клика: {page.Url}");
-            await SaveErrorScreenshotAsync(page, $"promo_added_to_cart_{sanitizedId}");
-
-            // 2. Ожидаем автоматического перехода в корзину или чекаут
-            stepSw.Restart();
-            _logger.Info($"[Промокод][Шаг 2] Ожидание редиректа в корзину/чекаут...");
-            var redirected = false;
-            for (var i = 0; i < 8; i++)
+            if (addState == "clicked")
             {
-                _logger.Debug($"[Промокод][Шаг 2] Проверка URL [{i+1}/15]: {page.Url}");
-                if (page.Url.Contains("pay.unity.com", StringComparison.OrdinalIgnoreCase) ||
-                    page.Url.Contains("/cart", StringComparison.OrdinalIgnoreCase) ||
-                    page.Url.Contains("/checkout", StringComparison.OrdinalIgnoreCase))
-                {
-                    redirected = true;
-                    _logger.Info($"[Промокод][Шаг 2] Автоматический переход зафиксирован: {page.Url} | {stepSw.ElapsedMilliseconds}мс");
-                    break;
-                }
-                await Task.Delay(1000);
+                var added = await WaitForAddedToCartAsync(page, TimeSpan.FromSeconds(12));
+                _logger.Info(added
+                    ? $"[Промокод][Шаг 1] Магазин подтвердил: ассет в корзине | {stepSw.ElapsedMilliseconds}мс"
+                    : $"[Промокод][Шаг 1] Подтверждения не видно, проверим по самой корзине | {stepSw.ElapsedMilliseconds}мс");
+            }
+            else
+            {
+                _logger.Info("[Промокод][Шаг 1] Ассет уже лежал в корзине, второй раз не добавляем.");
             }
 
-            if (!redirected)
+            // 2. Открываем корзину и убираем из неё всё, кроме этого ассета.
+            // Иначе в заказ попадут и другие ассеты, а промокод действует только на один.
+            stepSw.Restart();
+            _logger.Info($"[Промокод][Шаг 2] Открываем корзину {CartUrl} и оставляем в ней только ассет #{packageId}");
+            var cart = await RemoveCartItemsAsync(page, keepPackageId: packageId);
+
+            if (cart is null || !cart.Items.Any(i => i.Id == packageId))
             {
-                _logger.Info($"[Промокод][Шаг 2] Авторедирект не произошёл за 8с. Принудительный переход на /cart | URL сейчас: {page.Url}");
-                await SafeGoToAsync(page, "https://assetstore.unity.com/cart");
-                await Task.Delay(3000);
-                _logger.Debug($"[Промокод][Шаг 2] URL после принудительного перехода: {page.Url}");
+                result.Status = AssetProcessStatus.Failed;
+                result.Message = cart is null
+                    ? "Корзина не открылась."
+                    : "Ассет не попал в корзину: кнопка нажата, но в корзине его нет.";
+                _logger.Warn($"[Ошибка][Шаг 2] {result.Message} | URL: {page.Url}");
+                await LogAllButtonsAsync(page, "Шаг 2 - кнопки корзины");
+                await SaveErrorScreenshotAsync(page, $"promo_failed_cart_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step2_cart_{sanitizedId}");
+                return result;
+            }
+
+            if (cart.Items.Count != 1)
+            {
+                result.Status = AssetProcessStatus.Failed;
+                result.Message =
+                    $"Из корзины не удалось убрать другие ассеты (осталось {cart.Items.Count}). " +
+                    "Оформлять заказ с ними нельзя: промокод относится только к одному ассету.";
+                _logger.Warn($"[Ошибка][Шаг 2] {result.Message}");
+                await SaveErrorScreenshotAsync(page, $"promo_failed_cart_cleanup_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step2_cleanup_{sanitizedId}");
+                await ClearCartAsync(page);
+                return result;
+            }
+
+            _logger.Info($"[Промокод][Шаг 2] В корзине только нужный ассет: {cart.Items[0].Describe()} | {stepSw.ElapsedMilliseconds}мс");
+
+            // 3. Оформление заказа из корзины: магазин сам переводит на pay.unity.com.
+            stepSw.Restart();
+            _logger.Info("[Промокод][Шаг 3] Нажимаем 'Checkout' в корзине и ждём страницу оплаты pay.unity.com");
+            var onPayPage = await ProceedToCheckoutFromCartAsync(page, TimeSpan.FromSeconds(45));
+            _logger.Info($"[Промокод][Шаг 3] страница оплаты открылась={onPayPage} | {stepSw.ElapsedMilliseconds}мс | URL: {page.Url}");
+
+            if (!onPayPage)
+            {
+                result.Status = AssetProcessStatus.Failed;
+                result.Message = "После нажатия 'Checkout' страница оплаты pay.unity.com не открылась.";
+                _logger.Warn($"[Ошибка][Шаг 3] {result.Message}");
+                await LogAllButtonsAsync(page, "Шаг 3 - кнопки");
+                await SaveErrorScreenshotAsync(page, $"promo_failed_checkout_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step3_checkout_{sanitizedId}");
+                await ClearCartAsync(page);
+                return result;
             }
 
             await SaveErrorScreenshotAsync(page, $"promo_pay_page_{sanitizedId}");
 
-            // 3. Ожидание полей ввода
-            stepSw.Restart();
-            _logger.Info($"[Промокод][Шаг 3] Ожидание элементов страницы корзины (poле промо / кнопка оплаты) | URL: {page.Url}");
-            var elementsReady = await WaitForCartPageElementsAsync(page, TimeSpan.FromSeconds(15));
+            var elementsReady = await WaitForCartPageElementsAsync(page, TimeSpan.FromSeconds(20));
             _logger.Info($"[Промокод][Шаг 3] elementsReady={elementsReady} | {stepSw.ElapsedMilliseconds}мс");
             if (!elementsReady)
             {
                 result.Status = AssetProcessStatus.Failed;
                 result.Message =
-                    "Страница оформления заказа не открылась: нет ни поля промокода, ни кнопки оплаты. " +
-                    "Обычно это значит, что корзина пуста — ассет в неё не попал.";
+                    "Страница оформления заказа открылась, но на ней нет ни поля промокода, ни кнопки оплаты.";
                 _logger.Warn("============================================================");
                 _logger.Warn(" ПРОМОКОД ПРИМЕНИТЬ НЕ УДАЛОСЬ");
                 _logger.Warn($" {result.Message}");
@@ -3911,46 +3996,12 @@ internal sealed class UnityAssetAutomationApp
             }
 
             // 5. Вводим промокод и нажимаем Apply
-            _logger.Info($"[Промокод] Ввод промокода '{promoCode}'...");
             stepSw.Restart();
-            _logger.Info($"[Промокод][Шаг 5] Поиск поля ввода промокода и ввод '{promoCode}' | URL: {page.Url}");
+            var priceBefore = await ReadCartPriceAsync(page);
+            _logger.Info($"[Промокод][Шаг 5] Стоимость до промокода: {priceBefore.Describe()}");
+            _logger.Info($"[Промокод][Шаг 5] Ввод промокода '{promoCode}' | URL: {page.Url}");
             await LogAllInputFieldsAsync(page, "Шаг 5 - все input перед вводом кода");
-            var promoEntered = await page.EvaluateFunctionAsync<bool>(@"async (code) => {
-                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                const visible = (el) => {
-                    if (!el) return false;
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-                };
-
-                const inputs = Array.from(document.querySelectorAll('input'));
-                const promoInput = inputs.find(el => {
-                    if (!visible(el)) return false;
-                    const placeholder = normalize(el.placeholder || '');
-                    const name = normalize(el.name || '');
-                    const id = normalize(el.id || '');
-                    
-                    const isAddressField = 
-                        name.includes('postal') || name.includes('zip') || name.includes('address') || name.includes('phone') || name.includes('city') || name.includes('state') || name.includes('country') || name.includes('company') || name.includes('name') || name.includes('email') ||
-                        id.includes('postal') || id.includes('zip') || id.includes('address') || id.includes('phone') || id.includes('city') || id.includes('state') || id.includes('country') || id.includes('company') || id.includes('name') || id.includes('email') ||
-                        placeholder.includes('zip') || placeholder.includes('postal') || placeholder.includes('address') || placeholder.includes('phone') || placeholder.includes('city') || placeholder.includes('state') || placeholder.includes('country') || placeholder.includes('email');
-
-                    if (isAddressField) return false;
-
-                    return placeholder.includes('coupon') || placeholder.includes('promo') || placeholder.includes('code') || placeholder.includes('credit') ||
-                           placeholder.includes('купон') || placeholder.includes('промо') || placeholder.includes('код') || placeholder.includes('скидк') ||
-                           name.includes('coupon') || name.includes('promo') || name.includes('code') ||
-                           id.includes('coupon') || id.includes('promo') || id.includes('code');
-                });
-
-                if (!promoInput) return false;
-
-                promoInput.value = code;
-                promoInput.dispatchEvent(new Event('input', { bubbles: true }));
-                promoInput.dispatchEvent(new Event('change', { bubbles: true }));
-                return true;
-            }", promoCode);
+            var promoEntered = await TryFillPromoCodeAsync(page, promoCode);
 
             _logger.Info($"[Промокод][Шаг 5] promoEntered={promoEntered} | {stepSw.ElapsedMilliseconds}мс");
             if (!promoEntered)
@@ -3967,65 +4018,25 @@ internal sealed class UnityAssetAutomationApp
                 return result;
             }
 
-            var applyClicked = await page.EvaluateFunctionAsync<bool>(@"() => {
-                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                const visible = (el) => {
-                    if (!el) return false;
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-                };
-
-                const buttons = Array.from(document.querySelectorAll('button, a, [role=""button""]')).filter(visible);
-                let applyBtn = buttons.find(el => {
-                    const txt = normalize(el.innerText || '');
-                    return txt === 'apply' || txt === 'redeem' || txt === 'submit' || txt.includes('apply') || txt.includes('применить') || txt.includes('ввести');
-                });
-
-                if (!applyBtn) {
-                    const inputs = Array.from(document.querySelectorAll('input'));
-                    const promoInput = inputs.find(el => {
-                        const placeholder = normalize(el.placeholder || '');
-                        const name = normalize(el.name || '');
-                        const id = normalize(el.id || '');
-                        
-                        const isAddressField = 
-                            name.includes('postal') || name.includes('zip') || name.includes('address') || name.includes('phone') || name.includes('city') || name.includes('state') || name.includes('country') || name.includes('company') || name.includes('name') || name.includes('email') ||
-                            id.includes('postal') || id.includes('zip') || id.includes('address') || id.includes('phone') || id.includes('city') || id.includes('state') || id.includes('country') || id.includes('company') || id.includes('name') || id.includes('email') ||
-                            placeholder.includes('zip') || placeholder.includes('postal') || placeholder.includes('address') || placeholder.includes('phone') || placeholder.includes('city') || placeholder.includes('state') || placeholder.includes('country') || placeholder.includes('email');
-
-                        if (isAddressField) return false;
-
-                        return placeholder.includes('coupon') || placeholder.includes('promo') || placeholder.includes('code') || placeholder.includes('купон') || placeholder.includes('промо') || placeholder.includes('код') ||
-                               name.includes('coupon') || name.includes('promo') || name.includes('code') ||
-                               id.includes('coupon') || id.includes('promo') || id.includes('code');
-                    });
-                    if (promoInput) {
-                        let parent = promoInput.parentElement;
-                        while (parent && parent !== document.body) {
-                            const btnInParent = Array.from(parent.querySelectorAll('button, a, [role=""button""]')).filter(visible)[0];
-                            if (btnInParent) {
-                                applyBtn = btnInParent;
-                                break;
-                            }
-                            parent = parent.parentElement;
-                        }
-                    }
-                }
-
-                if (!applyBtn) return false;
-                applyBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                return true;
-            }");
-
             // 5.5 - Apply button
             stepSw.Restart();
-            var priceBefore = await ReadCartPriceAsync(page);
             _logger.Info($"[Промокод][Шаг 5.5] Нажатие кнопки Apply/Redeem | URL: {page.Url}");
-            if (!applyClicked)
+            var applyState = await TryClickPromoApplyAsync(page);
+            if (applyState == "disabled")
+            {
+                // Кнопка не ожила — значит, форма не заметила введённый текст. Вписываем код
+                // ещё раз напрямую и пробуем снова.
+                await ForcePromoInputValueAsync(page, promoCode);
+                await Task.Delay(700);
+                applyState = await TryClickPromoApplyAsync(page);
+            }
+
+            if (applyState != "clicked")
             {
                 result.Status = AssetProcessStatus.Failed;
-                result.Message = "Не найдена кнопка Apply для промокода.";
+                result.Message = applyState == "disabled"
+                    ? "Кнопка Apply для промокода не нажимается."
+                    : "Не найдена кнопка Apply для промокода.";
                 _logger.Warn($"[Ошибка][Шаг 5.5] {result.Message} | URL: {page.Url}");
                 await LogAllButtonsAsync(page, "Шаг 5.5 - кнопки при ошибке Apply");
                 await SaveErrorScreenshotAsync(page, $"promo_failed_apply_{sanitizedId}");
@@ -4034,18 +4045,15 @@ internal sealed class UnityAssetAutomationApp
                 return result;
             }
 
-            _logger.Info($"[Промокод][Шаг 5.5] Кнопка Apply нажата | {stepSw.ElapsedMilliseconds}мс. Ожидание обновления стоимости (4с)...");
-            await Task.Delay(4000);
-            _logger.Info($"[Промокод] Стоимость до промокода: {priceBefore.Describe()}");
-            _logger.Debug($"[Промокод][Шаг 5.5] URL после Apply: {page.Url}");
-
-            await SaveErrorScreenshotAsync(page, $"promo_coupon_applied_{sanitizedId}");
+            _logger.Info($"[Промокод][Шаг 5.5] Кнопка Apply нажата | {stepSw.ElapsedMilliseconds}мс. Ждём ответа магазина (до 20с)...");
 
             // 6. Промокод сработал только если итоговая цена стала ровно нулём.
-            // Сравнение с ценой до применения — единственный надёжный признак.
+            // Ждём, пока страница либо обнулит цену, либо скажет, что код не подходит.
             stepSw.Restart();
-            var priceAfter = await ReadCartPriceAsync(page);
-            _logger.Info($"[Промокод] Стоимость после промокода: {priceAfter.Describe()}");
+            var priceAfter = await WaitForPromoOutcomeAsync(page, priceBefore, TimeSpan.FromSeconds(20));
+            _logger.Info($"[Промокод] Стоимость после промокода: {priceAfter.Describe()} | {stepSw.ElapsedMilliseconds}мс");
+            _logger.Debug($"[Промокод][Шаг 6] URL после Apply: {page.Url}");
+            await SaveErrorScreenshotAsync(page, $"promo_coupon_applied_{sanitizedId}");
 
             if (priceAfter.HasPromoError)
             {
@@ -4055,7 +4063,7 @@ internal sealed class UnityAssetAutomationApp
                 _logger.Warn("============================================================");
                 _logger.Warn(" ПРОМОКОД НЕ СРАБОТАЛ");
                 _logger.Warn($" {result.Message}");
-                _logger.Warn(" Ассет пропущен, покупка отменена, деньги не списаны.");
+                _logger.Warn(" Ассет пропущен и убран из корзины, деньги не списаны.");
                 _logger.Warn("============================================================");
                 await SaveErrorScreenshotAsync(page, $"promo_failed_error_{sanitizedId}");
                 await ClearCartAsync(page);
@@ -4083,14 +4091,14 @@ internal sealed class UnityAssetAutomationApp
                     $"Промокод введён, но цена осталась {priceAfter.Describe()}. Скидка не применилась.";
                 _logger.Warn("============================================================");
                 _logger.Warn(" ПРОМОКОД НЕ СРАБОТАЛ");
-                _logger.Warn($" Цена не изменилась: {priceAfter.Describe()}");
+                _logger.Warn($" Цена не обнулилась: {priceAfter.Describe()}");
                 if (priceBefore.Found)
                 {
                     _logger.Warn($" Было до промокода: {priceBefore.Describe()}");
                 }
 
                 _logger.Warn(" Скорее всего раздача уже закончилась.");
-                _logger.Warn(" Ассет пропущен, покупка отменена, деньги не списаны.");
+                _logger.Warn(" Ассет пропущен и убран из корзины, деньги не списаны.");
                 _logger.Warn("============================================================");
                 await SaveErrorScreenshotAsync(page, $"promo_price_not_zero_{sanitizedId}");
                 await ClearCartAsync(page);
@@ -4167,6 +4175,19 @@ internal sealed class UnityAssetAutomationApp
                 _logger.Warn($"[Промокод][Шаг 7] EULA-чекбокс не обнаружен (возможно, не требуется) | URL: {page.Url}");
             }
 
+            // Последняя проверка перед оплатой: после EULA и налогового вопроса сумма могла пересчитаться.
+            var priceBeforePay = await ReadCartPriceAsync(page);
+            if (!priceBeforePay.Found || priceBeforePay.Amount != 0)
+            {
+                result.Status = AssetProcessStatus.Failed;
+                result.Message = $"Перед оплатой сумма уже не ноль ({priceBeforePay.Describe()}). Оплату не нажимаем.";
+                _logger.Warn($"[Ошибка][Шаг 8] {result.Message}");
+                await SaveErrorScreenshotAsync(page, $"promo_price_changed_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step8_price_changed_{sanitizedId}");
+                await ClearCartAsync(page);
+                return result;
+            }
+
             // 8. Кликаем кнопку оформления заказа ("Pay Now", "Complete Purchase", "Place Order")
             _logger.Info("[Промокод] Нажатие на кнопку оформления заказа (Pay Now / Place Order)...");
             stepSw.Restart();
@@ -4227,6 +4248,19 @@ internal sealed class UnityAssetAutomationApp
                 return text.includes('thank you') || text.includes('success') || text.includes('order completed') || text.includes('успешно') || text.includes('спасибо за покупку') || window.location.href.includes('success');
             }");
 
+            if (!successState && !page.Url.Contains("success", StringComparison.OrdinalIgnoreCase))
+            {
+                // Страницу благодарности могли не узнать. Надёжнее спросить сам магазин:
+                // если на странице ассета теперь «Open in Unity», он уже наш.
+                _logger.Info("[Промокод][Шаг 9] Страница благодарности не распознана. Проверяем страницу ассета...");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step9_unknown_{sanitizedId}");
+                await SafeGoToAsync(page, assetUrl);
+                await WaitForAssetSignalsAsync(page, TimeSpan.FromSeconds(20));
+                var ownedNow = await DetectStatusAsync(page);
+                successState = ownedNow.IsOwned || ownedNow.HasOpenInUnity;
+                _logger.Debug($"[Промокод][Шаг 9] Статус ассета после оплаты: {ownedNow.DetectionSummary}");
+            }
+
             if (successState || page.Url.Contains("success", StringComparison.OrdinalIgnoreCase))
             {
                 result.Status = AssetProcessStatus.Added;
@@ -4236,9 +4270,8 @@ internal sealed class UnityAssetAutomationApp
             else
             {
                 result.Status = AssetProcessStatus.UnknownAfterClick;
-                _logger.Warn($"[Внимание] Кнопка оформления по промокоду нажата, но переход на страницу успешного завершения не зафиксирован: {page.Url}");
-                _logger.Warn($"[Внимание][Шаг 9] Кнопка Pay нажата, но страница успеха не зафиксирована. Итого: {totalSw.Elapsed.TotalSeconds:F1}с | URL: {page.Url}");
-                await SaveHtmlDumpAsync(page, $"promo_dump_step9_unknown_{sanitizedId}");
+                _logger.Warn($"[Внимание] Кнопка оформления по промокоду нажата, но ассет на аккаунте не появился: {page.Url}");
+                _logger.Warn($"[Внимание][Шаг 9] Кнопка Pay нажата, но успех не подтверждён. Итого: {totalSw.Elapsed.TotalSeconds:F1}с | URL: {page.Url}");
             }
 
             _logger.Info($"[Промокод] ===== КОНЕЦ выкупа по промокоду '{promoCode}' | статус: {result.Status} | {totalSw.Elapsed.TotalSeconds:F1}с =====");
@@ -4257,54 +4290,577 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
+    /// <summary>
+    /// Корзина магазина. Адрес /cart даёт 404 — настоящая корзина лежит в разделе аккаунта.
+    /// </summary>
+    private const string CartUrl = "https://assetstore.unity.com/account/cart";
+
+    /// <summary>Номер ассета из адреса вида /packages/.../name-135722. null, если номера нет.</summary>
+    public static string? ExtractPackageId(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return null;
+        }
+
+        var match = Regex.Match(url, @"/packages/[^?#]*?-(\d+)/?(?:[?#]|$)");
+        return match.Success ? match.Groups[1].Value : null;
+    }
+
+    /// <summary>
+    /// Нажимает «Add to Cart» на странице ассета. «Buy Now» не трогает: это Express Purchase.
+    /// Возвращает "clicked", "in-cart" (ассет уже в корзине, повторно не кладём, чтобы не
+    /// удвоить количество) или "none".
+    /// </summary>
+    private static async Task<string> TryClickAddToCartOnlyAsync(IPage page)
+    {
+        return await page.EvaluateFunctionAsync<string>(@"() => {
+            const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+
+            const clickables = Array.from(document.querySelectorAll('button, a, [role=""button""]')).filter(visible);
+            const textOf = (el) => normalize(el.innerText || el.getAttribute('aria-label') || '');
+
+            const inCart = clickables.some(el => textOf(el).includes('view in cart'));
+            if (inCart) return 'in-cart';
+
+            const isBuy = (t) => t.includes('buy') || t.includes('express') || t.includes('купить');
+            let target = Array.from(document.querySelectorAll('[data-test=""add-to-cart-button""]'))
+                .filter(visible)
+                .find(el => !isBuy(textOf(el)));
+            if (!target) {
+                target = clickables.find(el => {
+                    const t = textOf(el);
+                    return t === 'add to cart' || t === 'добавить в корзину';
+                });
+            }
+            if (!target) {
+                target = clickables.find(el => {
+                    const t = textOf(el);
+                    return t.includes('add to cart') && !isBuy(t) && t.length <= 40;
+                });
+            }
+
+            if (!target) return 'none';
+            target.click();
+            return 'clicked';
+        }");
+    }
+
+    /// <summary>
+    /// Ждёт, пока магазин подтвердит добавление в корзину, и по дороге принимает
+    /// диалоги лицензии/условий, если они появятся.
+    /// </summary>
+    private async Task<bool> WaitForAddedToCartAsync(IPage page, TimeSpan timeout)
+    {
+        var stopAt = DateTime.UtcNow.Add(timeout);
+        while (DateTime.UtcNow < stopAt)
+        {
+            try
+            {
+                if (await TryAcceptAddConfirmationAsync(page))
+                {
+                    _logger.Info("[Промокод][Шаг 1] Принят диалог с условиями перед добавлением в корзину.");
+                }
+
+                var added = await page.EvaluateFunctionAsync<bool>(@"() => {
+                    const text = (document.body ? document.body.innerText : '').replace(/\s+/g, ' ').toLowerCase();
+                    return text.includes('added to your cart') || text.includes('view in cart') ||
+                           text.includes('добавлен в корзину') || text.includes('добавлено в корзину');
+                }");
+
+                if (added)
+                {
+                    return true;
+                }
+            }
+            catch (Exception ex) when (IsTransientPageError(ex))
+            {
+                // Страница перерисовывается после добавления — просто проверяем ещё раз.
+            }
+
+            await Task.Delay(700);
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Читает содержимое корзины на странице /account/cart. Каждой строке ставит метку
+    /// data-uad-remove на её кнопку «Remove», чтобы потом нажать именно её.
+    /// «Отложенные» ассеты (Saved for Later, у них кнопка «Move to Cart») не считаются.
+    /// </summary>
+    private async Task<CartSnapshot> ReadCartAsync(IPage page)
+    {
+        var json = await page.EvaluateFunctionAsync<string>(@"() => {
+            const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+            const packageIdOf = (href) => {
+                const m = (href || '').match(/\/packages\/[^?#]*?-(\d+)\/?(?:[?#]|$)/);
+                return m ? m[1] : null;
+            };
+            const linkIds = (root) => Array.from(new Set(
+                Array.from(root.querySelectorAll('a[href*=""/packages/""]'))
+                    .map(a => packageIdOf(a.getAttribute('href')))
+                    .filter(Boolean)));
+
+            // Кнопка «Remove» — это иконка с подписью. Берём самый глубокий элемент
+            // с этой подписью: клик по нему всплывёт до обработчика кнопки.
+            const isRemoveText = (el) => {
+                const t = normalize(el.innerText);
+                const a = normalize(el.getAttribute('aria-label'));
+                return t === 'remove' || t === 'удалить' || a === 'remove' || a === 'удалить';
+            };
+            const candidates = Array.from(document.querySelectorAll('button, a, [role=""button""], span, div, p'))
+                .filter(visible)
+                .filter(isRemoveText);
+            const innermost = candidates.filter(el => !candidates.some(o => o !== el && el.contains(o)));
+
+            const items = [];
+            const seen = new Set();
+            for (const btn of innermost) {
+                let row = btn.parentElement;
+                let ids = [];
+                while (row && row !== document.body) {
+                    ids = linkIds(row);
+                    if (ids.length > 0) break;
+                    row = row.parentElement;
+                }
+                if (!row || row === document.body || ids.length !== 1) continue;
+
+                const rowText = normalize(row.innerText);
+                if (rowText.includes('move to cart') || rowText.includes('переместить в корзину')) continue;
+
+                const id = ids[0];
+                if (seen.has(id)) continue;
+                seen.add(id);
+
+                const name = Array.from(row.querySelectorAll('a[href*=""/packages/""]'))
+                    .map(a => (a.innerText || '').replace(/\s+/g, ' ').trim())
+                    .find(t => t.length > 0) || '';
+                btn.setAttribute('data-uad-remove', id);
+                items.push({ id, name: name.slice(0, 80) });
+            }
+
+            const body = normalize(document.body ? document.body.innerText : '');
+            const empty = body.includes('your shopping cart is empty') || body.includes('корзина пуста');
+            return JSON.stringify({ empty, items });
+        }");
+
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        var snapshot = new CartSnapshot { Empty = root.GetProperty("empty").GetBoolean() };
+        foreach (var item in root.GetProperty("items").EnumerateArray())
+        {
+            snapshot.Items.Add(new CartItemInfo
+            {
+                Id = item.GetProperty("id").GetString() ?? string.Empty,
+                Name = item.GetProperty("name").GetString() ?? string.Empty
+            });
+        }
+
+        return snapshot;
+    }
+
+    /// <summary>
+    /// Открывает корзину и ждёт, пока она прогрузится: появятся строки ассетов
+    /// или надпись о пустой корзине. null, если корзина так и не показалась.
+    /// </summary>
+    private async Task<CartSnapshot?> OpenCartAsync(IPage page)
+    {
+        await SafeGoToAsync(page, CartUrl);
+
+        var stopAt = DateTime.UtcNow.AddSeconds(25);
+        while (DateTime.UtcNow < stopAt)
+        {
+            try
+            {
+                var cart = await ReadCartAsync(page);
+                if (cart.Items.Count > 0 || cart.Empty)
+                {
+                    // Строки приходят одним ответом сервера, но дорисовываются не мгновенно.
+                    await Task.Delay(1000);
+                    return await ReadCartAsync(page);
+                }
+            }
+            catch (Exception ex) when (IsTransientPageError(ex))
+            {
+            }
+
+            await Task.Delay(700);
+        }
+
+        _logger.Warn($"[Корзина] Корзина не прогрузилась за 25с | URL: {page.Url}");
+        return null;
+    }
+
+    /// <summary>
+    /// Убирает из корзины все ассеты, кроме keepPackageId (null — убирает все).
+    /// Удаляет по одному: пока магазин обрабатывает одно удаление, остальные
+    /// кнопки у него заблокированы, и нажатие на них пропадает.
+    /// Возвращает то, что осталось в корзине, или null, если корзина не открылась.
+    /// </summary>
+    private async Task<CartSnapshot?> RemoveCartItemsAsync(IPage page, string? keepPackageId)
+    {
+        var cart = await OpenCartAsync(page);
+        if (cart is null)
+        {
+            return null;
+        }
+
+        _logger.Info($"[Корзина] Сейчас в корзине: {cart.Items.Count} шт." +
+                     (cart.Items.Count > 0 ? $" ({string.Join("; ", cart.Items.Select(i => i.Describe()))})" : string.Empty));
+
+        for (var attempt = 0; attempt < 30; attempt++)
+        {
+            var victim = cart.Items.FirstOrDefault(i => i.Id != keepPackageId);
+            if (victim is null)
+            {
+                return cart;
+            }
+
+            var clicked = await page.EvaluateFunctionAsync<bool>(@"(id) => {
+                const el = document.querySelector(`[data-uad-remove=""${id}""]`);
+                if (!el) return false;
+                el.click();
+                return true;
+            }", victim.Id);
+
+            if (!clicked)
+            {
+                _logger.Warn($"[Корзина] Не нашли кнопку Remove у {victim.Describe()}");
+                return cart;
+            }
+
+            // Ждём, пока строка исчезнет.
+            var gone = false;
+            var stopAt = DateTime.UtcNow.AddSeconds(12);
+            while (DateTime.UtcNow < stopAt)
+            {
+                await Task.Delay(600);
+                try
+                {
+                    cart = await ReadCartAsync(page);
+                }
+                catch (Exception ex) when (IsTransientPageError(ex))
+                {
+                    continue;
+                }
+
+                if (cart.Items.All(i => i.Id != victim.Id))
+                {
+                    gone = true;
+                    break;
+                }
+            }
+
+            if (!gone)
+            {
+                _logger.Warn($"[Корзина] {victim.Describe()} не убирается из корзины.");
+                return cart;
+            }
+
+            _logger.Info($"[Корзина] Убран из корзины: {victim.Describe()}");
+        }
+
+        return cart;
+    }
+
+    /// <summary>Убирает из корзины всё, что там лежит. Ошибки не пробрасывает.</summary>
     private async Task ClearCartAsync(IPage page)
     {
         try
         {
-            _logger.Info("[Очистка корзины] Переход на https://assetstore.unity.com/cart для очистки...");
-            await SafeGoToAsync(page, "https://assetstore.unity.com/cart");
-            await Task.Delay(3000);
+            _logger.Info($"[Очистка корзины] Открываем {CartUrl} и убираем из неё ассеты...");
+            var cart = await RemoveCartItemsAsync(page, keepPackageId: null);
 
-            var cleared = await page.EvaluateFunctionAsync<bool>(@"() => {
-                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                const visible = (el) => {
-                    if (!el) return false;
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-                };
-
-                const buttons = Array.from(document.querySelectorAll('button, a, [role=""button""]')).filter(visible);
-                const removeButtons = buttons.filter(el => {
-                    const txt = normalize(el.innerText || '');
-                    const label = normalize(el.getAttribute('aria-label') || '');
-                    return txt === 'remove' || txt === 'delete' || txt === 'удалить' || label.includes('remove') || label.includes('delete');
-                });
-
-                if (removeButtons.length === 0) return false;
-
-                for (const btn of removeButtons) {
-                    btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                    if (typeof btn.click === 'function') {
-                        btn.click();
-                    }
-                }
-                return true;
-            }");
-
-            if (cleared)
+            if (cart is null)
             {
-                _logger.Info("[Очистка корзины] Элементы удалены из корзины.");
-                await Task.Delay(2000);
+                _logger.Warn("[Очистка корзины] Корзина не открылась. Проверьте её вручную: " + CartUrl);
+            }
+            else if (cart.Items.Count > 0)
+            {
+                _logger.Warn($"[Очистка корзины] В корзине осталось: {cart.Items.Count}. Проверьте её вручную: {CartUrl}");
             }
             else
             {
-                _logger.Debug("[Очистка корзины] Корзина пуста или кнопки удаления не найдены.");
+                _logger.Info("[Очистка корзины] Корзина пуста.");
             }
         }
         catch (Exception ex)
         {
             _logger.Warn($"[Очистка корзины] Не удалось очистить корзину: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Нажимает «Checkout» на странице корзины и ждёт переход на pay.unity.com.
+    /// По дороге принимает диалог с условиями магазина, если он появится.
+    /// </summary>
+    private async Task<bool> ProceedToCheckoutFromCartAsync(IPage page, TimeSpan timeout)
+    {
+        const string clickCheckoutJs = @"() => {
+            const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+
+            let btn = Array.from(document.querySelectorAll('[data-test=""checkout-button""]')).find(visible);
+            if (!btn) {
+                btn = Array.from(document.querySelectorAll('button, a, [role=""button""]')).filter(visible).find(el => {
+                    const t = normalize(el.innerText);
+                    return t === 'checkout' || t === 'proceed to checkout' || t === 'оформить заказ';
+                });
+            }
+
+            if (!btn) return 'none';
+            if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return 'disabled';
+            btn.click();
+            return 'clicked';
+        }";
+
+        var state = await page.EvaluateFunctionAsync<string>(clickCheckoutJs);
+        if (state == "disabled")
+        {
+            // Кнопка неактивна, если ассет в корзине не отмечен галочкой. Отмечаем.
+            _logger.Info("[Промокод][Шаг 3] Кнопка Checkout неактивна. Отмечаем ассет в корзине галочкой...");
+            await page.EvaluateFunctionAsync(@"() => {
+                for (const cb of document.querySelectorAll('input[type=""checkbox""]')) {
+                    if (!cb.checked) cb.click();
+                }
+            }");
+            await Task.Delay(1000);
+            state = await page.EvaluateFunctionAsync<string>(clickCheckoutJs);
+        }
+
+        _logger.Info($"[Промокод][Шаг 3] кнопка Checkout: {state}");
+        if (state != "clicked")
+        {
+            return false;
+        }
+
+        var stopAt = DateTime.UtcNow.Add(timeout);
+        while (DateTime.UtcNow < stopAt)
+        {
+            if (page.Url.Contains("pay.unity.com", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (page.Url.Contains("assetstore.unity.com/error", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.Warn($"[Промокод][Шаг 3] Магазин показал страницу ошибки: {page.Url}");
+                return false;
+            }
+
+            try
+            {
+                if (await TryAcceptAddConfirmationAsync(page))
+                {
+                    _logger.Info("[Промокод][Шаг 3] Принят диалог с условиями магазина.");
+                }
+            }
+            catch (Exception ex) when (IsTransientPageError(ex))
+            {
+                // Идёт переход на страницу оплаты — это и нужно.
+            }
+
+            await Task.Delay(700);
+        }
+
+        return page.Url.Contains("pay.unity.com", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Находит поле промокода (при нужде раскрывает его ссылкой «Have a promo code?»)
+    /// и вводит код с клавиатуры, как человек. Прямая запись в value React-форма
+    /// не замечает и стирает.
+    /// </summary>
+    private async Task<bool> TryFillPromoCodeAsync(IPage page, string promoCode)
+    {
+        var found = await page.EvaluateFunctionAsync<bool>(@"async () => {
+            const wait = (ms) => new Promise(r => setTimeout(r, ms));
+            const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+
+            const findInput = () => Array.from(document.querySelectorAll('input')).filter(visible).find(el => {
+                const type = normalize(el.type);
+                if (type && type !== 'text' && type !== 'search') return false;
+
+                const placeholder = normalize(el.placeholder);
+                const name = normalize(el.name);
+                const id = normalize(el.id);
+                const aria = normalize(el.getAttribute('aria-label'));
+                const all = [placeholder, name, id, aria].join(' ');
+
+                const isOtherField = ['postal', 'zip', 'address', 'phone', 'city', 'state', 'country', 'company',
+                    'email', 'card', 'cvc', 'expir', 'vat', 'tax'].some(w => all.includes(w)) ||
+                    name.includes('name') || id.includes('name');
+                if (isOtherField) return false;
+
+                return ['coupon', 'promo', 'code', 'voucher', 'discount', 'credit',
+                    'купон', 'промо', 'код', 'скидк'].some(w => all.includes(w));
+            });
+
+            let input = findInput();
+            if (!input) {
+                // Поле часто спрятано за ссылкой вида «Have a promo code?».
+                const isPayLike = (t) => t.includes('pay') || t.includes('order') || t.includes('purchase') ||
+                    t.includes('оплат') || t.includes('заказ') || t.includes('купить');
+                const toggles = Array.from(document.querySelectorAll('button, a, [role=""button""], span, div, p, label'))
+                    .filter(visible)
+                    .filter(el => {
+                        const t = normalize(el.innerText);
+                        return t.length > 0 && t.length <= 60 && !isPayLike(t) &&
+                            (t.includes('promo code') || t.includes('coupon') || t.includes('discount code') ||
+                             t.includes('промокод') || t.includes('купон') || t.includes('код скидки'));
+                    });
+                const innermost = toggles.filter(el => !toggles.some(o => o !== el && el.contains(o)));
+                if (innermost.length > 0) {
+                    innermost[0].click();
+                    await wait(1200);
+                    input = findInput();
+                }
+            }
+
+            if (!input) return false;
+            document.querySelectorAll('[data-uad-promo]').forEach(el => el.removeAttribute('data-uad-promo'));
+            input.setAttribute('data-uad-promo', '1');
+            input.scrollIntoView({ block: 'center' });
+            return true;
+        }");
+
+        if (!found)
+        {
+            return false;
+        }
+
+        var input = await page.QuerySelectorAsync("[data-uad-promo='1']");
+        if (input is null)
+        {
+            return false;
+        }
+
+        await input.ClickAsync(new PuppeteerSharp.Input.ClickOptions { Count = 3 });
+        await page.Keyboard.PressAsync("Backspace");
+        await input.TypeAsync(promoCode, new PuppeteerSharp.Input.TypeOptions { Delay = 40 });
+
+        var typed = await page.EvaluateFunctionAsync<string>(
+            "() => (document.querySelector('[data-uad-promo=\"1\"]') || {}).value || ''");
+        if (!string.Equals(typed.Trim(), promoCode, StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.Debug($"[Промокод][Шаг 5] В поле оказалось '{typed}' вместо '{promoCode}'. Вписываем напрямую.");
+            await ForcePromoInputValueAsync(page, promoCode);
+        }
+
+        return true;
+    }
+
+    /// <summary>Вписывает код в поле через родной сеттер value — так его замечает и React.</summary>
+    private static async Task ForcePromoInputValueAsync(IPage page, string promoCode)
+    {
+        await page.EvaluateFunctionAsync(@"(code) => {
+            const el = document.querySelector('[data-uad-promo=""1""]');
+            if (!el) return;
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+            setter.call(el, code);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }", promoCode);
+    }
+
+    /// <summary>
+    /// Нажимает кнопку Apply рядом с полем промокода. Кнопки оплаты не трогает никогда.
+    /// Возвращает "clicked", "disabled" или "none".
+    /// </summary>
+    private static async Task<string> TryClickPromoApplyAsync(IPage page)
+    {
+        return await page.EvaluateFunctionAsync<string>(@"() => {
+            const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+            const textOf = (el) => normalize(el.innerText || el.value || el.getAttribute('aria-label') || '');
+            const isPayLike = (t) => t.includes('pay') || t.includes('order') || t.includes('purchase') ||
+                t.includes('оплат') || t.includes('заказ') || t.includes('купить');
+            const isApplyLike = (t) => !isPayLike(t) &&
+                (t.includes('apply') || t === 'redeem' || t === 'submit' || t === 'ok' ||
+                 t.includes('применить') || t.includes('активировать'));
+
+            const input = document.querySelector('[data-uad-promo=""1""]');
+            let btn = null;
+
+            // Сначала ищем рядом с полем: поднимаемся от него на несколько уровней.
+            let parent = input ? input.parentElement : null;
+            for (let depth = 0; parent && parent !== document.body && depth < 6 && !btn; depth++) {
+                btn = Array.from(parent.querySelectorAll('button, [role=""button""], input[type=""submit""]'))
+                    .filter(visible)
+                    .find(el => isApplyLike(textOf(el))) || null;
+                parent = parent.parentElement;
+            }
+
+            if (!btn) {
+                btn = Array.from(document.querySelectorAll('button, [role=""button""]'))
+                    .filter(visible)
+                    .find(el => {
+                        const t = textOf(el);
+                        return t === 'apply' || t === 'применить' || t === 'redeem';
+                    }) || null;
+            }
+
+            if (!btn) return 'none';
+            if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return 'disabled';
+            btn.click();
+            return 'clicked';
+        }");
+    }
+
+    /// <summary>
+    /// Ждёт ответа на промокод: цена стала нулём или на странице появилась ошибка.
+    /// Ошибка, которая висела на странице ещё до ввода кода, ответом не считается.
+    /// </summary>
+    private async Task<CartPriceSnapshot> WaitForPromoOutcomeAsync(
+        IPage page, CartPriceSnapshot before, TimeSpan timeout)
+    {
+        var stopAt = DateTime.UtcNow.Add(timeout);
+        await Task.Delay(1500);
+
+        while (true)
+        {
+            var current = await ReadCartPriceAsync(page);
+
+            if (current.HasPromoError && before.HasPromoError && current.FoundError == before.FoundError)
+            {
+                current.HasPromoError = false;
+            }
+
+            if (current.HasPromoError || (current.Found && current.Amount == 0) || DateTime.UtcNow >= stopAt)
+            {
+                return current;
+            }
+
+            await Task.Delay(1000);
         }
     }
 
@@ -4649,74 +5205,6 @@ internal sealed class UnityAssetAutomationApp
             }
 
             return false;
-        }");
-    }
-
-    private static async Task<bool> TryClickAddToCartOrBuyNowButtonAsync(IPage page)
-    {
-        return await page.EvaluateFunctionAsync<bool>(@"() => {
-            const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
-            const visible = (el) => {
-                if (!el) return false;
-                const style = window.getComputedStyle(el);
-                const rect = el.getBoundingClientRect();
-                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-            };
-
-            const rootSelectors = [
-                '[data-testid*=""cta"" i]',
-                '[data-testid*=""purchase"" i]',
-                '[class*=""cta"" i]',
-                '[class*=""purchase"" i]',
-                '[class*=""buy"" i]',
-                'aside[class*=""sidebar"" i]',
-                'div[class*=""sidebar"" i]'
-            ].join(', ');
-
-            const roots = Array.from(document.querySelectorAll(rootSelectors))
-                .filter(visible)
-                .filter(root => {
-                    const txt = normalize(root.innerText || '');
-                    return txt.includes('add to cart') || txt.includes('buy now') || txt.includes('buy');
-                });
-
-            const collectClickables = (root) => Array.from(root.querySelectorAll('button, a, [role=""button""]'))
-                .filter(visible)
-                .map(el => ({
-                    element: el,
-                    text: normalize(el.innerText)
-                }))
-                .filter(x => !!x.text);
-
-            const clickFrom = (items) => {
-                const addCart = items.find(x => x.text.includes('add to cart'));
-                const buyNow = items.find(x => x.text.includes('buy now') || x.text === 'buy');
-                const target = addCart || buyNow;
-
-                if (!target) return false;
-                
-                setTimeout(() => {
-                    if (typeof target.element.click === 'function') {
-                        target.element.click();
-                    } else {
-                        target.element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                    }
-                }, 50);
-                
-                return true;
-            };
-
-            for (const root of roots) {
-                const items = collectClickables(root);
-                if (clickFrom(items)) return true;
-            }
-
-            const fallback = Array.from(document.querySelectorAll('button, a, [role=""button""]'))
-                .filter(visible)
-                .map(el => ({ element: el, text: normalize(el.innerText) }))
-                .filter(x => !!x.text);
-
-            return clickFrom(fallback);
         }");
     }
 
@@ -5162,7 +5650,7 @@ internal sealed class CliOptions
     
     // Telegram
     public List<string> TelegramChannels { get; init; } = [];
-    public int TelegramPostLimit { get; init; } = 20;
+    public int TelegramPostLimit { get; init; } = 50;
     public bool TelegramScreenshotOnNoLinks { get; init; } = true;
 
     public static CliOptions Parse(string[] args)
@@ -5585,7 +6073,7 @@ internal sealed class CliOptions
         // Интерактивный режим доступен, только если программу запустили из живой консоли.
         var interactive = cliInteractive ?? config?.Interactive ?? !Console.IsInputRedirected;
 
-        var telegramPostLimit = config?.Telegram?.PostLimit ?? 20;
+        var telegramPostLimit = config?.Telegram?.PostLimit ?? 50;
         var telegramScreenshotOnNoLinks = config?.Telegram?.ScreenshotOnNoLinks ?? false;
 
         return new CliOptions
@@ -5818,7 +6306,7 @@ internal sealed class TelegramConfig
     public string? ProxyList { get; init; }
     public bool? AutoProxy { get; init; }
     public List<string> Channels { get; init; } = [];
-    public int PostLimit { get; init; } = 20;
+    public int PostLimit { get; init; } = 50;
     public bool ScreenshotOnNoLinks { get; init; } = true;
 }
 
@@ -5934,6 +6422,21 @@ internal enum AssetProcessStatus
     PromoNotApplied,
     Deprecated,
     Failed
+}
+
+/// <summary>Что лежит в корзине магазина (без отложенных «на потом»).</summary>
+internal sealed class CartSnapshot
+{
+    public bool Empty { get; set; }
+    public List<CartItemInfo> Items { get; } = [];
+}
+
+internal sealed class CartItemInfo
+{
+    public string Id { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+
+    public string Describe() => string.IsNullOrWhiteSpace(Name) ? $"#{Id}" : $"'{Name}' (#{Id})";
 }
 
 /// <summary>

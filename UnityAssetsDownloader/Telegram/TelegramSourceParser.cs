@@ -10,7 +10,9 @@ internal sealed class TelegramSourceParser
     private readonly int _navigationTimeoutMs;
     private readonly int _postLimit;
     private readonly bool _screenshotOnNoLinks;
-    private static readonly TimeSpan ScrollTimeout = TimeSpan.FromSeconds(25);
+    // Страница канала отдаёт около 20 постов. Десять страниц — это ~200 постов,
+    // больше не нужно: старые раздачи давно закончились.
+    private const int MaxPagesPerChannel = 10;
 
     // Regex для ссылок на ассеты Unity Asset Store
     private static readonly Regex AssetUrlRegex = new(
@@ -32,7 +34,7 @@ internal sealed class TelegramSourceParser
         AppLogger logger,
         string logsDirectory,
         int navigationTimeoutMs,
-        int postLimit = 20,
+        int postLimit = 50,
         bool screenshotOnNoLinks = true)
     {
         _browser = browser;
@@ -112,121 +114,87 @@ internal sealed class TelegramSourceParser
 
             await Task.Delay(2000); // Ждём первичную загрузку постов
 
-            // Скроллим чтобы загрузить N постов
-            var loadedPosts = await ScrollForPostsAsync(page, _postLimit);
-            _logger.Info($"[Telegram] Канал {channelName}: загружено постов (видимых элементов): {loadedPosts}");
+            // Страница t.me/s/<канал> показывает только ~20 последних постов.
+            // Листать её вниз бесполезно: более старые посты лежат на отдельных
+            // страницах ?before=<номер поста>. Идём по ним от новых к старым,
+            // пока не наберём лимит.
+            var seenPostIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var totalPosts = 0;
 
-            // Собираем все посты
-            var postsRaw = await ExtractPostsRawAsync(page);
-            _logger.Info($"[Telegram] Канал {channelName}: извлечено текстовых блоков постов: {postsRaw.Count}");
+            for (var pageNo = 1; pageNo <= MaxPagesPerChannel && totalPosts < _postLimit; pageNo++)
+            {
+                if (pageNo > 1)
+                {
+                    var oldestId = channelResult.AllPosts
+                        .Select(p => ParsePostNumber(p.PostId))
+                        .Where(n => n > 0)
+                        .DefaultIfEmpty(0)
+                        .Min();
 
-            if (postsRaw.Count == 0)
+                    if (oldestId <= 1)
+                    {
+                        break;
+                    }
+
+                    try
+                    {
+                        await page.GoToAsync($"{channelUrl}?before={oldestId}", new NavigationOptions
+                        {
+                            WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
+                            Timeout = _navigationTimeoutMs
+                        });
+                        await Task.Delay(1500);
+                    }
+                    catch (Exception ex)
+                    {
+                        // То, что уже прочитано, не выбрасываем: старые посты — не самое ценное.
+                        _logger.Warn(
+                            $"[Telegram] Канал {channelName}: более старые посты не загрузились ({ex.Message}). Берём прочитанные.");
+                        break;
+                    }
+                }
+
+                var pagePosts = await ExtractPostsRawAsync(page);
+                var freshPosts = new List<(string Text, string PostId)>();
+                foreach (var post in pagePosts)
+                {
+                    if (seenPostIds.Add(post.PostId))
+                    {
+                        freshPosts.Add(post);
+                    }
+                }
+
+                // Сначала новые посты: промокоды быстро истекают, свежие важнее.
+                freshPosts = freshPosts
+                    .OrderByDescending(p => ParsePostNumber(p.PostId))
+                    .Take(_postLimit - totalPosts)
+                    .ToList();
+
+                _logger.Info($"[Telegram] Канал {channelName}: страница {pageNo}, новых постов: {freshPosts.Count}");
+
+                if (freshPosts.Count == 0)
+                {
+                    break;
+                }
+
+                // Разбираем сразу, пока страница открыта: скриншот поста без ссылок
+                // можно снять только с той страницы, где он виден.
+                foreach (var (text, postId) in freshPosts)
+                {
+                    await AnalyzePostAsync(page, channelName, text, postId, channelResult);
+                }
+
+                totalPosts += freshPosts.Count;
+            }
+
+            if (totalPosts == 0)
             {
                 _logger.Warn($"[Telegram] Канал {channelName}: не найдено постов. Возможно канал недоступен или заблокирован.");
                 channelResult.Errors.Add($"Канал {channelName}: посты не найдены");
                 return channelResult;
             }
 
-            var processedCount = 0;
-            foreach (var post in postsRaw)
-            {
-                if (processedCount >= _postLimit)
-                    break;
-
-                processedCount++;
-
-                var (text, postId) = post;
-                channelResult.AllPosts.Add(new TelegramPostInfo
-                {
-                    ChannelName = channelName,
-                    PostId = postId,
-                    Text = text
-                });
-                _logger.Debug($"[Telegram] ---- ПОСТ {channelName}/#{postId} ({text.Length} символов) ----");
-                _logger.Debug($"[Telegram] {text}");
-
-                // Ищем ссылки на ассеты
-                var assetMatches = AssetUrlRegex.Matches(text);
-                var gitMatches = GitUrlRegex.Matches(text);
-                var promoMatches = PromocodeRegex.Matches(text);
-
-                var assetUrls = assetMatches
-                    .Select(m => NormalizeAssetUrl(m.Value))
-                    .Where(u => !string.IsNullOrWhiteSpace(u))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-
-                var gitUrls = gitMatches
-                    .Select(m => m.Value.StartsWith("http", StringComparison.OrdinalIgnoreCase)
-                        ? m.Value
-                        : "https://" + m.Value)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-
-                var promocodes = promoMatches
-                    .Select(m => m.Groups[1].Value.Trim())
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-
-                channelResult.AssetUrls.AddRange(assetUrls);
-                channelResult.GitLinks.AddRange(gitUrls);
-                channelResult.Promocodes.AddRange(promocodes);
-
-                if (assetUrls.Count > 0 && promocodes.Count > 0)
-                {
-                    var firstPromo = promocodes[0];
-                    foreach (var url in assetUrls)
-                    {
-                        channelResult.AssetPromocodes[url] = firstPromo;
-                    }
-                }
-
-                if (assetUrls.Count > 0 || promocodes.Count > 0)
-                {
-                    var promoPart = promocodes.Count > 0
-                        ? $", промокод: {string.Join(", ", promocodes)}"
-                        : string.Empty;
-                    _logger.Info($"[Telegram] пост {postId}: ассетов {assetUrls.Count}{promoPart}");
-
-                    foreach (var url in assetUrls)
-                    {
-                        _logger.Info($"[Telegram]   {url}");
-                    }
-                }
-                else
-                {
-                    _logger.Debug(
-                        $"[Telegram] пост {postId}: ссылок на Asset Store нет (текст в telegram_posts_raw.log)");
-                }
-
-                if (gitUrls.Count > 0)
-                {
-                    _logger.Info($"[Telegram] {channelName} пост #{postId}: найдено git-ссылок: {gitUrls.Count}");
-                    foreach (var url in gitUrls)
-                    {
-                        _logger.Info($"[Telegram]   Git URL (пропущено): {url}");
-                    }
-                }
-
-                if (promocodes.Count > 0)
-                {
-                    _logger.Info($"[Telegram] {channelName} пост #{postId}: найдено промокодов: {string.Join(", ", promocodes)}");
-                }
-
-                // Если не найдено ни одной ссылки — скриншот
-                if (_screenshotOnNoLinks && assetUrls.Count == 0 && gitUrls.Count == 0 && promocodes.Count == 0)
-                {
-                    await TakePostScreenshotAsync(page, channelName, postId, text);
-                    channelResult.PostsWithoutLinks.Add(new PostWithoutLink
-                    {
-                        ChannelName = channelName,
-                        PostId = postId,
-                        TextPreview = text.Length > 200 ? text[..200] + "..." : text
-                    });
-                }
-            }
-
-            _logger.Info($"[Telegram] Канал {channelName}: итого ассетов={channelResult.AssetUrls.Count}, git-ссылок={channelResult.GitLinks.Count}, промокодов={channelResult.Promocodes.Count}, постов без ссылок={channelResult.PostsWithoutLinks.Count}");
+            _logger.Info($"[Telegram] Канал {channelName}: прочитано постов {totalPosts} (лимит {_postLimit}), итого ассетов={channelResult.AssetUrls.Count}, git-ссылок={channelResult.GitLinks.Count}, промокодов={channelResult.Promocodes.Count}, постов без ссылок={channelResult.PostsWithoutLinks.Count}");
         }
         catch (Exception ex)
         {
@@ -245,49 +213,102 @@ internal sealed class TelegramSourceParser
         return channelResult;
     }
 
-    private async Task<int> ScrollForPostsAsync(IPage page, int targetCount)
+    /// <summary>Ищет в посте ссылки на ассеты, git-ссылки и промокоды.</summary>
+    private async Task AnalyzePostAsync(
+        IPage page, string channelName, string text, string postId, TelegramChannelResult channelResult)
     {
-        var stableIterations = 0;
-        var lastCount = -1;
-
-        var stopAt = DateTime.UtcNow.Add(ScrollTimeout);
-        while (DateTime.UtcNow < stopAt && stableIterations < 5)
+        channelResult.AllPosts.Add(new TelegramPostInfo
         {
-            var currentCount = await page.EvaluateFunctionAsync<int>(@"() => {
-                // Считаем посты как элементы tgme_widget_message_wrap или похожие
-                const posts = document.querySelectorAll('.tgme_widget_message_wrap, .tgme_widget_message, [data-post], article');
-                return posts.length;
-            }");
+            ChannelName = channelName,
+            PostId = postId,
+            Text = text
+        });
+        _logger.Debug($"[Telegram] ---- ПОСТ {channelName}/#{postId} ({text.Length} символов) ----");
+        _logger.Debug($"[Telegram] {text}");
 
-            if (currentCount <= lastCount)
+        var assetUrls = AssetUrlRegex.Matches(text)
+            .Select(m => NormalizeAssetUrl(m.Value))
+            .Where(u => !string.IsNullOrWhiteSpace(u))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var gitUrls = GitUrlRegex.Matches(text)
+            .Select(m => m.Value.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                ? m.Value
+                : "https://" + m.Value)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var promocodes = PromocodeRegex.Matches(text)
+            .Select(m => m.Groups[1].Value.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        channelResult.AssetUrls.AddRange(assetUrls);
+        channelResult.GitLinks.AddRange(gitUrls);
+        channelResult.Promocodes.AddRange(promocodes);
+
+        if (assetUrls.Count > 0 && promocodes.Count > 0)
+        {
+            // Посты идут от новых к старым, поэтому первый найденный код — самый свежий.
+            // Старый пост с тем же ассетом не должен подменить его истёкшим кодом.
+            var firstPromo = promocodes[0];
+            foreach (var url in assetUrls)
             {
-                stableIterations++;
+                channelResult.AssetPromocodes.TryAdd(url, firstPromo);
             }
-            else
-            {
-                stableIterations = 0;
-                lastCount = currentCount;
-            }
-
-            if (currentCount >= targetCount)
-                break;
-
-            // Скроллим вниз
-            await page.EvaluateFunctionAsync<string>(@"() => {
-                const allMessages = document.querySelectorAll('.tgme_widget_message_wrap, .tgme_widget_message');
-                if (allMessages.length > 0) {
-                    const last = allMessages[allMessages.length - 1];
-                    last.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                } else {
-                    window.scrollBy(0, window.innerHeight * 2);
-                }
-                return '';
-            }");
-
-            await Task.Delay(1200);
         }
 
-        return lastCount > 0 ? lastCount : 0;
+        if (assetUrls.Count > 0 || promocodes.Count > 0)
+        {
+            var promoPart = promocodes.Count > 0
+                ? $", промокод: {string.Join(", ", promocodes)}"
+                : string.Empty;
+            _logger.Info($"[Telegram] пост {postId}: ассетов {assetUrls.Count}{promoPart}");
+
+            foreach (var url in assetUrls)
+            {
+                _logger.Info($"[Telegram]   {url}");
+            }
+        }
+        else
+        {
+            _logger.Debug(
+                $"[Telegram] пост {postId}: ссылок на Asset Store нет (текст в telegram_posts_raw.log)");
+        }
+
+        if (gitUrls.Count > 0)
+        {
+            _logger.Info($"[Telegram] {channelName} пост #{postId}: найдено git-ссылок: {gitUrls.Count}");
+            foreach (var url in gitUrls)
+            {
+                _logger.Info($"[Telegram]   Git URL (пропущено): {url}");
+            }
+        }
+
+        if (promocodes.Count > 0)
+        {
+            _logger.Info($"[Telegram] {channelName} пост #{postId}: найдено промокодов: {string.Join(", ", promocodes)}");
+        }
+
+        // Если не найдено ни одной ссылки — скриншот
+        if (_screenshotOnNoLinks && assetUrls.Count == 0 && gitUrls.Count == 0 && promocodes.Count == 0)
+        {
+            await TakePostScreenshotAsync(page, channelName, postId, text);
+            channelResult.PostsWithoutLinks.Add(new PostWithoutLink
+            {
+                ChannelName = channelName,
+                PostId = postId,
+                TextPreview = text.Length > 200 ? text[..200] + "..." : text
+            });
+        }
+    }
+
+    /// <summary>Номер поста из "канал/1348". 0, если номера нет.</summary>
+    private static int ParsePostNumber(string postId)
+    {
+        var tail = postId.Split('/').LastOrDefault() ?? string.Empty;
+        return int.TryParse(tail, out var number) ? number : 0;
     }
 
     private async Task<List<(string Text, string PostId)>> ExtractPostsRawAsync(IPage page)

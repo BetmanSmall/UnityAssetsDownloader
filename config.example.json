@@ -33,7 +33,7 @@
     "autoProxy": true,
     "proxyList": "",
     "channels": [],
-    "postLimit": 40,
+    "postLimit": 50,
     "screenshotOnNoLinks": false
   },
   "proxy": {
