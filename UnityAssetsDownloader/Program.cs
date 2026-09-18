@@ -2138,9 +2138,24 @@ internal sealed class UnityAssetAutomationApp
                     if (normBody.includes(kw)) { hasPromoError = true; foundError = kw; break; }
                 }
 
-                const totalWords = ['order total', 'total', 'итого', 'к оплате', 'grand total', 'amount due'];
-                const nodes = Array.from(document.querySelectorAll('div, span, p, td, li, section'))
+                // Сначала точные слова, 'total' последним: он есть и внутри 'subtotal'.
+                const totalWords = ['order total', 'grand total', 'amount due', 'к оплате', 'итого', 'total'];
+                const nodes = Array.from(document.querySelectorAll('div, span, p, td, li, section, dl'))
                     .filter(visible);
+
+                // Сумма берётся именно после слова итога. В блоке вида
+                // 'Покупки (1) $20.00 Промежуточный итог $20.00 Налог $4.40 К оплате $24.40'
+                // первая сумма — цена товара, а к оплате — последняя.
+                const amountAfterTotal = (t) => {
+                    const lt = t.toLowerCase();
+                    for (const w of totalWords) {
+                        const idx = lt.lastIndexOf(w);
+                        if (idx < 0) continue;
+                        const amount = parseAmount(t.slice(idx + w.length));
+                        if (amount !== null) return amount;
+                    }
+                    return null;
+                };
 
                 // Сначала ищем узел, где рядом со словом 'итого' стоит сумма.
                 let best = null;
@@ -2149,7 +2164,7 @@ internal sealed class UnityAssetAutomationApp
                     if (!t || t.length > 200) continue;
                     const lt = t.toLowerCase();
                     if (!totalWords.some(w => lt.includes(w))) continue;
-                    const amount = parseAmount(t);
+                    const amount = amountAfterTotal(t);
                     if (amount === null) continue;
                     // Берём самый мелкий подходящий узел: он ближе всего к самой сумме.
                     if (!best || t.length < best.raw.length) best = { raw: t, amount };
@@ -4044,6 +4059,7 @@ internal sealed class UnityAssetAutomationApp
                 result.Message = "Не найдено поле ввода промокода.";
                 _logger.Warn($"[Ошибка][Шаг 5] {result.Message} | URL: {page.Url}");
 
+                await LogCouponAreaAsync(page);
                 await LogAllInputFieldsAsync(page, "Шаг 5 - поле не найдено, все inputs");
                 await LogAllButtonsAsync(page, "Шаг 5 - кнопки при ошибке");
                 await SaveErrorScreenshotAsync(page, $"promo_failed_input_{sanitizedId}");
@@ -4776,10 +4792,28 @@ internal sealed class UnityAssetAutomationApp
                 const rect = el.getBoundingClientRect();
                 return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
             };
-
-            const findInput = () => Array.from(document.querySelectorAll('input')).filter(visible).find(el => {
+            const isTextInput = (el) => {
                 const type = normalize(el.type);
-                if (type && type !== 'text' && type !== 'search') return false;
+                return !type || type === 'text' || type === 'search';
+            };
+            const isPayLike = (t) => t.includes('pay') || t.includes('order') || t.includes('purchase') ||
+                t.includes('оплат') || t.includes('заказ') || t.includes('купить');
+
+            // Блок купона на pay.unity.com: .summary-coupon / .order-promotion,
+            // в нём dt с заголовком и зелёной надписью, dd.input с полем и кнопкой.
+            const couponBoxes = () => Array.from(document.querySelectorAll(
+                '.summary-coupon, .order-promotion, [class*=""coupon"" i]'));
+
+            const inputInBoxes = () => {
+                for (const box of couponBoxes()) {
+                    const input = Array.from(box.querySelectorAll('input')).filter(visible).find(isTextInput);
+                    if (input) return input;
+                }
+                return null;
+            };
+
+            const inputByAttributes = () => Array.from(document.querySelectorAll('input')).filter(visible).find(el => {
+                if (!isTextInput(el)) return false;
 
                 const placeholder = normalize(el.placeholder);
                 const name = normalize(el.name);
@@ -4796,24 +4830,36 @@ internal sealed class UnityAssetAutomationApp
                     'купон', 'промо', 'код', 'скидк'].some(w => all.includes(w));
             });
 
+            const findInput = () => inputInBoxes() || inputByAttributes();
+
             let input = findInput();
             if (!input) {
-                // Поле часто спрятано за ссылкой вида «Have a promo code?».
-                const isPayLike = (t) => t.includes('pay') || t.includes('order') || t.includes('purchase') ||
-                    t.includes('оплат') || t.includes('заказ') || t.includes('купить');
-                const toggles = Array.from(document.querySelectorAll('button, a, [role=""button""], span, div, p, label'))
+                // Поле спрятано, пока не нажмёшь надпись вроде «Добавить» или «Have a promo code?».
+                // Сначала пробуем кликабельное в заголовке блока купона, потом надписи по тексту.
+                const inBoxes = couponBoxes().flatMap(box =>
+                    Array.from(box.querySelectorAll('dt label, dt a, dt button, dt [role=""button""], label, a, button, [role=""button""]')))
+                    .filter(el => !el.closest('.coupon-item, .appended'));
+
+                const byText = Array.from(document.querySelectorAll('button, a, [role=""button""], span, div, p, label, dt'))
                     .filter(visible)
                     .filter(el => {
                         const t = normalize(el.innerText);
-                        return t.length > 0 && t.length <= 60 && !isPayLike(t) &&
+                        return t.length > 0 && t.length <= 60 &&
                             (t.includes('promo code') || t.includes('coupon') || t.includes('discount code') ||
-                             t.includes('промокод') || t.includes('купон') || t.includes('код скидки'));
+                             t.includes('промокод') || t.includes('купон') || t.includes('код скидки') ||
+                             t.includes('промо-код'));
                     });
-                const innermost = toggles.filter(el => !toggles.some(o => o !== el && el.contains(o)));
-                if (innermost.length > 0) {
-                    innermost[0].click();
-                    await wait(1200);
+                const byTextInnermost = byText.filter(el => !byText.some(o => o !== el && el.contains(o)));
+
+                const toggles = [...new Set([...inBoxes, ...byTextInnermost])]
+                    .filter(visible)
+                    .filter(el => !isPayLike(normalize(el.innerText)));
+
+                for (const toggle of toggles.slice(0, 6)) {
+                    toggle.click();
+                    await wait(1000);
                     input = findInput();
+                    if (input) break;
                 }
             }
 
@@ -4881,14 +4927,22 @@ internal sealed class UnityAssetAutomationApp
             const isPayLike = (t) => t.includes('pay') || t.includes('order') || t.includes('purchase') ||
                 t.includes('оплат') || t.includes('заказ') || t.includes('купить');
             const isApplyLike = (t) => !isPayLike(t) &&
-                (t.includes('apply') || t === 'redeem' || t === 'submit' || t === 'ok' ||
-                 t.includes('применить') || t.includes('активировать'));
+                (t.includes('apply') || t === 'redeem' || t === 'submit' || t === 'ok' || t === 'ок' ||
+                 t.includes('применить') || t.includes('активировать') || t === 'добавить' || t === 'add');
 
             const input = document.querySelector('[data-uad-promo=""1""]');
             let btn = null;
 
+            // На pay.unity.com поле и кнопка стоят вдвоём в строке dd.input.
+            const row = input ? input.closest('dd.input') : null;
+            if (row) {
+                btn = Array.from(row.querySelectorAll('button, .btn, [role=""button""], input[type=""submit""]'))
+                    .filter(visible)
+                    .find(el => !isPayLike(textOf(el))) || null;
+            }
+
             // Сначала ищем рядом с полем: поднимаемся от него на несколько уровней.
-            let parent = input ? input.parentElement : null;
+            let parent = input && !btn ? input.parentElement : null;
             for (let depth = 0; parent && parent !== document.body && depth < 6 && !btn; depth++) {
                 btn = Array.from(parent.querySelectorAll('button, [role=""button""], input[type=""submit""]'))
                     .filter(visible)
@@ -4913,6 +4967,69 @@ internal sealed class UnityAssetAutomationApp
     }
 
     /// <summary>
+    /// Ошибка из блока купона на pay.unity.com: текст красной строки под полем
+    /// или пометка, что введённый код зачёркнут как недействительный. Пусто, если ошибки нет.
+    /// </summary>
+    private static async Task<string> ReadCouponBlockErrorAsync(IPage page)
+    {
+        try
+        {
+            return await page.EvaluateFunctionAsync<string>(@"() => {
+                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+
+                for (const box of document.querySelectorAll('.summary-coupon, .order-promotion')) {
+                    const error = Array.from(box.querySelectorAll('.error'))
+                        .filter(visible)
+                        .map(e => normalize(e.innerText))
+                        .find(t => t.length > 0);
+                    if (error) return error.slice(0, 200);
+
+                    const invalid = box.querySelector('.coupon-item span.invalid, .coupon-item .invalid');
+                    if (invalid) return 'код зачёркнут как недействительный: ' + normalize(invalid.innerText).slice(0, 60);
+                }
+
+                return '';
+            }") ?? string.Empty;
+        }
+        catch (Exception ex) when (IsTransientPageError(ex))
+        {
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Что видно в блоке купона и сколько на странице текстовых полей — для лога,
+    /// когда поле промокода не нашлось. Отладочные строки в файл не пишутся, а эта — пишется.
+    /// </summary>
+    private async Task LogCouponAreaAsync(IPage page)
+    {
+        try
+        {
+            var info = await page.EvaluateFunctionAsync<string>(@"() => {
+                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim();
+                const boxes = Array.from(document.querySelectorAll('.summary-coupon, .order-promotion, [class*=""coupon"" i]'));
+                const boxText = boxes.map(b => `<${b.tagName.toLowerCase()} class='${b.className}'> ${normalize(b.innerText).slice(0, 150)}`).join(' || ');
+                const inputs = Array.from(document.querySelectorAll('input'))
+                    .map(i => `${i.type || 'text'}#${i.id || '-'}[name=${i.name || '-'}][ph=${i.placeholder || '-'}]${i.offsetParent === null ? '(скрыто)' : ''}`)
+                    .join(', ');
+                const summary = document.querySelector('.order-summary, .summary');
+                return `блок купона: ${boxText || 'не найден'} | поля: ${inputs || 'нет'} | сводка: ${summary ? normalize(summary.innerText).slice(0, 300) : 'нет'}`;
+            }");
+            _logger.Info($"[Промокод][Шаг 5] Что на странице: {info}");
+        }
+        catch (Exception ex)
+        {
+            _logger.Info($"[Промокод][Шаг 5] Не удалось описать страницу: {ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// Ждёт ответа на промокод: цена стала нулём или на странице появилась ошибка.
     /// Ошибка, которая висела на странице ещё до ввода кода, ответом не считается.
     /// </summary>
@@ -4929,6 +5046,15 @@ internal sealed class UnityAssetAutomationApp
             if (current.HasPromoError && before.HasPromoError && current.FoundError == before.FoundError)
             {
                 current.HasPromoError = false;
+            }
+
+            // Блок купона сам пишет, что код не подошёл: красная строка ошибки
+            // или код в списке, зачёркнутый как недействительный.
+            var couponVerdict = await ReadCouponBlockErrorAsync(page);
+            if (!string.IsNullOrWhiteSpace(couponVerdict))
+            {
+                current.HasPromoError = true;
+                current.FoundError = couponVerdict;
             }
 
             if (current.HasPromoError || (current.Found && current.Amount == 0) || DateTime.UtcNow >= stopAt)
