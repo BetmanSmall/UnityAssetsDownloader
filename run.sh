@@ -54,12 +54,15 @@ if ! dotnet build "$PROJECT" --nologo -v q; then
 fi
 
 ask_limit() {
-    local limit
+    local limit batch
     read -r -p "Сколько новых ассетов добавить за запуск? [Enter = без лимита]: " limit
     LIMIT_ARG=()
     if [ -n "$limit" ]; then
         LIMIT_ARG=(--max-add-attempts "$limit")
     fi
+    echo "Ассеты из Telegram берутся пачками: собрали пачку, проверили в магазине, собираем следующую."
+    read -r -p "Сколько ассетов в одной пачке из Telegram? [Enter = 30, 0 = всё разом]: " batch
+    LIMIT_ARG+=(--tg-batch-size "${batch:-30}")
 }
 
 # Запускает программу. Ctrl+C останавливает только её, а не меню:

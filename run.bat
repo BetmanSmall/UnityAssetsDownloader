@@ -94,6 +94,11 @@ set "limit="
 set /p "limit=Сколько новых ассетов добавить за запуск? [Enter = без лимита]: "
 set "LIMIT_ARG="
 if defined limit set "LIMIT_ARG=--max-add-attempts %limit%"
+echo Ассеты из Telegram берутся пачками: собрали пачку, проверили в магазине, собираем следующую.
+set "batch="
+set /p "batch=Сколько ассетов в одной пачке из Telegram? [Enter = 30, 0 = всё разом]: "
+if not defined batch set "batch=30"
+set "LIMIT_ARG=%LIMIT_ARG% --tg-batch-size %batch%"
 goto :eof
 
 :run_all

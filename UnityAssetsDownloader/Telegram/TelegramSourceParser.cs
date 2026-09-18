@@ -10,9 +10,9 @@ internal sealed class TelegramSourceParser
     private readonly int _navigationTimeoutMs;
     private readonly int _postLimit;
     private readonly bool _screenshotOnNoLinks;
-    // Страница канала отдаёт около 20 постов. Десять страниц — это ~200 постов,
-    // больше не нужно: старые раздачи давно закончились.
-    private const int MaxPagesPerChannel = 10;
+    // Страница канала отдаёт около 20 постов. При чтении за один раз десяти страниц
+    // (~200 постов) хватает: старые раздачи давно закончились. Пачками читается без предела.
+    public const int MaxPagesPerChannel = 10;
 
     // Regex для ссылок на ассеты Unity Asset Store
     private static readonly Regex AssetUrlRegex = new(
@@ -49,171 +49,213 @@ internal sealed class TelegramSourceParser
     }
 
     /// <summary>
-    /// Парсит Telegram каналы и возвращает найденные ссылки на ассеты Unity.
+    /// Разбирает каналы за один раз: с каждого читает до postLimit последних постов.
     /// </summary>
-    public async Task<TelegramParseResult> ParseChannelsAsync(List<string> channelNames)
+    public Task<TelegramParseResult> ParseChannelsAsync(List<string> channelNames) =>
+        ReadAsync(
+            channelNames.Select(c => new TelegramChannelCursor(c)).ToList(),
+            wantAssets: int.MaxValue,
+            isWanted: _ => true,
+            maxPostsPerChannel: _postLimit,
+            maxPagesPerChannel: MaxPagesPerChannel);
+
+    /// <summary>
+    /// Читает каналы по кругу, по странице с каждого, от новых постов к старым.
+    /// Останавливается, когда набралось wantAssets ассетов, подходящих под isWanted,
+    /// когда у всех каналов кончились посты или прочитан лимит.
+    ///
+    /// Курсоры помнят, где остановились, поэтому следующий вызов с теми же
+    /// курсорами продолжит с более старых постов. Так ассеты берутся пачками.
+    /// Каналы, которые не открылись, получают FailedThisRead и попадают в FailedChannels.
+    /// </summary>
+    public async Task<TelegramParseResult> ReadAsync(
+        IReadOnlyList<TelegramChannelCursor> cursors,
+        int wantAssets,
+        Func<string, bool> isWanted,
+        int maxPostsPerChannel = int.MaxValue,
+        int maxPagesPerChannel = int.MaxValue)
     {
         var result = new TelegramParseResult();
+        var wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var knownAssets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var channel in channelNames)
+        bool CanRead(TelegramChannelCursor c) =>
+            !c.Exhausted && !c.FailedThisRead &&
+            c.PostsRead < maxPostsPerChannel && c.PagesRead < maxPagesPerChannel;
+
+        var page = await _browser.NewPageAsync();
+        page.DefaultNavigationTimeout = _navigationTimeoutMs;
+        page.DefaultTimeout = _navigationTimeoutMs;
+
+        try
         {
-            var channelResult = await ParseSingleChannelAsync(channel);
-
-            // Бесплатные прокси часто срываются на первом же запросе.
-            // Одна повторная попытка почти всегда спасает, поэтому делаем её.
-            if (channelResult.AssetUrls.Count == 0 && channelResult.Errors.Count > 0 &&
-                channelResult.Errors.Any(e => e.Contains("ERR_", StringComparison.OrdinalIgnoreCase)))
+            while (wanted.Count < wantAssets && cursors.Any(CanRead))
             {
-                _logger.Warn($"[Telegram] Канал {channel} не открылся. Пробуем ещё раз...");
-                await Task.Delay(2000);
-                var retry = await ParseSingleChannelAsync(channel);
-
-                if (retry.Errors.Count == 0 || retry.AssetUrls.Count > 0)
+                foreach (var cursor in cursors.Where(CanRead).ToList())
                 {
-                    _logger.Info($"[Telegram] Со второй попытки канал {channel} открылся.");
-                    channelResult = retry;
+                    var channelResult = await ReadPageWithRetryAsync(page, cursor, maxPostsPerChannel);
+
+                    result.GitLinks.AddRange(channelResult.GitLinks);
+                    result.Promocodes.AddRange(channelResult.Promocodes);
+                    result.PostsWithoutLinks.AddRange(channelResult.PostsWithoutLinks);
+                    result.Errors.AddRange(channelResult.Errors);
+                    result.AllPosts.AddRange(channelResult.AllPosts);
+
+                    foreach (var url in channelResult.AssetUrls)
+                    {
+                        if (knownAssets.Add(url))
+                        {
+                            result.AssetUrls.Add(url);
+                        }
+
+                        if (isWanted(url))
+                        {
+                            wanted.Add(url);
+                        }
+                    }
+
+                    // Посты идут от новых к старым: код из более нового поста уже записан раньше.
+                    foreach (var kvp in channelResult.AssetPromocodes)
+                    {
+                        result.AssetPromocodes.TryAdd(kvp.Key, kvp.Value);
+                    }
+
+                    if (cursor.FailedThisRead)
+                    {
+                        result.FailedChannels.Add(cursor.Name);
+                    }
+
+                    if (wanted.Count >= wantAssets)
+                    {
+                        break;
+                    }
                 }
             }
-
-            result.AssetUrls.AddRange(channelResult.AssetUrls);
-            result.GitLinks.AddRange(channelResult.GitLinks);
-            result.Promocodes.AddRange(channelResult.Promocodes);
-            result.PostsWithoutLinks.AddRange(channelResult.PostsWithoutLinks);
-            result.Errors.AddRange(channelResult.Errors);
-            result.AllPosts.AddRange(channelResult.AllPosts);
-
-            foreach (var kvp in channelResult.AssetPromocodes)
-            {
-                result.AssetPromocodes[kvp.Key] = kvp.Value;
-            }
+        }
+        finally
+        {
+            await page.CloseAsync();
+            await page.DisposeAsync();
         }
 
-        // Дедупликация
-        result.AssetUrls = result.AssetUrls.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         result.GitLinks = result.GitLinks.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+        foreach (var cursor in cursors.Where(c => c.PostsRead > 0))
+        {
+            var state = cursor.Exhausted ? ", посты канала кончились" : string.Empty;
+            _logger.Info($"[Telegram] Канал {cursor.Name}: всего прочитано постов {cursor.PostsRead}{state}.");
+        }
 
         return result;
     }
 
-    private async Task<TelegramChannelResult> ParseSingleChannelAsync(string channelName)
+    /// <summary>
+    /// Читает следующую страницу канала. Бесплатные прокси часто срываются на запросе,
+    /// поэтому при сетевой ошибке пробует ещё раз; не вышло — помечает канал FailedThisRead.
+    /// </summary>
+    private async Task<TelegramChannelResult> ReadPageWithRetryAsync(
+        IPage page, TelegramChannelCursor cursor, int maxPostsPerChannel)
     {
-        var channelResult = new TelegramChannelResult { ChannelName = channelName };
-        IPage? page = null;
-
-        try
+        for (var attempt = 1; ; attempt++)
         {
-            page = await _browser.NewPageAsync();
-            page.DefaultNavigationTimeout = _navigationTimeoutMs;
-            page.DefaultTimeout = _navigationTimeoutMs;
-
-            var channelUrl = $"{TelegramWebBaseUrl}{channelName}";
-            _logger.Info($"[Telegram] Открытие канала: {channelUrl}");
-
-            await page.GoToAsync(channelUrl, new NavigationOptions
+            var channelResult = new TelegramChannelResult { ChannelName = cursor.Name };
+            try
             {
-                WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
-                Timeout = _navigationTimeoutMs
-            });
-
-            await Task.Delay(2000); // Ждём первичную загрузку постов
-
-            // Страница t.me/s/<канал> показывает только ~20 последних постов.
-            // Листать её вниз бесполезно: более старые посты лежат на отдельных
-            // страницах ?before=<номер поста>. Идём по ним от новых к старым,
-            // пока не наберём лимит.
-            var seenPostIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var totalPosts = 0;
-
-            for (var pageNo = 1; pageNo <= MaxPagesPerChannel && totalPosts < _postLimit; pageNo++)
-            {
-                if (pageNo > 1)
+                await ReadNextPageAsync(page, cursor, channelResult, maxPostsPerChannel);
+                if (attempt > 1)
                 {
-                    var oldestId = channelResult.AllPosts
-                        .Select(p => ParsePostNumber(p.PostId))
-                        .Where(n => n > 0)
-                        .DefaultIfEmpty(0)
-                        .Min();
-
-                    if (oldestId <= 1)
-                    {
-                        break;
-                    }
-
-                    try
-                    {
-                        await page.GoToAsync($"{channelUrl}?before={oldestId}", new NavigationOptions
-                        {
-                            WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
-                            Timeout = _navigationTimeoutMs
-                        });
-                        await Task.Delay(1500);
-                    }
-                    catch (Exception ex)
-                    {
-                        // То, что уже прочитано, не выбрасываем: старые посты — не самое ценное.
-                        _logger.Warn(
-                            $"[Telegram] Канал {channelName}: более старые посты не загрузились ({ex.Message}). Берём прочитанные.");
-                        break;
-                    }
+                    _logger.Info($"[Telegram] Со второй попытки канал {cursor.Name} открылся.");
                 }
 
-                var pagePosts = await ExtractPostsRawAsync(page);
-                var freshPosts = new List<(string Text, string PostId)>();
-                foreach (var post in pagePosts)
-                {
-                    if (seenPostIds.Add(post.PostId))
-                    {
-                        freshPosts.Add(post);
-                    }
-                }
-
-                // Сначала новые посты: промокоды быстро истекают, свежие важнее.
-                freshPosts = freshPosts
-                    .OrderByDescending(p => ParsePostNumber(p.PostId))
-                    .Take(_postLimit - totalPosts)
-                    .ToList();
-
-                _logger.Info($"[Telegram] Канал {channelName}: страница {pageNo}, новых постов: {freshPosts.Count}");
-
-                if (freshPosts.Count == 0)
-                {
-                    break;
-                }
-
-                // Разбираем сразу, пока страница открыта: скриншот поста без ссылок
-                // можно снять только с той страницы, где он виден.
-                foreach (var (text, postId) in freshPosts)
-                {
-                    await AnalyzePostAsync(page, channelName, text, postId, channelResult);
-                }
-
-                totalPosts += freshPosts.Count;
-            }
-
-            if (totalPosts == 0)
-            {
-                _logger.Warn($"[Telegram] Канал {channelName}: не найдено постов. Возможно канал недоступен или заблокирован.");
-                channelResult.Errors.Add($"Канал {channelName}: посты не найдены");
                 return channelResult;
             }
-
-            _logger.Info($"[Telegram] Канал {channelName}: прочитано постов {totalPosts} (лимит {_postLimit}), итого ассетов={channelResult.AssetUrls.Count}, git-ссылок={channelResult.GitLinks.Count}, промокодов={channelResult.Promocodes.Count}, постов без ссылок={channelResult.PostsWithoutLinks.Count}");
-        }
-        catch (Exception ex)
-        {
-            _logger.Warn($"[Telegram] Ошибка при парсинге канала {channelName}: {ex.Message}");
-            channelResult.Errors.Add($"Ошибка: {ex.Message}");
-        }
-        finally
-        {
-            if (page != null)
+            catch (Exception ex)
             {
-                await page.CloseAsync();
-                await page.DisposeAsync();
+                _logger.Warn($"[Telegram] Ошибка при парсинге канала {cursor.Name}: {ex.Message}");
+                if (attempt == 1 && ex.Message.Contains("ERR_", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.Warn($"[Telegram] Канал {cursor.Name} не открылся. Пробуем ещё раз...");
+                    await Task.Delay(2000);
+                    continue;
+                }
+
+                cursor.FailedThisRead = true;
+                channelResult.Errors.Add($"Ошибка: {ex.Message}");
+                return channelResult;
             }
         }
+    }
 
-        return channelResult;
+    /// <summary>
+    /// Читает одну страницу канала: первую — t.me/s/&lt;канал&gt;, дальше — ?before=&lt;самый старый
+    /// прочитанный пост&gt;. Листать страницу вниз бесполезно: t.me/s показывает около 20
+    /// последних постов, а более старые лежат именно на страницах ?before.
+    /// </summary>
+    private async Task ReadNextPageAsync(
+        IPage page, TelegramChannelCursor cursor, TelegramChannelResult channelResult, int maxPostsPerChannel)
+    {
+        var channelUrl = $"{TelegramWebBaseUrl}{cursor.Name}";
+        var firstPage = cursor.OldestId == 0;
+        if (!firstPage && cursor.OldestId <= 1)
+        {
+            cursor.Exhausted = true;
+            return;
+        }
+
+        var url = firstPage ? channelUrl : $"{channelUrl}?before={cursor.OldestId}";
+        if (firstPage)
+        {
+            _logger.Info($"[Telegram] Открытие канала: {channelUrl}");
+        }
+
+        await page.GoToAsync(url, new NavigationOptions
+        {
+            WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
+            Timeout = _navigationTimeoutMs
+        });
+        await Task.Delay(firstPage ? 2000 : 1500);
+
+        // Сначала новые посты: промокоды быстро истекают, свежие важнее.
+        var fresh = (await ExtractPostsRawAsync(page))
+            .Where(p => !cursor.SeenPostIds.Contains(p.PostId))
+            .OrderByDescending(p => ParsePostNumber(p.PostId))
+            .Take(Math.Max(0, maxPostsPerChannel - cursor.PostsRead))
+            .ToList();
+
+        cursor.PagesRead++;
+        _logger.Info($"[Telegram] Канал {cursor.Name}: страница {cursor.PagesRead}, новых постов: {fresh.Count}");
+
+        if (fresh.Count == 0)
+        {
+            cursor.Exhausted = true;
+            if (cursor.PostsRead == 0)
+            {
+                _logger.Warn($"[Telegram] Канал {cursor.Name}: не найдено постов. Возможно канал недоступен или заблокирован.");
+                channelResult.Errors.Add($"Канал {cursor.Name}: посты не найдены");
+            }
+
+            return;
+        }
+
+        // Разбираем сразу, пока страница открыта: скриншот поста без ссылок
+        // можно снять только с той страницы, где он виден.
+        foreach (var (text, postId) in fresh)
+        {
+            cursor.SeenPostIds.Add(postId);
+            await AnalyzePostAsync(page, cursor.Name, text, postId, channelResult);
+        }
+
+        cursor.PostsRead += fresh.Count;
+
+        var oldest = fresh.Select(p => ParsePostNumber(p.PostId)).Where(n => n > 0).DefaultIfEmpty(0).Min();
+        if (oldest <= 1)
+        {
+            cursor.Exhausted = true;
+        }
+        else
+        {
+            cursor.OldestId = oldest;
+        }
     }
 
     /// <summary>Ищет в посте ссылки на ассеты, git-ссылки и промокоды.</summary>
@@ -465,8 +507,32 @@ internal sealed class TelegramSourceParser
     }
 }
 
+/// <summary>
+/// Где остановилось чтение канала. Нужен, чтобы брать ассеты пачками:
+/// следующая пачка начинается с постов старше уже прочитанных.
+/// </summary>
+internal sealed class TelegramChannelCursor(string name)
+{
+    public string Name { get; } = name;
+
+    /// <summary>Номер самого старого прочитанного поста. 0 — канал ещё не открывали.</summary>
+    public int OldestId { get; set; }
+
+    public bool Exhausted { get; set; }
+    public int PostsRead { get; set; }
+    public int PagesRead { get; set; }
+
+    /// <summary>Канал не открылся в текущем чтении. Сбрасывается перед повтором через другой прокси.</summary>
+    public bool FailedThisRead { get; set; }
+
+    public HashSet<string> SeenPostIds { get; } = new(StringComparer.OrdinalIgnoreCase);
+}
+
 internal sealed class TelegramParseResult
 {
+    /// <summary>Каналы, которые не открылись в этом чтении.</summary>
+    public List<string> FailedChannels { get; set; } = [];
+
     public List<string> AssetUrls { get; set; } = [];
     public List<string> GitLinks { get; set; } = [];
     public List<string> Promocodes { get; set; } = [];

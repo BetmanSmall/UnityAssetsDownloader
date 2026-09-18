@@ -402,69 +402,8 @@ internal sealed class UnityAssetAutomationApp
             var assetUrls = await CollectAssetUrlsAsync(page, sources);
             var assetPromocodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-            // Парсинг Telegram каналов (если указаны)
-            if (_options.TelegramChannels.Count > 0)
-            {
-                var tgResult = await ParseTelegramChannelsAsync(browser);
-
-                if (tgResult.AssetUrls.Count > 0)
-                {
-                    _logger.Info($"Telegram: найдено ссылок на ассеты: {tgResult.AssetUrls.Count}");
-                    foreach (var url in tgResult.AssetUrls)
-                    {
-                        assetUrls.Add(url);
-                        _logger.Debug($"Telegram asset: {url}");
-                    }
-                }
-
-                if (tgResult.AssetPromocodes.Count > 0)
-                {
-                    foreach (var kvp in tgResult.AssetPromocodes)
-                    {
-                        assetPromocodes[kvp.Key] = kvp.Value;
-                    }
-                }
-
-                if (tgResult.GitLinks.Count > 0)
-                {
-                    var gitLogPath = Path.Combine(_logsDirectory, "telegram_git_links.log");
-                    await File.WriteAllLinesAsync(gitLogPath, tgResult.GitLinks);
-                    _logger.Info($"Telegram git-ссылки сохранены в: {gitLogPath} (всего: {tgResult.GitLinks.Count})");
-                }
-
-                if (tgResult.Promocodes.Count > 0)
-                {
-                    var promoLogPath = Path.Combine(_logsDirectory, "telegram_promocodes.log");
-                    await File.WriteAllLinesAsync(promoLogPath, tgResult.Promocodes);
-                    _logger.Info($"Telegram промокоды сохранены в: {promoLogPath} (всего: {tgResult.Promocodes.Count})");
-                }
-
-                if (tgResult.PostsWithoutLinks.Count > 0)
-                {
-                    var where = _options.TelegramScreenshotOnNoLinks
-                        ? " Скриншоты сохранены в logs/telegram/"
-                        : " Их тексты есть в telegram_posts_raw.log.";
-                    _logger.Info(
-                        $"Telegram: постов без ссылок на Asset Store: {tgResult.PostsWithoutLinks.Count}.{where}");
-                }
-
-                if (tgResult.Errors.Count > 0)
-                {
-                    foreach (var err in tgResult.Errors)
-                    {
-                        _logger.Warn($"Telegram ошибка: {err}");
-                    }
-                }
-            }
-
-            _logger.Info($"Найдено уникальных ассетов: {assetUrls.Count}");
-            var report = new RunReport
-            {
-                StartedAtUtc = DateTime.UtcNow,
-                DryRun = _options.DryRun,
-                Sources = sources
-            };
-
+            // Память профиля нужна ещё до Telegram: пачка из каналов набирается
+            // только из ассетов, про которые ещё ничего не известно.
             var profileDirectory = _profileStore.GetProfileDirectory(_profileName);
             var ownedCache = new OwnedAssetsCache(profileDirectory);
             var deprecatedCache = new OwnedAssetsCache(
@@ -479,6 +418,75 @@ internal sealed class UnityAssetAutomationApp
             _rejectedPromoCache = rejectedPromoCache;
             var skippedKnown = 0;
             var skippedDeprecated = 0;
+
+            var report = new RunReport
+            {
+                StartedAtUtc = DateTime.UtcNow,
+                DryRun = _options.DryRun,
+                Sources = sources
+            };
+
+            // Ассеты, про которые всё известно с прошлых запусков: страницу не открываем.
+            // Возвращает true, если ассет пропущен.
+            bool SkipIfKnown(string url)
+            {
+                if (_options.RecheckOwned)
+                {
+                    return false;
+                }
+
+                if (ownedCache.Contains(url))
+                {
+                    skippedKnown++;
+                    report.Items.Add(new ProcessResult
+                    {
+                        Url = url,
+                        Status = AssetProcessStatus.AlreadyOwned,
+                        Message = "Уже был на аккаунте (известно с прошлых запусков, страница не открывалась)."
+                    });
+                    return true;
+                }
+
+                if (deprecatedCache.Contains(url))
+                {
+                    skippedDeprecated++;
+                    report.Items.Add(new ProcessResult
+                    {
+                        Url = url,
+                        Status = AssetProcessStatus.Deprecated,
+                        Message = "Удалён из магазина (известно с прошлых запусков, страница не открывалась)."
+                    });
+                    return true;
+                }
+
+                return false;
+            }
+
+            // Telegram: пачками (по умолчанию) — собрали пачку, проверили в магазине, собираем
+            // следующую из более старых постов. С --tg-batch-size 0 — всё разом, как раньше.
+            var batchSize = _options.TelegramBatchSize;
+            List<TelegramChannelCursor>? telegramCursors = null;
+
+            if (_options.TelegramChannels.Count > 0)
+            {
+                if (batchSize > 0)
+                {
+                    telegramCursors = _options.TelegramChannels.Select(c => new TelegramChannelCursor(c)).ToList();
+                    _logger.Info(
+                        $"Telegram: ассеты берутся пачками по {batchSize}. Собрали пачку — проверили в магазине — " +
+                        "собираем следующую из более старых постов. Лимит постов на канал при этом не действует.");
+                }
+                else
+                {
+                    var tgResult = await ReadTelegramOnceAsync(browser);
+                    await ReportTelegramResultAsync(tgResult, assetPromocodes);
+                    assetUrls.AddRange(tgResult.AssetUrls);
+                }
+            }
+
+            _logger.Info(telegramCursors is null
+                ? $"Найдено уникальных ассетов: {assetUrls.Distinct(StringComparer.OrdinalIgnoreCase).Count()}"
+                : $"Найдено уникальных ассетов в списках: {assetUrls.Distinct(StringComparer.OrdinalIgnoreCase).Count()}, из Telegram — пачками дальше.");
 
             if (!_options.RecheckOwned && (ownedCache.Count > 0 || deprecatedCache.Count > 0))
             {
@@ -498,9 +506,96 @@ internal sealed class UnityAssetAutomationApp
                 _logger.Info($"Включен лимит по посещенным ассетам: {_options.MaxVisitedAssets.Value}");
             }
 
-            var index = 0;
-            foreach (var assetUrl in assetUrls)
+            // Очередь на проверку: сначала ссылки из списков, потом пачки из Telegram.
+            var queue = new Queue<(string Url, string Label)>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var listUrls = assetUrls.Where(seen.Add).ToList();
+            for (var i = 0; i < listUrls.Count; i++)
             {
+                queue.Enqueue((listUrls[i], $"{i + 1}/{listUrls.Count}"));
+            }
+
+            var telegramPending = new List<string>();
+            var batchNo = 0;
+            var telegramSilentReads = 0;
+
+            // Следующая пачка из Telegram: читаем каналы, пока не наберётся batchSize новых
+            // ассетов (не проверенных в этом запуске и не известных по памяти профиля).
+            // Лишнее, что пришло с последней страницей, ждёт следующей пачки.
+            async Task<List<string>> NextTelegramBatchAsync()
+            {
+                var need = batchSize - telegramPending.Count;
+                if (need > 0 && telegramCursors!.Any(c => !c.Exhausted) && telegramSilentReads < 2)
+                {
+                    _logger.Info($"==== Telegram: собираем пачку №{batchNo + 1} (нужно ещё {need} новых ассетов) ====");
+                    var tg = await ParseTelegramChannelsAsync(
+                        browser, telegramCursors!, need,
+                        url => !seen.Contains(url) && (_options.RecheckOwned || (!ownedCache.Contains(url) && !deprecatedCache.Contains(url))),
+                        maxPostsPerChannel: int.MaxValue, maxPagesPerChannel: int.MaxValue);
+
+                    await ReportTelegramResultAsync(tg, assetPromocodes);
+                    foreach (var url in tg.AssetUrls)
+                    {
+                        if (seen.Add(url) && !SkipIfKnown(url))
+                        {
+                            telegramPending.Add(url);
+                        }
+                    }
+
+                    // Два чтения подряд без единого поста — Telegram перестал открываться.
+                    telegramSilentReads = tg.AllPosts.Count == 0 ? telegramSilentReads + 1 : 0;
+                    if (telegramSilentReads >= 2)
+                    {
+                        _logger.Warn("Telegram два раза подряд не отдал ни одного поста. Дальше каналы не читаем.");
+                    }
+                }
+
+                var batch = telegramPending.Take(batchSize).ToList();
+                telegramPending.RemoveRange(0, batch.Count);
+
+                if (batch.Count == 0)
+                {
+                    _logger.Info(telegramCursors!.All(c => c.Exhausted)
+                        ? "Telegram: посты в каналах кончились, новых ассетов больше нет."
+                        : "Telegram: новых ассетов больше не нашлось.");
+                }
+
+                return batch;
+            }
+
+            var index = 0;
+
+            bool LimitReached() =>
+                (_options.MaxAddAttempts.HasValue && newlyAddedCount >= _options.MaxAddAttempts.Value) ||
+                (_options.MaxVisitedAssets.HasValue && index >= _options.MaxVisitedAssets.Value);
+
+            while (true)
+            {
+                if (queue.Count == 0)
+                {
+                    if (telegramCursors is null || LimitReached())
+                    {
+                        break;
+                    }
+
+                    var batch = await NextTelegramBatchAsync();
+                    if (batch.Count == 0)
+                    {
+                        break;
+                    }
+
+                    batchNo++;
+                    _logger.Info($"==== Пачка №{batchNo} из Telegram: {batch.Count} ассетов, проверяем их в магазине" +
+                                 (telegramPending.Count > 0 ? $" (ещё {telegramPending.Count} ждут следующей пачки)" : string.Empty) +
+                                 " ====");
+                    for (var i = 0; i < batch.Count; i++)
+                    {
+                        queue.Enqueue((batch[i], $"пачка {batchNo}: {i + 1}/{batch.Count}"));
+                    }
+                }
+
+                var (assetUrl, label) = queue.Dequeue();
+
                 if (_options.MaxVisitedAssets.HasValue && index >= _options.MaxVisitedAssets.Value)
                 {
                     _logger.Warn(
@@ -516,32 +611,13 @@ internal sealed class UnityAssetAutomationApp
                 }
 
                 // Ассеты, про которые уже всё известно, не открываем вовсе.
-                if (!_options.RecheckOwned && ownedCache.Contains(assetUrl))
+                if (SkipIfKnown(assetUrl))
                 {
-                    skippedKnown++;
-                    report.Items.Add(new ProcessResult
-                    {
-                        Url = assetUrl,
-                        Status = AssetProcessStatus.AlreadyOwned,
-                        Message = "Уже был на аккаунте (известно с прошлых запусков, страница не открывалась)."
-                    });
-                    continue;
-                }
-
-                if (!_options.RecheckOwned && deprecatedCache.Contains(assetUrl))
-                {
-                    skippedDeprecated++;
-                    report.Items.Add(new ProcessResult
-                    {
-                        Url = assetUrl,
-                        Status = AssetProcessStatus.Deprecated,
-                        Message = "Удалён из магазина (известно с прошлых запусков, страница не открывалась)."
-                    });
                     continue;
                 }
 
                 index++;
-                _logger.Info($"[{index}/{assetUrls.Count}] {assetUrl}");
+                _logger.Info($"[{label}] {assetUrl}");
 
                 assetPromocodes.TryGetValue(assetUrl, out var promoCode);
                 if (promoCode != null && !_options.RecheckOwned &&
@@ -852,13 +928,87 @@ internal sealed class UnityAssetAutomationApp
         return Directory.Exists(candidate) ? candidate : null;
     }
 
+    private readonly List<string> _telegramGitLinks = [];
+    private readonly List<string> _telegramPromocodes = [];
+
+    /// <summary>
+    /// Пишет в лог, что принесло чтение Telegram, и копит найденное за весь запуск:
+    /// промокоды — в общий словарь (код из более свежего поста не перетирается),
+    /// git-ссылки и промокоды — в файлы в logs/.
+    /// </summary>
+    private async Task ReportTelegramResultAsync(TelegramParseResult tgResult, Dictionary<string, string> assetPromocodes)
+    {
+        if (tgResult.AssetUrls.Count > 0)
+        {
+            _logger.Info($"Telegram: найдено ссылок на ассеты: {tgResult.AssetUrls.Count}");
+            foreach (var url in tgResult.AssetUrls)
+            {
+                _logger.Debug($"Telegram asset: {url}");
+            }
+        }
+
+        foreach (var kvp in tgResult.AssetPromocodes)
+        {
+            assetPromocodes.TryAdd(kvp.Key, kvp.Value);
+        }
+
+        if (tgResult.GitLinks.Count > 0)
+        {
+            _telegramGitLinks.AddRange(tgResult.GitLinks.Except(_telegramGitLinks, StringComparer.OrdinalIgnoreCase).ToList());
+            var gitLogPath = Path.Combine(_logsDirectory, "telegram_git_links.log");
+            await File.WriteAllLinesAsync(gitLogPath, _telegramGitLinks);
+            _logger.Info($"Telegram git-ссылки сохранены в: {gitLogPath} (всего: {_telegramGitLinks.Count})");
+        }
+
+        if (tgResult.Promocodes.Count > 0)
+        {
+            _telegramPromocodes.AddRange(tgResult.Promocodes);
+            var promoLogPath = Path.Combine(_logsDirectory, "telegram_promocodes.log");
+            await File.WriteAllLinesAsync(promoLogPath, _telegramPromocodes);
+            _logger.Info($"Telegram промокоды сохранены в: {promoLogPath} (всего: {_telegramPromocodes.Count})");
+        }
+
+        if (tgResult.PostsWithoutLinks.Count > 0)
+        {
+            var where = _options.TelegramScreenshotOnNoLinks
+                ? " Скриншоты сохранены в logs/telegram/"
+                : " Их тексты есть в telegram_posts_raw.log.";
+            _logger.Info($"Telegram: постов без ссылок на Asset Store: {tgResult.PostsWithoutLinks.Count}.{where}");
+        }
+
+        foreach (var err in tgResult.Errors)
+        {
+            _logger.Warn($"Telegram ошибка: {err}");
+        }
+    }
+
+    /// <summary>Читает каналы за один раз: с каждого до telegram.postLimit последних постов.</summary>
+    private Task<TelegramParseResult> ReadTelegramOnceAsync(IBrowser mainBrowser) =>
+        ParseTelegramChannelsAsync(
+            mainBrowser,
+            _options.TelegramChannels.Select(c => new TelegramChannelCursor(c)).ToList(),
+            wantAssets: int.MaxValue,
+            isWanted: _ => true,
+            maxPostsPerChannel: _options.TelegramPostLimit,
+            maxPagesPerChannel: TelegramSourceParser.MaxPagesPerChannel);
+
     /// <summary>
     /// Разбирает Telegram-каналы. Если задан отдельный прокси для Telegram,
     /// поднимает под это второй браузер, чтобы Unity продолжал ходить напрямую.
+    ///
+    /// Курсоры помнят, где остановилось чтение каждого канала: при сборе пачками
+    /// следующий вызов продолжает с более старых постов. Чтение идёт, пока не наберётся
+    /// wantAssets ассетов, подходящих под isWanted, или пока не кончатся посты.
     /// </summary>
-    private async Task<TelegramParseResult> ParseTelegramChannelsAsync(IBrowser mainBrowser)
+    private async Task<TelegramParseResult> ParseTelegramChannelsAsync(
+        IBrowser mainBrowser,
+        List<TelegramChannelCursor> cursors,
+        int wantAssets,
+        Func<string, bool> isWanted,
+        int maxPostsPerChannel,
+        int maxPagesPerChannel)
     {
-        _logger.Info($"Запуск парсинга Telegram каналов: {string.Join(", ", _options.TelegramChannels)}");
+        _logger.Info($"Запуск парсинга Telegram каналов: {string.Join(", ", cursors.Select(c => c.Name))}");
 
         IBrowser tgBrowser = mainBrowser;
         IBrowser? ownBrowser = null;
@@ -930,10 +1080,11 @@ internal sealed class UnityAssetAutomationApp
             // Бесплатный прокси может открыть один канал и сорваться на другом.
             // Поэтому каналы, которые не открылись, пробуем через следующий прокси,
             // а уже прочитанные не перечитываем.
-            var pending = new List<string>(_options.TelegramChannels);
+            var pending = cursors.Where(c => !c.Exhausted).ToList();
+            var wantedFound = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var proxySaved = false;
 
-            for (var i = 0; i < candidates.Count && i < 4 && pending.Count > 0; i++)
+            for (var i = 0; i < candidates.Count && i < 4 && pending.Count > 0 && wantedFound.Count < wantAssets; i++)
             {
                 var candidate = candidates[i];
 
@@ -953,7 +1104,7 @@ internal sealed class UnityAssetAutomationApp
                 {
                     if (i > 0)
                     {
-                        _logger.Warn($"Пробуем запасной прокси: {candidate} (каналы: {string.Join(", ", pending)})");
+                        _logger.Warn($"Пробуем запасной прокси: {candidate} (каналы: {string.Join(", ", pending.Select(c => c.Name))})");
                     }
 
                     ownBrowser = await LaunchTelegramBrowserAsync(candidate);
@@ -962,19 +1113,26 @@ internal sealed class UnityAssetAutomationApp
                     _logger.Info("Unity при этом работает напрямую, без прокси.");
                 }
 
-                var partial = await RunParserAsync(tgBrowser, pending);
+                foreach (var cursor in pending)
+                {
+                    cursor.FailedThisRead = false;
+                }
+
+                var partial = await RunParserAsync(tgBrowser, pending, wantAssets - wantedFound.Count);
                 MergeTelegramResults(result, partial);
+                foreach (var url in partial.AssetUrls.Where(isWanted))
+                {
+                    wantedFound.Add(url);
+                }
 
-                var opened = partial.AllPosts
-                    .Select(p => p.ChannelName)
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                pending.RemoveAll(opened.Contains);
-
-                if (opened.Count > 0 && !proxySaved && !string.IsNullOrWhiteSpace(candidate))
+                var failed = pending.Where(c => c.FailedThisRead).ToList();
+                if (failed.Count < pending.Count && !proxySaved && !string.IsNullOrWhiteSpace(candidate))
                 {
                     await RememberProxyAsync(candidate);
                     proxySaved = true;
                 }
+
+                pending = failed;
 
                 if (pending.Count > 0 && !LooksBlocked(partial))
                 {
@@ -984,14 +1142,20 @@ internal sealed class UnityAssetAutomationApp
 
             if (pending.Count > 0 && result.AllPosts.Count > 0)
             {
-                _logger.Warn($"Telegram: не открылись каналы: {string.Join(", ", pending)}. Их посты в этот раз пропущены.");
+                _logger.Warn($"Telegram: не открылись каналы: {string.Join(", ", pending.Select(c => c.Name))}. Их посты в этот раз пропущены.");
+            }
+
+            // Следующая пачка снова пробует все каналы.
+            foreach (var cursor in cursors)
+            {
+                cursor.FailedThisRead = false;
             }
 
             await SaveTelegramPostsAsync(result);
             ExplainTelegramFailure(result);
             return result;
 
-            async Task<TelegramParseResult> RunParserAsync(IBrowser browser, List<string> channels)
+            async Task<TelegramParseResult> RunParserAsync(IBrowser browser, List<TelegramChannelCursor> channels, int want)
             {
                 var parser = new TelegramSourceParser(
                     browser,
@@ -1001,7 +1165,7 @@ internal sealed class UnityAssetAutomationApp
                     _options.TelegramPostLimit,
                     _options.TelegramScreenshotOnNoLinks);
 
-                return await parser.ParseChannelsAsync(channels);
+                return await parser.ReadAsync(channels, want, isWanted, maxPostsPerChannel, maxPagesPerChannel);
             }
         }
         finally
@@ -1049,6 +1213,7 @@ internal sealed class UnityAssetAutomationApp
         total.PostsWithoutLinks.AddRange(partial.PostsWithoutLinks);
         total.AllPosts.AddRange(partial.AllPosts);
         total.Errors = partial.Errors;
+        total.FailedChannels = partial.FailedChannels;
 
         foreach (var kvp in partial.AssetPromocodes)
         {
@@ -1428,7 +1593,7 @@ internal sealed class UnityAssetAutomationApp
             return;
         }
 
-        var result = await ParseTelegramChannelsAsync(browser);
+        var result = await ReadTelegramOnceAsync(browser);
 
         _logger.Info("============================================================");
         _logger.Info(" ИТОГ ПРОВЕРКИ TELEGRAM");
@@ -2924,7 +3089,9 @@ internal sealed class UnityAssetAutomationApp
             }
         };
 
-        page.PageError += (_, e) => _logger.Warn($"PAGE ERROR: {e.Message}");
+        // Ошибки скриптов самого магазина: к работе программы отношения не имеют, а каждая —
+        // это сотни строк стека. В обычном логе они мешали найти настоящие проблемы.
+        page.PageError += (_, e) => _logger.Debug($"PAGE ERROR: {e.Message}");
     }
 
     private static bool IsKnownNoiseConsoleMessage(ConsoleMessage message)
@@ -3837,6 +4004,9 @@ internal sealed class UnityAssetAutomationApp
             return result;
         }
 
+        // После нажатия оплаты ошибка страницы не повод чистить корзину: сначала выясняем, куплен ли ассет.
+        var payClicked = false;
+
         try
         {
             // 1. Кладём ассет в корзину. Только кнопкой «Add to Cart»: «Buy Now» на странице
@@ -4262,35 +4432,15 @@ internal sealed class UnityAssetAutomationApp
                 return result;
             }
 
-            _logger.Info($"[Промокод][Шаг 8] Кнопка Pay нажата. Ожидание завершения транзакции (10с)...");
-            await Task.Delay(10000);
-            _logger.Debug($"[Промокод][Шаг 8] URL после транзакции: {page.Url}");
+            payClicked = true;
+            _logger.Info("[Промокод][Шаг 8] Кнопка Pay нажата. Ждём, пока магазин оформит заказ...");
 
-            await SaveErrorScreenshotAsync(page, $"promo_checkout_success_{sanitizedId}");
-
-            // 9. Проверка успешного завершения покупки
+            // 9. Проверка: после оплаты магазин уводит на свою страницу заказа, и страница
+            // меняется прямо во время проверки. Ждём переходов и спрашиваем сам магазин.
             stepSw.Restart();
-            _logger.Info($"[Промокод][Шаг 9] Проверка успешного завершения | URL: {page.Url}");
-            var successState = await page.EvaluateFunctionAsync<bool>(@"() => {
-                const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                const text = normalize(document.body?.innerText || '');
-                return text.includes('thank you') || text.includes('success') || text.includes('order completed') || text.includes('успешно') || text.includes('спасибо за покупку') || window.location.href.includes('success');
-            }");
+            var purchased = await VerifyPromoPurchaseAsync(page, assetUrl, sanitizedId);
 
-            if (!successState && !page.Url.Contains("success", StringComparison.OrdinalIgnoreCase))
-            {
-                // Страницу благодарности могли не узнать. Надёжнее спросить сам магазин:
-                // если на странице ассета теперь «Open in Unity», он уже наш.
-                _logger.Info("[Промокод][Шаг 9] Страница благодарности не распознана. Проверяем страницу ассета...");
-                await SaveHtmlDumpAsync(page, $"promo_dump_step9_unknown_{sanitizedId}");
-                await SafeGoToAsync(page, assetUrl);
-                await WaitForAssetSignalsAsync(page, TimeSpan.FromSeconds(20));
-                var ownedNow = await DetectStatusAsync(page);
-                successState = ownedNow.IsOwned || ownedNow.HasOpenInUnity;
-                _logger.Debug($"[Промокод][Шаг 9] Статус ассета после оплаты: {ownedNow.DetectionSummary}");
-            }
-
-            if (successState || page.Url.Contains("success", StringComparison.OrdinalIgnoreCase))
+            if (purchased)
             {
                 result.Status = AssetProcessStatus.Added;
                 _logger.Info($"[УСПЕХ] Ассет успешно получен по промокоду: {assetUrl}");
@@ -4299,11 +4449,25 @@ internal sealed class UnityAssetAutomationApp
             else
             {
                 result.Status = AssetProcessStatus.UnknownAfterClick;
+                result.Message = "Кнопка оплаты нажата, но ассет на аккаунте не появился.";
                 _logger.Warn($"[Внимание] Кнопка оформления по промокоду нажата, но ассет на аккаунте не появился: {page.Url}");
-                _logger.Warn($"[Внимание][Шаг 9] Кнопка Pay нажата, но успех не подтверждён. Итого: {totalSw.Elapsed.TotalSeconds:F1}с | URL: {page.Url}");
+                _logger.Warn($"[Внимание][Шаг 9] Успех не подтверждён. Итого: {totalSw.Elapsed.TotalSeconds:F1}с | URL: {page.Url}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step9_unknown_{sanitizedId}");
             }
 
             _logger.Info($"[Промокод] ===== КОНЕЦ выкупа по промокоду '{promoCode}' | статус: {result.Status} | {totalSw.Elapsed.TotalSeconds:F1}с =====");
+            return result;
+        }
+        catch (Exception ex) when (payClicked)
+        {
+            // Оплата уже нажата — корзину не трогаем, а выясняем, куплен ли ассет.
+            _logger.Warn($"[Промокод][Шаг 9] Сбой после нажатия оплаты ({ex.Message}). Проверяем страницу ассета...");
+            var purchased = await VerifyPromoPurchaseAsync(page, assetUrl, sanitizedId);
+            result.Status = purchased ? AssetProcessStatus.Added : AssetProcessStatus.UnknownAfterClick;
+            result.Message = purchased ? null : $"После оплаты произошёл сбой: {ex.Message}";
+            _logger.Info(purchased
+                ? $"[УСПЕХ] Ассет успешно получен по промокоду: {assetUrl}"
+                : $"[Внимание] Кнопка оплаты нажата, но ассет на аккаунте не появился: {assetUrl}");
             return result;
         }
         catch (Exception ex)
@@ -4317,6 +4481,79 @@ internal sealed class UnityAssetAutomationApp
             await ClearCartAsync(page);
             return result;
         }
+    }
+
+    /// <summary>
+    /// Проверяет покупку после «Pay now». Магазин уводит на свою страницу заказа
+    /// (assetstore.unity.com/orders/&lt;id&gt;/confirm), и адрес меняется несколько раз.
+    /// Сначала ждём, пока переходы закончатся (не уходим со страницы подтверждения
+    /// раньше времени), потом открываем страницу ассета: «Open in Unity» значит, что он наш.
+    /// </summary>
+    private async Task<bool> VerifyPromoPurchaseAsync(IPage page, string assetUrl, string sanitizedId)
+    {
+        var stopAt = DateTime.UtcNow.AddSeconds(30);
+        var lastUrl = string.Empty;
+        var thanks = false;
+
+        while (DateTime.UtcNow < stopAt && !thanks)
+        {
+            var url = page.Url;
+            if (url != lastUrl)
+            {
+                _logger.Info($"[Промокод][Шаг 9] Сейчас открыто: {ShortUrl(url)}");
+                lastUrl = url;
+            }
+
+            try
+            {
+                thanks = await page.EvaluateFunctionAsync<bool>(@"() => {
+                    const text = (document.body ? document.body.innerText : '').replace(/\s+/g, ' ').toLowerCase();
+                    return text.includes('thank you for your purchase') || text.includes('thank you for your order') ||
+                           text.includes('order completed') || text.includes('order confirmed') ||
+                           text.includes('спасибо за покупку') || text.includes('заказ оформлен');
+                }");
+            }
+            catch (Exception ex) when (IsTransientPageError(ex))
+            {
+                // Страница ещё переходит — это нормально.
+            }
+
+            if (!thanks)
+            {
+                await Task.Delay(1000);
+            }
+        }
+
+        _logger.Info(thanks
+            ? "[Промокод][Шаг 9] Магазин показал страницу благодарности за покупку."
+            : "[Промокод][Шаг 9] Страницы благодарности не видно. Проверяем по странице ассета.");
+        await SaveErrorScreenshotAsync(page, $"promo_after_pay_{sanitizedId}");
+
+        for (var attempt = 1; attempt <= 2; attempt++)
+        {
+            try
+            {
+                await SafeGoToAsync(page, assetUrl);
+                await WaitForAssetSignalsAsync(page, TimeSpan.FromSeconds(20));
+                var status = await DetectStatusAsync(page);
+                _logger.Debug($"[Промокод][Шаг 9] Статус ассета после оплаты: {status.DetectionSummary}");
+
+                if (status.IsOwned || status.HasOpenInUnity)
+                {
+                    _logger.Info("[Промокод][Шаг 9] На странице ассета 'Open in Unity': ассет на аккаунте.");
+                    return true;
+                }
+
+                break;
+            }
+            catch (Exception ex) when (IsTransientPageError(ex))
+            {
+                await Task.Delay(2000);
+            }
+        }
+
+        // Магазин поблагодарил, но кнопка на странице ассета ещё не обновилась — так бывает первые минуты.
+        return thanks;
     }
 
     /// <summary>
@@ -4482,7 +4719,8 @@ internal sealed class UnityAssetAutomationApp
             }
 
             const body = normalize(document.body ? document.body.innerText : '');
-            const empty = body.includes('your shopping cart is empty') || body.includes('корзина пуста');
+            const empty = ['your shopping cart is empty', 'cart is empty', 'no items in your cart', 'корзина пуста', 'в корзине нет']
+                .some(t => body.includes(t));
             return JSON.stringify({ empty, items });
         }");
 
@@ -6248,6 +6486,10 @@ internal sealed class CliOptions
     // Telegram
     public List<string> TelegramChannels { get; init; } = [];
     public int TelegramPostLimit { get; init; } = 50;
+
+    /// <summary>Сколько ассетов собирать из Telegram за одну пачку. 0 — читать всё разом по TelegramPostLimit.</summary>
+    public int TelegramBatchSize { get; init; } = 30;
+
     public bool TelegramScreenshotOnNoLinks { get; init; } = true;
 
     public static CliOptions Parse(string[] args)
@@ -6287,6 +6529,7 @@ internal sealed class CliOptions
         int? cliAuthTimeoutMs = null;
         int? cliAssetUiTimeoutMs = null;
         int? cliMaxAddAttempts = null;
+        int? cliTelegramBatchSize = null;
         int? cliMaxVisitedAssets = null;
         var cliSources = new List<string>();
         var cliExtraSourceFiles = new List<string>();
@@ -6429,6 +6672,15 @@ internal sealed class CliOptions
                     if (int.TryParse(args[++i], out var assetUiTimeout) && assetUiTimeout >= 5000)
                     {
                         cliAssetUiTimeoutMs = assetUiTimeout;
+                    }
+
+                    break;
+                }
+                case "--tg-batch-size" when i + 1 < args.Length:
+                {
+                    if (int.TryParse(args[++i], out var parsedBatch) && parsedBatch >= 0)
+                    {
+                        cliTelegramBatchSize = parsedBatch;
                     }
 
                     break;
@@ -6715,6 +6967,7 @@ internal sealed class CliOptions
             ProxyPort = proxyPort,
             TelegramChannels = telegramChannels,
             TelegramPostLimit = telegramPostLimit,
+            TelegramBatchSize = cliTelegramBatchSize ?? config?.Telegram?.BatchSize ?? 30,
             TelegramScreenshotOnNoLinks = telegramScreenshotOnNoLinks
         };
     }
@@ -6904,6 +7157,9 @@ internal sealed class TelegramConfig
     public bool? AutoProxy { get; init; }
     public List<string> Channels { get; init; } = [];
     public int PostLimit { get; init; } = 50;
+
+    /// <summary>Размер пачки ассетов из Telegram. 0 — читать всё разом по postLimit.</summary>
+    public int? BatchSize { get; init; }
     public bool ScreenshotOnNoLinks { get; init; } = true;
 }
 
