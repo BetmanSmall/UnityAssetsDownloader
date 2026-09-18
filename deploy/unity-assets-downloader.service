@@ -1,0 +1,31 @@
+# Служба systemd для запуска без Docker.
+# Нужны .NET 8 и Chromium (например: apt install chromium).
+#
+#   sudo cp deploy/unity-assets-downloader.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now unity-assets-downloader
+#
+# Логи: journalctl -u unity-assets-downloader -f
+# Пароль и токен — в /etc/unity-assets-downloader.env (права 600), формат как в .env.example.
+
+[Unit]
+Description=UnityAssetsDownloader: новые ассеты из Telegram-каналов
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=unityassets
+WorkingDirectory=/opt/unity-assets-downloader
+EnvironmentFile=/etc/unity-assets-downloader.env
+ExecStart=/usr/bin/dotnet /opt/unity-assets-downloader/UnityAssetsDownloader.dll \
+    --logs-dir /opt/unity-assets-downloader/logs --data-dir /opt/unity-assets-downloader/data \
+    --watch --watch-interval 24h --profile server --no-defaults --quiet
+Restart=on-failure
+RestartSec=60
+# Браузер оставляет дочерние процессы: при остановке гасим всю группу.
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

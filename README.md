@@ -151,6 +151,12 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --hea
 | `--sign-in-url <url>` | Точка входа. По умолчанию `https://assetstore.unity.com/auth/login` |
 | `--tg-proxy <url>` | Прокси **только** для Telegram, например `socks5://127.0.0.1:1080`. Unity при этом ходит напрямую |
 | `--tg-auto-proxy true/false` | Искать ли рабочий прокси самому, когда Telegram не открылся. Включено по умолчанию |
+| `--watch` | Режим сервера: прогон, пауза `--watch-interval`, снова прогон. Невидимый браузер, только новые посты, без вопросов в консоли |
+| `--watch-interval <период>` | Период между прогонами: `30m`, `6h`, `1d`. По умолчанию `24h` (`server.interval` в `config.json`) |
+| `--tg-only-new` | Читать в каналах только посты, появившиеся после прошлого прогона (`telegram.onlyNew`) |
+| `--notify-bot-token <токен>` | Telegram-бот для сообщений (или `TELEGRAM_BOT_TOKEN`, `notify.telegramBotToken`) |
+| `--notify-chat-id <id>` | Куда писать. Можно не задавать: напишите боту сообщение, и он запомнит чат (`TELEGRAM_CHAT_ID`) |
+| `--notify-test` | Отправить боту проверочное сообщение и выйти |
 | `--tg-batch-size <N>` | Сколько новых ассетов собирать из Telegram за одну пачку, прежде чем проверять их в магазине. По умолчанию 30 (`telegram.batchSize` в `config.json`). `0` — читать каналы разом по `telegram.postLimit` |
 | `--tg-proxy-list <url\|файл>` | Откуда брать список. По умолчанию — [hookzof/socks5_list](https://github.com/hookzof/socks5_list) |
 | `--check-telegram` | Открыть каналы, показать что нашлось, и выйти. Вход в Unity не нужен |
@@ -520,7 +526,81 @@ dotnet run --project UnityAssetsDownloader\UnityAssetsDownloader.csproj -- ^
 
 ---
 
-## 8. Что планируется дальше
+## 8. Сервер: сам следит за каналами
+
+На выделенном Linux-сервере программа может работать без присмотра: раз в сутки
+(или как настроите) читает Telegram-каналы, берёт **только новые посты** с прошлого
+прогона, добавляет бесплатные ассеты, выкупает по промокоду (только при итоге 0)
+и пишет вам в Telegram, что сделала.
+
+### Установка через Docker (рекомендуется)
+
+Нужны Docker и Docker Compose. Всё остальное — .NET, Chromium, шрифты — уже в образе.
+
+```bash
+git clone https://github.com/BetmanSmall/UnityAssetsDownloader
+cd UnityAssetsDownloader
+cp .env.example .env
+nano .env                     # email и пароль Unity, токен бота, период
+docker compose up -d --build
+```
+
+Потом напишите своему боту в Telegram любое сообщение — он запомнит, куда писать.
+Проверить связь: `docker compose run --rm unity-assets --notify-test`.
+
+| Что | Как |
+|---|---|
+| Логи прогона | `docker compose logs -f` и файлы в `./logs` |
+| Каналы | `telegram_sources.txt` — правка подхватится в следующем прогоне |
+| Период | `WATCH_INTERVAL` в `.env`: `30m`, `6h`, `1d`. После правки — `docker compose up -d` |
+| Остановить | `docker compose down` |
+| Обновить | `git pull && docker compose up -d --build` |
+
+### Что где хранится
+
+В `./data/profiles/<профиль>/`: сессия Unity, память об уже добавленных ассетах и
+`telegram_state.json` — номер последнего прочитанного поста в каждом канале.
+Удалите этот файл, чтобы следующий прогон снова взял последние посты
+(`telegram.postLimit`, по умолчанию 50).
+
+### Вход в Unity на сервере
+
+Экрана на сервере нет, поэтому вход только по email и паролю Unity ID из `.env`.
+Программа входит сама и перезаходит, когда сессия протухнет. Если что-то не так,
+вход останавливается после первой же неудачи — повторять пароль программа не будет,
+чтобы Unity не заблокировала вход — и бот пишет, в чём дело:
+
+- **«Incorrect email or password»** — проверьте пароль, войдя им на id.unity.com;
+- **Unity просит код подтверждения** — бот спросит код, пришлите его ответом в течение 10 минут;
+- **капча** — войдите один раз на компьютере через `run.bat`/`run.sh` (пункт 6) и
+  скопируйте папку `data/profiles/<профиль>` на сервер.
+
+### О чём пишет бот
+
+- что добавлено и что выкуплено по промокоду (пустые прогоны не пишет);
+- оплата нажата, но покупка не подтвердилась;
+- не получилось войти и почему;
+- программа упала.
+
+### Без Docker (systemd)
+
+Нужны .NET 8 и Chromium (`apt install chromium`). Опубликуйте программу в
+`/opt/unity-assets-downloader` (`dotnet publish -c Release -o /opt/unity-assets-downloader`),
+положите рядом `telegram_sources.txt`, пароль и токен — в `/etc/unity-assets-downloader.env`
+(формат как в `.env.example`, права `600`) и включите службу из
+`deploy/unity-assets-downloader.service`. Логи: `journalctl -u unity-assets-downloader -f`.
+
+### То же самое вручную
+
+```bash
+dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- \
+    --watch --watch-interval 24h --no-defaults
+```
+
+`--watch` включает невидимый браузер, режим «только новые посты» и отключает вопросы
+в консоли. `--tg-only-new` — «только новые посты» без режима сервера.
+
+## 9. Что планируется дальше
 
 ### Читать Telegram без браузера
 
@@ -548,7 +628,7 @@ dotnet run --project UnityAssetsDownloader\UnityAssetsDownloader.csproj -- ^
 
 ---
 
-## 9. Рекомендованный порядок работы
+## 10. Рекомендованный порядок работы
 
 1. Войдите и сохраните сессию — пункт **6** в меню
 2. Прогоните проверочный запуск — пункт **7** (аккаунт не меняется)
@@ -558,7 +638,7 @@ dotnet run --project UnityAssetsDownloader\UnityAssetsDownloader.csproj -- ^
 
 ---
 
-## 10. Типовые проблемы
+## 11. Типовые проблемы
 
 ### Проблема: не подтверждается авторизация
 
@@ -606,7 +686,7 @@ dotnet run --project UnityAssetsDownloader\UnityAssetsDownloader.csproj -- ^
 
 ---
 
-## 11. Важные замечания
+## 12. Важные замечания
 
 - Unity меняет вёрстку и правила без предупреждения. Если что-то перестало
   работать — начните с пунктов **C** и **T** в меню: они показывают, что программа

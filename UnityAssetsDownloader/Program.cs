@@ -29,12 +29,94 @@ if (options.ListProfiles)
     return;
 }
 
+if (options.Watch)
+{
+    await RunWatchLoopAsync();
+    return;
+}
+
 try
 {
     var app = new UnityAssetAutomationApp(options);
     await app.RunAsync();
 }
 catch (Exception ex)
+{
+    await ReportCrashAsync(ex, options);
+}
+
+// Режим сервера: прогон, пауза до следующего, снова прогон — пока службу не остановят.
+// Каждый прогон начинается с чистого листа: параметры читаются заново (после первого
+// входа профиль переименовывается), браузер и лог — новые.
+async Task RunWatchLoopAsync()
+{
+    var interval = options.WatchInterval;
+    Console.WriteLine($"[Сервер] Режим наблюдения: прогон раз в {DescribeInterval(interval)}. Остановить: Ctrl+C, docker stop или systemctl stop.");
+
+    using var stop = new CancellationTokenSource();
+    UnityAssetAutomationApp? current = null;
+    var running = false;
+
+    // docker stop / systemctl stop присылают SIGTERM. Между прогонами выходим штатно,
+    // посреди прогона — сохраняем память профиля и завершаемся сразу: ждать конца
+    // прогона служба не станет (через несколько секунд пришлёт SIGKILL).
+    using var sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
+    {
+        Console.WriteLine("[Сервер] Получен сигнал остановки. Сохраняем память профиля и выходим.");
+        current?.SaveCachesOnExit();
+        ctx.Cancel = !running;
+        stop.Cancel();
+    });
+
+    while (!stop.IsCancellationRequested)
+    {
+        var startedAt = DateTime.Now;
+        var cycleOptions = CliOptions.Parse(args);
+
+        try
+        {
+            running = true;
+            current = new UnityAssetAutomationApp(cycleOptions);
+            await current.RunAsync();
+        }
+        catch (Exception ex)
+        {
+            await ReportCrashAsync(ex, cycleOptions);
+            if (current is not null)
+            {
+                await current.NotifyAsync($"💥 Программа упала во время прогона: {ex.Message}\nСледующий прогон — по расписанию.");
+            }
+        }
+        finally
+        {
+            running = false;
+        }
+
+        // Расписание от начала прогона: «раз в сутки» значит в одно и то же время.
+        var next = startedAt + interval;
+        if (next <= DateTime.Now)
+        {
+            next = DateTime.Now + TimeSpan.FromMinutes(1);
+        }
+
+        Console.WriteLine($"[Сервер] Следующий прогон: {next:yyyy-MM-dd HH:mm}.");
+        try
+        {
+            await Task.Delay(next - DateTime.Now, stop.Token);
+        }
+        catch (TaskCanceledException)
+        {
+            break;
+        }
+    }
+}
+
+static string DescribeInterval(TimeSpan t) =>
+    t.TotalDays >= 1 && t.TotalDays % 1 == 0 ? $"{t.TotalDays:0} сут."
+    : t.TotalHours >= 1 && t.TotalHours % 1 == 0 ? $"{t.TotalHours:0} ч"
+    : $"{t.TotalMinutes:0} мин";
+
+async Task ReportCrashAsync(Exception ex, CliOptions crashOptions)
 {
     // Любое необработанное падение сохраняем в отдельный файл, чтобы его можно было прислать целиком.
     var crashText =
@@ -48,8 +130,8 @@ catch (Exception ex)
 
     try
     {
-        Directory.CreateDirectory(options.LogsDirectory);
-        var problemsPath = Path.Combine(options.LogsDirectory, CliOptions.ProblemsFileName);
+        Directory.CreateDirectory(crashOptions.LogsDirectory);
+        var problemsPath = Path.Combine(crashOptions.LogsDirectory, CliOptions.ProblemsFileName);
         await File.AppendAllTextAsync(problemsPath, crashText + Environment.NewLine);
         Console.Error.WriteLine();
         Console.Error.WriteLine("============================================================");
@@ -90,6 +172,7 @@ internal sealed class UnityAssetAutomationApp
     private OwnedAssetsCache? _ownedCache;
     private OwnedAssetsCache? _deprecatedCache;
     private OwnedAssetsCache? _rejectedPromoCache;
+    private readonly TelegramNotifier? _notifier;
 
     private bool HasCredentials =>
         !string.IsNullOrWhiteSpace(_unityEmail) && !string.IsNullOrWhiteSpace(_unityPassword);
@@ -148,6 +231,18 @@ internal sealed class UnityAssetAutomationApp
         _logger.Info($"Каталог данных (cookies): {_dataDirectory}");
         _logger.Info($"Профиль аккаунта: {_profileName} | папка: {profileDirectory}");
         _logger.Info($"ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК — ПРИШЛИТЕ ЭТОТ ФАЙЛ: {errorsFilePath}");
+
+        if (!string.IsNullOrWhiteSpace(options.NotifyBotToken))
+        {
+            // Номер чата общий для всех профилей: бот пишет одному человеку.
+            _notifier = new TelegramNotifier(
+                options.NotifyBotToken,
+                options.NotifyChatId,
+                Path.Combine(_dataDirectory, "telegram_bot_chat.txt"),
+                () => !string.IsNullOrWhiteSpace(options.TelegramProxy) ? options.TelegramProxy : ReadRememberedProxy(),
+                _logger);
+            _logger.Info("Telegram-бот для сообщений настроен.");
+        }
     }
 
     public async Task RunAsync()
@@ -159,6 +254,21 @@ internal sealed class UnityAssetAutomationApp
 
             // Ctrl+C не должен стирать то, что программа уже успела выяснить.
             Console.CancelKeyPress += OnCancelRequested;
+
+            if (_options.NotifyTest)
+            {
+                if (_notifier is null)
+                {
+                    _logger.Error("Бот не настроен: задайте TELEGRAM_BOT_TOKEN (или notify.telegramBotToken в config.json).");
+                    return;
+                }
+
+                var sent = await _notifier.SendAsync($"👋 Проверка связи от UnityAssetsDownloader (профиль {_profileName}). Сообщения доходят.");
+                _logger.Info(sent
+                    ? "Бот: проверочное сообщение отправлено. Проверьте Telegram."
+                    : "Бот: сообщение не отправилось. Причина — в строках выше.");
+                return;
+            }
 
             _profileStore.Touch(_profileName, _unityEmail);
             if (_profileStore.TryMigrateLegacySession(_profileName, out var migrationMessage))
@@ -318,6 +428,10 @@ internal sealed class UnityAssetAutomationApp
             // Постоянная папка браузера. Без неё Chrome каждый раз стартует пустым,
             // как в режиме инкогнито: ни истории, ни расширений, ни сохранённого входа.
             var userDataDir = ResolveChromeUserDataDir();
+            if (!_options.UseSystemChromeProfile)
+            {
+                RemoveStaleChromeLock(userDataDir);
+            }
 
             _logger.Debug($"Аргументы браузера: {string.Join(" ", browserArgs)}");
 
@@ -378,6 +492,11 @@ internal sealed class UnityAssetAutomationApp
                 _logger.Error($" Профиль: {_profileName}");
                 _logger.Error(" Что делать написано выше. Обычно помогает вход по email и паролю.");
                 _logger.Error("============================================================");
+                await NotifyAsync(
+                    $"🚫 Не удалось войти в Unity (профиль {_profileName}).\n" +
+                    (_loginProblem ?? (HasCredentials
+                        ? "Unity не подтвердила вход. Подробности в логе."
+                        : "Сессия истекла, а email и пароль не заданы (UNITY_EMAIL / UNITY_PASSWORD).")));
                 return;
             }
 
@@ -467,14 +586,46 @@ internal sealed class UnityAssetAutomationApp
             var batchSize = _options.TelegramBatchSize;
             List<TelegramChannelCursor>? telegramCursors = null;
 
+            // «Только новые» (всегда на сервере): читаем посты, появившиеся после прошлого прогона.
+            // В этом режиме всегда работаем пачками: только так известно, где остановились.
+            var telegramState = TelegramChannelState.Load(profileDirectory);
+            if (_options.TelegramOnlyNew && batchSize <= 0)
+            {
+                batchSize = 30;
+            }
+
             if (_options.TelegramChannels.Count > 0)
             {
                 if (batchSize > 0)
                 {
-                    telegramCursors = _options.TelegramChannels.Select(c => new TelegramChannelCursor(c)).ToList();
+                    telegramCursors = _options.TelegramChannels.Select(c =>
+                    {
+                        var cursor = new TelegramChannelCursor(c);
+                        if (_options.TelegramOnlyNew)
+                        {
+                            cursor.StopAtId = telegramState.LastSeen(c);
+                            // Канал впервые: ограничиваемся последними постами, историю не листаем.
+                            cursor.MaxPosts = cursor.StopAtId > 0 ? int.MaxValue : _options.TelegramPostLimit;
+                        }
+
+                        return cursor;
+                    }).ToList();
+
+                    if (_options.TelegramOnlyNew)
+                    {
+                        foreach (var cursor in telegramCursors)
+                        {
+                            _logger.Info(cursor.StopAtId > 0
+                                ? $"Telegram: канал {cursor.Name} — читаем посты новее #{cursor.StopAtId}."
+                                : $"Telegram: канал {cursor.Name} читаем впервые — берём последние {cursor.MaxPosts} постов.");
+                        }
+                    }
+
                     _logger.Info(
                         $"Telegram: ассеты берутся пачками по {batchSize}. Собрали пачку — проверили в магазине — " +
-                        "собираем следующую из более старых постов. Лимит постов на канал при этом не действует.");
+                        (_options.TelegramOnlyNew
+                            ? "собираем следующую."
+                            : "собираем следующую из более старых постов. Лимит постов на канал при этом не действует."));
                 }
                 else
                 {
@@ -564,6 +715,7 @@ internal sealed class UnityAssetAutomationApp
             }
 
             var index = 0;
+            var stoppedEarly = false;
 
             bool LimitReached() =>
                 (_options.MaxAddAttempts.HasValue && newlyAddedCount >= _options.MaxAddAttempts.Value) ||
@@ -573,8 +725,14 @@ internal sealed class UnityAssetAutomationApp
             {
                 if (queue.Count == 0)
                 {
-                    if (telegramCursors is null || LimitReached())
+                    if (telegramCursors is null)
                     {
+                        break;
+                    }
+
+                    if (LimitReached())
+                    {
+                        stoppedEarly = true;
                         break;
                     }
 
@@ -600,6 +758,7 @@ internal sealed class UnityAssetAutomationApp
                 {
                     _logger.Warn(
                         $"Достигнут лимит посещенных ассетов ({index}/{_options.MaxVisitedAssets.Value}). Обработка остановлена.");
+                    stoppedEarly = true;
                     break;
                 }
 
@@ -607,6 +766,7 @@ internal sealed class UnityAssetAutomationApp
                 {
                     _logger.Warn(
                         $"[Лимит] Достигнут лимит новых ассетов ({newlyAddedCount}/{_options.MaxAddAttempts.Value}). Обработка остановлена.");
+                    stoppedEarly = true;
                     break;
                 }
 
@@ -669,11 +829,28 @@ internal sealed class UnityAssetAutomationApp
                     {
                         _logger.Info(
                             $"[Лимит] Достигнут лимит {_options.MaxAddAttempts.Value} новых ассетов. Завершение.");
+                        stoppedEarly = true;
                         break;
                     }
                 }
 
                 await Task.Delay(TimeSpan.FromMilliseconds(_options.DelayMs));
+            }
+
+            // Запоминаем, до какого поста дочитали. Только если каналы прочитаны до конца
+            // и все собранные ассеты проверены: иначе часть новых постов потерялась бы.
+            if (telegramCursors is not null && !stoppedEarly && queue.Count == 0 && telegramPending.Count == 0)
+            {
+                var advanced = telegramCursors
+                    .Where(c => c.Exhausted && c.NewestId > 0 && telegramState.Advance(c.Name, c.NewestId))
+                    .Select(c => $"{c.Name} #{c.NewestId}")
+                    .ToList();
+                if (advanced.Count > 0)
+                {
+                    telegramState.Save();
+                    _logger.Info($"Telegram: запомнили, где остановились: {string.Join(", ", advanced)}. " +
+                                 "В режиме «только новые» следующий прогон начнёт отсюда.");
+                }
             }
 
             SaveCaches();
@@ -692,6 +869,7 @@ internal sealed class UnityAssetAutomationApp
 
             PrintSummary(report);
             _logger.Info($"Отчет сохранен: {_reportPath}");
+            await NotifyRunSummaryAsync(report);
             }
         }
         finally
@@ -1445,6 +1623,66 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
+    /// <summary>
+    /// Убирает блокировку папки браузера, оставшуюся от упавшего запуска.
+    ///
+    /// Chrome пишет в SingletonLock «имя-компьютера-номер-процесса». Если процесс жив,
+    /// блокировка настоящая. Но в Docker у каждого нового контейнера своё имя, и чужую
+    /// блокировку Chrome не снимает никогда: после любой аварийной остановки браузер
+    /// перестаёт запускаться совсем. Поэтому снимаем её сами, если она с другого
+    /// «компьютера» или её процесса уже нет. Только для своей папки браузера программы,
+    /// обычный Chrome пользователя не трогаем.
+    /// </summary>
+    private void RemoveStaleChromeLock(string userDataDir)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        try
+        {
+            var lockPath = Path.Combine(userDataDir, "SingletonLock");
+            var info = new FileInfo(lockPath);
+            if (info.LinkTarget is not { } target)
+            {
+                return;
+            }
+
+            var dash = target.LastIndexOf('-');
+            var host = dash > 0 ? target[..dash] : target;
+            var pidAlive = dash > 0 && int.TryParse(target[(dash + 1)..], out var pid) && IsProcessAlive(pid);
+            if (host == Environment.MachineName && pidAlive)
+            {
+                return;
+            }
+
+            foreach (var name in new[] { "SingletonLock", "SingletonSocket", "SingletonCookie" })
+            {
+                File.Delete(Path.Combine(userDataDir, name));
+            }
+
+            _logger.Info($"Сняли блокировку папки браузера от прошлого запуска ({target}).");
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"Блокировку папки браузера проверить не удалось: {ex.Message}");
+        }
+
+        static bool IsProcessAlive(int pid)
+        {
+            try
+            {
+                using var process = Process.GetProcessById(pid);
+                return !process.HasExited;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
     /// <summary>Браузеру негде показать окно: ни X11, ни Wayland ему не доступны.</summary>
     private static bool IsNoDisplayError(Exception ex) =>
         ex.Message.Contains("Missing X server", StringComparison.OrdinalIgnoreCase) ||
@@ -1626,6 +1864,57 @@ internal sealed class UnityAssetAutomationApp
     /// <summary>Запись в памяти отвергнутых промокодов: адрес ассета и код через пробел.</summary>
     private static string PromoCacheKey(string assetUrl, string promoCode) => $"{assetUrl} {promoCode}";
 
+    /// <summary>Сообщение через Telegram-бота, если он настроен.</summary>
+    public async Task NotifyAsync(string text)
+    {
+        if (_notifier is { Enabled: true })
+        {
+            await _notifier.SendAsync(text);
+        }
+    }
+
+    /// <summary>
+    /// Итог прогона боту. Пишет, только если есть что сказать: что-то добавлено или
+    /// оплата нажата, но не подтверждена. Пустые прогоны не спамят.
+    /// </summary>
+    private async Task NotifyRunSummaryAsync(RunReport report)
+    {
+        if (_notifier is not { Enabled: true })
+        {
+            return;
+        }
+
+        var added = report.Items.Where(i => i.Status == AssetProcessStatus.Added).ToList();
+        var unclear = report.Items.Where(i => i.Status == AssetProcessStatus.UnknownAfterClick).ToList();
+        if (added.Count == 0 && unclear.Count == 0)
+        {
+            return;
+        }
+
+        static string Name(string url) => url.TrimEnd('/').Split('/').Last();
+
+        var lines = new List<string> { $"✅ Unity Asset Store — профиль {_profileName}", $"Добавлено: {added.Count}" };
+        lines.AddRange(added.Take(30).Select(i =>
+            $"• {Name(i.Url)}{(i.PromoCode is null ? string.Empty : $" — по промокоду {i.PromoCode}")}\n  {i.Url}"));
+
+        if (unclear.Count > 0)
+        {
+            lines.Add($"⚠️ Оплата нажата, но покупка не подтверждена: {unclear.Count}");
+            lines.AddRange(unclear.Take(10).Select(i => $"• {i.Url}"));
+        }
+
+        var failed = report.Items.Count(i => i.Status == AssetProcessStatus.Failed);
+        if (failed > 0)
+        {
+            lines.Add($"Ошибок: {failed} — подробности в логе.");
+        }
+
+        await _notifier.SendAsync(string.Join("\n", lines));
+    }
+
+    /// <summary>Сохранить память профиля перед остановкой службы (docker stop, systemctl stop).</summary>
+    public void SaveCachesOnExit() => SaveCaches();
+
     /// <summary>Сохраняет память профиля. Вызывать можно сколько угодно раз.</summary>
     private void SaveCaches()
     {
@@ -1768,6 +2057,16 @@ internal sealed class UnityAssetAutomationApp
         _logger.Warn("Требуется вход в Unity.");
         TrySetupCredentialsInteractively();
         _credentialsAsked = true;
+
+        // Без окна браузера войти руками нельзя. Ждать пять минут впустую незачем.
+        if (_options.Headless && !HasCredentials)
+        {
+            _loginProblem =
+                "Сессия Unity истекла, а email и пароль не заданы. На сервере задайте UNITY_EMAIL и UNITY_PASSWORD " +
+                "или перенесите папку профиля с компьютера, где вы вошли.";
+            _logger.Error(_loginProblem);
+            return false;
+        }
         _lastFullAuthAttemptUtc = DateTime.UtcNow;
         _logger.Info(HasCredentials
             ? "Программа войдёт сама. Окно браузера трогать не нужно."
@@ -2036,19 +2335,17 @@ internal sealed class UnityAssetAutomationApp
             _logger.Info($"Попытка авторизации {attempt}/3...");
             await StartAssetStoreSsoAsync(page);
 
-            if (HasCredentials)
-            {
-                await TrySwitchToSignInPageAsync(page);
-                var submitted = await TryCompleteUnityLoginFormAsync(page);
-                if (submitted)
-                {
-                    _logger.Info("Форма входа отправлена автоматически.");
-                }
-            }
-
+            // Форму входа по шагам заполняет само ожидание (TryAutoLoginStepAsync).
             if (await WaitForAuthenticatedSessionAsync(page, TimeSpan.FromMilliseconds(_options.AuthTimeoutMs)))
             {
                 return true;
+            }
+
+            // Unity не приняла пароль или просит то, что программа не умеет. Начинать вход
+            // заново — значит снова отправить тот же пароль: так и до блокировки недалеко.
+            if (_autoLoginGaveUp && (_options.Headless || !_options.Interactive))
+            {
+                return false;
             }
 
             _logger.Warn("Сессия Asset Store не подтверждена в рамках текущей попытки. Повторяем...");
@@ -2429,9 +2726,16 @@ internal sealed class UnityAssetAutomationApp
             if (page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
             {
                 await TrySwitchToSignInPageAsync(page);
-                if (HasCredentials)
+                if (HasCredentials && !_autoLoginGaveUp &&
+                    await TryAutoLoginStepAsync(page) == AutoLoginOutcome.GaveUp)
                 {
-                    await TryCompleteUnityLoginFormAsync(page);
+                    // Без окна и без человека у консоли ждать ручного входа бессмысленно.
+                    if (_options.Headless || !_options.Interactive)
+                    {
+                        return false;
+                    }
+
+                    _logger.Warn("Войдите в окне браузера сами — программа подождёт.");
                 }
 
                 await Task.Delay(1500);
@@ -2528,64 +2832,281 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
-    /// <summary>
-    /// Заполняет форму входа Unity. Форма двухшаговая: сначала спрашивают email,
-    /// и только потом, на следующем экране, пароль.
-    /// </summary>
-    private async Task<bool> TryCompleteUnityLoginFormAsync(IPage page)
+    private enum AutoLoginOutcome
     {
-        if (!HasCredentials)
+        Working,
+        GaveUp
+    }
+
+    // Состояние автовхода за этот запуск: какой шаг и когда отправили, сколько раз.
+    private string? _loginLastStep;
+    private DateTime _loginLastSubmitUtc = DateTime.MinValue;
+    private HashSet<string> _loginErrorsBeforeSubmit = [];
+    private int _loginEmailSubmits;
+    private int _loginPasswordSubmits;
+    private int _loginCodeSubmits;
+    private bool _autoLoginGaveUp;
+    private string? _loginProblem;
+    private readonly HashSet<string> _loginNotes = [];
+
+    /// <summary>
+    /// Один шаг автовхода на странице login.unity.com. Вызывается в цикле ожидания входа.
+    ///
+    /// Каждый шаг (email → пароль → код подтверждения) отправляется один раз, дальше
+    /// программа ждёт и читает, что ответила страница. Раньше форма заполнялась заново
+    /// на каждом проходе цикла: при неверном пароле программа долбила вход минутами.
+    /// Теперь неверный пароль, капча или «слишком много попыток» — это остановка
+    /// с понятным объяснением (и сообщение боту на сервере).
+    /// </summary>
+    private async Task<AutoLoginOutcome> TryAutoLoginStepAsync(IPage page)
+    {
+        if (_autoLoginGaveUp)
         {
-            return false;
+            return AutoLoginOutcome.GaveUp;
         }
 
-        if (!page.Url.Contains("login.unity.com", StringComparison.OrdinalIgnoreCase))
+        if (!HasCredentials || HostOf(page.Url) != "login.unity.com")
         {
-            _logger.Debug($"Автовход: страница не похожа на форму Unity ({page.Url}). Пропускаем.");
-            return false;
+            return AutoLoginOutcome.Working;
         }
 
-        // Шаг 1. Email.
-        if (await TryFillFieldAsync(page, FieldKind.Email, _unityEmail!))
+        LoginPageState state;
+        try
         {
-            _logger.Info("Автовход, шаг 1: email введён.");
-            if (await TryClickPrimaryButtonAsync(page))
+            state = JsonSerializer.Deserialize<LoginPageState>(
+                await page.EvaluateFunctionAsync<string>(ReadLoginPageJs), _runtimeJsonOptions) ?? new LoginPageState();
+        }
+        catch (Exception ex) when (IsTransientPageError(ex))
+        {
+            return AutoLoginOutcome.Working;
+        }
+
+        var sinceSubmit = DateTime.UtcNow - _loginLastSubmitUtc;
+
+        // Что страница ответила на наш последний шаг. Ошибки, которые висели ещё до него, не в счёт.
+        if (_loginLastStep is not null && sinceSubmit < TimeSpan.FromSeconds(40))
+        {
+            var newError = state.Errors.FirstOrDefault(e => !_loginErrorsBeforeSubmit.Contains(e));
+            if (newError is not null)
             {
-                _logger.Info("Автовход, шаг 1: кнопка продолжения нажата.");
+                return await GiveUpAutoLoginAsync(page,
+                    $"Unity не пустила: «{newError}». Проверьте email и пароль (войдите ими на id.unity.com в обычном браузере).");
             }
         }
-        else
+
+        if (state.Captcha)
         {
-            _logger.Debug("Автовход, шаг 1: поле email не найдено — возможно, мы уже на шаге пароля.");
+            return await GiveUpAutoLoginAsync(page,
+                "Unity показывает проверку «я не робот» (капчу). Её программа не проходит. " +
+                "Войдите один раз вручную (на ПК — в окне браузера) и перенесите папку профиля.");
         }
 
-        // Шаг 2. Пароль. Поле появляется не сразу, поэтому ждём.
-        var passwordAppeared = await WaitForFieldAsync(page, FieldKind.Password, TimeSpan.FromSeconds(25));
-        if (!passwordAppeared)
+        switch (state.Step)
         {
-            _logger.Warn("Автовход: поле пароля не появилось. Войдите в браузере вручную.");
-            await SaveErrorScreenshotAsync(page, "autologin-no-password-field");
+            case "email":
+                if (_loginLastStep == "email" && sinceSubmit < TimeSpan.FromSeconds(15))
+                {
+                    break;
+                }
+
+                if (_loginEmailSubmits >= 3)
+                {
+                    return await GiveUpAutoLoginAsync(page,
+                        "Email отправлен трижды, но Unity так и не спросила пароль.");
+                }
+
+                if (await TryFillFieldAsync(page, FieldKind.Email, _unityEmail!))
+                {
+                    _loginEmailSubmits++;
+                    RememberLoginSubmit("email", state);
+                    var clicked = await TryClickPrimaryButtonAsync(page);
+                    _logger.Info($"Автовход, шаг 1: email введён{(clicked ? ", нажато «Continue»" : ", но кнопку продолжения не нашли")}.");
+                    await SaveErrorScreenshotAsync(page, "autologin-1-email");
+                }
+
+                break;
+
+            case "password":
+                if (_loginLastStep == "password" && sinceSubmit < TimeSpan.FromSeconds(25))
+                {
+                    break;
+                }
+
+                if (_loginPasswordSubmits >= 2)
+                {
+                    return await GiveUpAutoLoginAsync(page,
+                        "Пароль отправлен дважды, но Unity снова просит пароль. Проверьте его.");
+                }
+
+                if (await TryFillFieldAsync(page, FieldKind.Password, _unityPassword!))
+                {
+                    _loginPasswordSubmits++;
+                    RememberLoginSubmit("password", state);
+                    var clicked = await TryClickPrimaryButtonAsync(page);
+                    _logger.Info($"Автовход, шаг 2: пароль введён{(clicked ? ", нажато «Sign in»" : ", но кнопку входа не нашли")}. Ждём ответа Unity...");
+                    await SaveErrorScreenshotAsync(page, "autologin-2-password");
+                }
+
+                break;
+
+            case "code":
+                if (_loginLastStep == "code" && sinceSubmit < TimeSpan.FromSeconds(25))
+                {
+                    break;
+                }
+
+                if (_loginCodeSubmits >= 2)
+                {
+                    return await GiveUpAutoLoginAsync(page, "Код подтверждения введён дважды, но Unity его не приняла.");
+                }
+
+                _logger.Warn("Автовход: Unity просит код подтверждения (пришёл на почту или в приложение).");
+                await SaveErrorScreenshotAsync(page, "autologin-3-code");
+                var code = await AskLoginCodeAsync();
+                if (code is null)
+                {
+                    return await GiveUpAutoLoginAsync(page,
+                        "Unity просит код подтверждения, а ввести его некому. " +
+                        "Настройте бота (он спросит код) или войдите один раз вручную.");
+                }
+
+                if (await TypeLoginCodeAsync(page, code))
+                {
+                    _loginCodeSubmits++;
+                    RememberLoginSubmit("code", state);
+                    await TryClickPrimaryButtonAsync(page);
+                    _logger.Info("Автовход, шаг 3: код подтверждения введён.");
+                }
+
+                break;
+
+            default:
+                if (_loginNotes.Add("unknown-step"))
+                {
+                    _logger.Info($"Автовход: на странице входа нет ни поля email, ни пароля, ни кода. Ждём. Текст: {Shorten(state.Text, 200)}");
+                    await SaveErrorScreenshotAsync(page, "autologin-unknown-step");
+                }
+
+                break;
+        }
+
+        return AutoLoginOutcome.Working;
+    }
+
+    private void RememberLoginSubmit(string step, LoginPageState state)
+    {
+        _loginLastStep = step;
+        _loginLastSubmitUtc = DateTime.UtcNow;
+        _loginErrorsBeforeSubmit = state.Errors.ToHashSet();
+    }
+
+    private async Task<AutoLoginOutcome> GiveUpAutoLoginAsync(IPage page, string reason)
+    {
+        _autoLoginGaveUp = true;
+        _loginProblem = reason;
+        _logger.Warn("============================================================");
+        _logger.Warn(" АВТОВХОД ОСТАНОВЛЕН");
+        _logger.Warn($" {reason}");
+        _logger.Warn(" Пароль повторно не отправляем, чтобы Unity не заблокировала вход.");
+        _logger.Warn("============================================================");
+        await SaveErrorScreenshotAsync(page, "autologin-stopped");
+        await SaveHtmlDumpAsync(page, "autologin-stopped");
+        return AutoLoginOutcome.GaveUp;
+    }
+
+    /// <summary>
+    /// Код подтверждения входа: в консоли, если за ней сидит человек, иначе — через бота.
+    /// </summary>
+    private async Task<string?> AskLoginCodeAsync()
+    {
+        if (_options.Interactive && !Console.IsInputRedirected)
+        {
+            Console.WriteLine();
+            Console.Write("Unity прислала код подтверждения входа (на почту или в приложение). Введите код: ");
+            var typed = Console.ReadLine()?.Trim();
+            return string.IsNullOrWhiteSpace(typed) ? null : typed;
+        }
+
+        if (_notifier is { Enabled: true })
+        {
+            await _notifier.SendAsync(
+                $"🔐 Unity просит код подтверждения входа (профиль {_profileName}).\n" +
+                "Пришлите код ответом на это сообщение в течение 10 минут.");
+            _logger.Info("Автовход: спросили код у бота, ждём ответа до 10 минут...");
+            var code = await _notifier.WaitForReplyAsync(new Regex(@"\b\d{4,8}\b"), TimeSpan.FromMinutes(10));
+            _logger.Info(code is null ? "Автовход: код от бота не пришёл." : "Автовход: код от бота получен.");
+            return code;
+        }
+
+        return null;
+    }
+
+    /// <summary>Вводит код с клавиатуры: так его понимают и одно поле, и шесть полей по цифре.</summary>
+    private static async Task<bool> TypeLoginCodeAsync(IPage page, string code)
+    {
+        var marked = await page.EvaluateFunctionAsync<bool>(@"() => {
+            const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+            const input = Array.from(document.querySelectorAll(
+                'input[autocomplete=""one-time-code""], input[name*=""code"" i], input[id*=""code"" i], input[name*=""otp"" i], input[id*=""otp"" i], input[inputmode=""numeric""]'))
+                .find(visible);
+            if (!input) return false;
+            input.setAttribute('data-uad-code', '1');
+            return true;
+        }");
+
+        if (!marked)
+        {
             return false;
         }
 
-        if (!await TryFillFieldAsync(page, FieldKind.Password, _unityPassword!))
+        var handle = await page.QuerySelectorAsync("[data-uad-code='1']");
+        if (handle is null)
         {
-            _logger.Warn("Автовход: не удалось заполнить поле пароля.");
             return false;
         }
 
-        _logger.Info("Автовход, шаг 2: пароль введён.");
-
-        if (!await TryClickPrimaryButtonAsync(page))
-        {
-            _logger.Warn("Автовход: кнопка входа не найдена. Нажмите её в браузере сами.");
-            await SaveErrorScreenshotAsync(page, "autologin-no-submit-button");
-            return false;
-        }
-
-        _logger.Info("Автовход, шаг 2: кнопка входа нажата. Ждём подтверждения сессии.");
+        await handle.ClickAsync();
+        await page.Keyboard.TypeAsync(code, new PuppeteerSharp.Input.TypeOptions { Delay = 80 });
         return true;
     }
+
+    private static string Shorten(string text, int max) => text.Length <= max ? text : text[..max] + "…";
+
+    /// <summary>
+    /// Что сейчас на странице входа: какой шаг (email / password / code), есть ли капча,
+    /// какие сообщения об ошибке видны.
+    /// </summary>
+    private const string ReadLoginPageJs = @"() => {
+        const norm = (v) => (v || '').replace(/\s+/g, ' ').trim();
+        const visible = (el) => {
+            if (!el) return false;
+            const st = window.getComputedStyle(el);
+            const r = el.getBoundingClientRect();
+            return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+        };
+        const first = (sel) => Array.from(document.querySelectorAll(sel)).find(visible) || null;
+
+        const password = first('input#password, input[name=""password""], input[type=""password""]');
+        const email = first('input#email, input[name=""email""], input[type=""email""]');
+        const codeInput = first('input[autocomplete=""one-time-code""], input[name*=""code"" i], input[id*=""code"" i], input[name*=""otp"" i], input[id*=""otp"" i], input[inputmode=""numeric""]');
+        const text = norm(document.body ? document.body.innerText : '');
+        const lower = text.toLowerCase();
+        const mentionsCode = /code|verif|two-factor|2fa|код|подтвер/.test(lower);
+
+        const captcha = Array.from(document.querySelectorAll('iframe'))
+            .some(f => /captcha|arkoselabs|funcaptcha|hcaptcha|turnstile|challenges\.cloudflare/i.test(f.src || '')) ||
+            !!first('[class*=""captcha"" i], #captcha, [id*=""captcha"" i]');
+
+        const errors = Array.from(document.querySelectorAll(
+            '[role=""alert""], [aria-live=""assertive""], [aria-live=""polite""], .error, [class*=""error"" i], [class*=""invalid"" i], [data-testid*=""error"" i]'))
+            .filter(visible)
+            .filter(el => !el.closest('#onetrust-consent-sdk, #onetrust-banner-sdk'))
+            .map(el => norm(el.innerText))
+            .filter(t => t.length >= 3 && t.length <= 300);
+
+        const step = password ? 'password' : (codeInput && mentionsCode && !email) ? 'code' : email ? 'email' : 'unknown';
+        return JSON.stringify({ Step: step, Captcha: captcha, Errors: Array.from(new Set(errors)), Text: text.slice(0, 1500) });
+    }";
 
     private enum FieldKind
     {
@@ -3985,6 +4506,7 @@ internal sealed class UnityAssetAutomationApp
             return result;
         }
 
+        result.PromoCode = promoCode;
         return await ProcessPromoAssetAsync(page, assetUrl, promoCode, result);
     }
 
@@ -4951,13 +5473,20 @@ internal sealed class UnityAssetAutomationApp
                 if (HostOf(url) == "login.unity.com")
                 {
                     // Unity просит войти заново перед оплатой.
-                    if (HasCredentials && !loginTried)
+                    if (HasCredentials)
                     {
-                        _logger.Info("[Промокод][Шаг 3] Unity просит войти перед оплатой. Вводим email и пароль профиля...");
-                        loginTried = true;
-                        await TryCompleteUnityLoginFormAsync(page);
+                        if (!loginTried)
+                        {
+                            _logger.Info("[Промокод][Шаг 3] Unity просит войти перед оплатой. Вводим email и пароль профиля...");
+                            loginTried = true;
+                        }
+
+                        if (await TryAutoLoginStepAsync(page) == AutoLoginOutcome.GaveUp)
+                        {
+                            return false;
+                        }
                     }
-                    else if (!HasCredentials && !loginTried)
+                    else if (!loginTried)
                     {
                         loginTried = true;
                         _logger.Warn("[Промокод][Шаг 3] Unity просит войти перед оплатой. Войдите в окне браузера — программа подождёт.");
@@ -6456,6 +6985,20 @@ internal sealed class CliOptions
     public bool ListProfiles { get; init; }
     public bool CheckLoginPage { get; init; }
     public bool CheckTelegram { get; init; }
+
+    /// <summary>Режим сервера: прогон, пауза WatchInterval, снова прогон — пока не остановят.</summary>
+    public bool Watch { get; init; }
+
+    public TimeSpan WatchInterval { get; init; } = TimeSpan.FromHours(24);
+
+    /// <summary>Читать в каналах только посты, появившиеся после прошлого прогона.</summary>
+    public bool TelegramOnlyNew { get; init; }
+
+    public string? NotifyBotToken { get; init; }
+    public string? NotifyChatId { get; init; }
+
+    /// <summary>Только отправить боту проверочное сообщение и выйти.</summary>
+    public bool NotifyTest { get; init; }
     public bool SplitScreen { get; init; } = true;
     public bool RecheckOwned { get; init; }
     public string? TelegramProxy { get; init; }
@@ -6492,6 +7035,39 @@ internal sealed class CliOptions
 
     public bool TelegramScreenshotOnNoLinks { get; init; } = true;
 
+    /// <summary>Период вида '45m', '6h', '1d', '1d12h' или '01:30:00'. Число без буквы — минуты.</summary>
+    public static bool TryParseInterval(string text, out TimeSpan interval)
+    {
+        interval = TimeSpan.Zero;
+        var t = text.Trim().ToLowerInvariant();
+
+        if (int.TryParse(t, out var minutes) && minutes > 0)
+        {
+            interval = TimeSpan.FromMinutes(minutes);
+            return true;
+        }
+
+        var parts = Regex.Matches(t, @"(\d+)\s*(d|h|m|s)");
+        if (parts.Count > 0 && string.Concat(parts.Select(p => p.Value)).Replace(" ", "") == t.Replace(" ", ""))
+        {
+            foreach (Match p in parts)
+            {
+                var n = int.Parse(p.Groups[1].Value);
+                interval += p.Groups[2].Value switch
+                {
+                    "d" => TimeSpan.FromDays(n),
+                    "h" => TimeSpan.FromHours(n),
+                    "m" => TimeSpan.FromMinutes(n),
+                    _ => TimeSpan.FromSeconds(n)
+                };
+            }
+
+            return interval > TimeSpan.Zero;
+        }
+
+        return TimeSpan.TryParse(t, out interval) && interval > TimeSpan.Zero;
+    }
+
     public static CliOptions Parse(string[] args)
     {
         string? configPath = null;
@@ -6512,6 +7088,12 @@ internal sealed class CliOptions
         var cliListProfiles = false;
         var cliCheckLoginPage = false;
         var cliCheckTelegram = false;
+        var cliWatch = false;
+        var cliNotifyTest = false;
+        string? cliWatchInterval = null;
+        var cliTelegramOnlyNew = false;
+        string? cliNotifyBotToken = null;
+        string? cliNotifyChatId = null;
         bool? cliSplitScreen = null;
         var cliRecheckOwned = false;
         string? cliTelegramProxy = null;
@@ -6603,6 +7185,24 @@ internal sealed class CliOptions
                     break;
                 case "--check-telegram":
                     cliCheckTelegram = true;
+                    break;
+                case "--watch":
+                    cliWatch = true;
+                    break;
+                case "--notify-test":
+                    cliNotifyTest = true;
+                    break;
+                case "--watch-interval" when i + 1 < args.Length:
+                    cliWatchInterval = args[++i];
+                    break;
+                case "--tg-only-new":
+                    cliTelegramOnlyNew = true;
+                    break;
+                case "--notify-bot-token" when i + 1 < args.Length:
+                    cliNotifyBotToken = args[++i];
+                    break;
+                case "--notify-chat-id" when i + 1 < args.Length:
+                    cliNotifyChatId = args[++i];
                     break;
                 case "--tg-proxy" when i + 1 < args.Length:
                     cliTelegramProxy = args[++i];
@@ -6735,7 +7335,13 @@ internal sealed class CliOptions
         var loginOnly = cliLoginOnly || (config?.LoginOnly ?? false);
         var dryRun = cliDryRun || (config?.DryRun ?? false);
 
-        var headless = cliHeadless ?? config?.Headless ?? false;
+        // На сервере экрана нет: в режиме --watch и там, где нет ни X11, ни Wayland
+        // (Docker, SSH), браузер невидимый — окно всё равно негде показать.
+        var watch = cliWatch || (config?.Server?.Watch ?? false);
+        var noScreen = OperatingSystem.IsLinux() &&
+                       string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY")) &&
+                       string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY"));
+        var headless = cliHeadless ?? (watch || noScreen ? true : config?.Headless ?? false);
         // --quiet сильнее всего остального: он нужен, чтобы обычный запуск давал
         // читаемый лог даже там, где в config.json когда-то включили подробности.
         var verbose = !cliQuiet && (cliVerbose || (config?.Verbose ?? false));
@@ -6920,7 +7526,22 @@ internal sealed class CliOptions
         }
 
         // Интерактивный режим доступен, только если программу запустили из живой консоли.
-        var interactive = cliInteractive ?? config?.Interactive ?? !Console.IsInputRedirected;
+        // На сервере спрашивать некого, даже если консоль вдруг есть.
+        var interactive = !watch && (cliInteractive ?? config?.Interactive ?? !Console.IsInputRedirected);
+
+        var watchIntervalText = FirstNonEmpty(cliWatchInterval, config?.Server?.Interval);
+        var watchInterval = TimeSpan.FromHours(24);
+        if (!string.IsNullOrWhiteSpace(watchIntervalText))
+        {
+            if (TryParseInterval(watchIntervalText, out var parsedInterval))
+            {
+                watchInterval = parsedInterval;
+            }
+            else
+            {
+                Console.WriteLine($"[Сервер] Не понял период '{watchIntervalText}'. Примеры: 30m, 6h, 1d. Берём 24h.");
+            }
+        }
 
         var telegramPostLimit = config?.Telegram?.PostLimit ?? 50;
         var telegramScreenshotOnNoLinks = config?.Telegram?.ScreenshotOnNoLinks ?? false;
@@ -6943,7 +7564,13 @@ internal sealed class CliOptions
             ListProfiles = cliListProfiles,
             CheckLoginPage = cliCheckLoginPage,
             CheckTelegram = cliCheckTelegram,
-            SplitScreen = cliSplitScreen ?? config?.SplitScreen ?? true,
+            Watch = watch,
+            NotifyTest = cliNotifyTest,
+            WatchInterval = watchInterval,
+            TelegramOnlyNew = watch || cliTelegramOnlyNew || (config?.Telegram?.OnlyNew ?? false),
+            NotifyBotToken = FirstNonEmpty(cliNotifyBotToken, Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN"), config?.Notify?.TelegramBotToken),
+            NotifyChatId = FirstNonEmpty(cliNotifyChatId, Environment.GetEnvironmentVariable("TELEGRAM_CHAT_ID"), config?.Notify?.TelegramChatId),
+            SplitScreen = !watch && (cliSplitScreen ?? config?.SplitScreen ?? true),
             RecheckOwned = cliRecheckOwned,
             TelegramProxy = FirstNonEmpty(cliTelegramProxy, config?.Telegram?.Proxy),
             TelegramProxyList = FirstNonEmpty(cliTelegramProxyList, config?.Telegram?.ProxyList),
@@ -7103,6 +7730,8 @@ internal sealed class AppConfig
     public List<string> Sources { get; init; } = [];
     public ProxyConfig? Proxy { get; init; }
     public TelegramConfig? Telegram { get; init; }
+    public ServerConfig? Server { get; init; }
+    public NotifyConfig? Notify { get; init; }
 
     public static AppConfig? Load(string? explicitConfigPath, out string? usedConfigPath, out string? error)
     {
@@ -7160,7 +7789,27 @@ internal sealed class TelegramConfig
 
     /// <summary>Размер пачки ассетов из Telegram. 0 — читать всё разом по postLimit.</summary>
     public int? BatchSize { get; init; }
+
+    /// <summary>Читать только посты, появившиеся после прошлого прогона.</summary>
+    public bool? OnlyNew { get; init; }
+
     public bool ScreenshotOnNoLinks { get; init; } = true;
+}
+
+/// <summary>Режим сервера: периодические прогоны без окна браузера.</summary>
+internal sealed class ServerConfig
+{
+    public bool? Watch { get; init; }
+
+    /// <summary>Период между прогонами: '30m', '6h', '1d'.</summary>
+    public string? Interval { get; init; }
+}
+
+/// <summary>Сообщения от Telegram-бота.</summary>
+internal sealed class NotifyConfig
+{
+    public string? TelegramBotToken { get; init; }
+    public string? TelegramChatId { get; init; }
 }
 
 internal sealed class SerializableCookie
@@ -7228,6 +7877,9 @@ internal sealed class ProcessResult
     public string? PurchasedOnText { get; set; }
     public string? DetectionSummary { get; set; }
     public string? Message { get; set; }
+
+    /// <summary>Промокод, по которому выкупался ассет (если выкупался).</summary>
+    public string? PromoCode { get; set; }
 }
 
 internal sealed class AssetStatusSnapshot
@@ -7282,6 +7934,15 @@ internal sealed class CouponMessage
 {
     public string Text { get; set; } = string.Empty;
     public bool Explicit { get; set; }
+}
+
+/// <summary>Состояние страницы входа Unity: шаг, капча, сообщения об ошибке.</summary>
+internal sealed class LoginPageState
+{
+    public string Step { get; set; } = "unknown";
+    public bool Captcha { get; set; }
+    public List<string> Errors { get; set; } = [];
+    public string Text { get; set; } = string.Empty;
 }
 
 /// <summary>Где на странице оплаты вопрос «Tax Business use» и выбран ли уже «No».</summary>

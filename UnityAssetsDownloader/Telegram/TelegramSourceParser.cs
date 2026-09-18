@@ -81,7 +81,7 @@ internal sealed class TelegramSourceParser
 
         bool CanRead(TelegramChannelCursor c) =>
             !c.Exhausted && !c.FailedThisRead &&
-            c.PostsRead < maxPostsPerChannel && c.PagesRead < maxPagesPerChannel;
+            c.PostsRead < Math.Min(maxPostsPerChannel, c.MaxPosts) && c.PagesRead < maxPagesPerChannel;
 
         var page = await _browser.NewPageAsync();
         page.DefaultNavigationTimeout = _navigationTimeoutMs;
@@ -142,7 +142,10 @@ internal sealed class TelegramSourceParser
 
         foreach (var cursor in cursors.Where(c => c.PostsRead > 0))
         {
-            var state = cursor.Exhausted ? ", посты канала кончились" : string.Empty;
+            var state = !cursor.Exhausted ? string.Empty
+                : cursor.StopAtId > 0 ? $", дочитали до прошлого раза (#{cursor.StopAtId})"
+                : cursor.PostsRead >= cursor.MaxPosts ? $", взяли последние {cursor.MaxPosts}"
+                : ", посты канала кончились";
             _logger.Info($"[Telegram] Канал {cursor.Name}: всего прочитано постов {cursor.PostsRead}{state}.");
         }
 
@@ -215,20 +218,37 @@ internal sealed class TelegramSourceParser
         });
         await Task.Delay(firstPage ? 2000 : 1500);
 
+        var pagePosts = await ExtractPostsRawAsync(page);
+        var postLimit = Math.Min(maxPostsPerChannel, cursor.MaxPosts);
+
+        // Режим «только новые»: посты с номером не больше StopAtId прочитаны в прошлый раз.
+        bool IsOld(string postId)
+        {
+            var n = ParsePostNumber(postId);
+            return cursor.StopAtId > 0 && (n == 0 || n <= cursor.StopAtId);
+        }
+
+        var reachedKnown = cursor.StopAtId > 0 && pagePosts.Any(p => IsOld(p.PostId));
+
         // Сначала новые посты: промокоды быстро истекают, свежие важнее.
-        var fresh = (await ExtractPostsRawAsync(page))
-            .Where(p => !cursor.SeenPostIds.Contains(p.PostId))
+        var fresh = pagePosts
+            .Where(p => !cursor.SeenPostIds.Contains(p.PostId) && !IsOld(p.PostId))
             .OrderByDescending(p => ParsePostNumber(p.PostId))
-            .Take(Math.Max(0, maxPostsPerChannel - cursor.PostsRead))
+            .Take(Math.Max(0, postLimit - cursor.PostsRead))
             .ToList();
 
         cursor.PagesRead++;
-        _logger.Info($"[Telegram] Канал {cursor.Name}: страница {cursor.PagesRead}, новых постов: {fresh.Count}");
+        _logger.Info($"[Telegram] Канал {cursor.Name}: страница {cursor.PagesRead}, новых постов: {fresh.Count}" +
+                     (reachedKnown ? $" (дошли до поста #{cursor.StopAtId}, прочитанного в прошлый раз)" : string.Empty));
 
         if (fresh.Count == 0)
         {
             cursor.Exhausted = true;
-            if (cursor.PostsRead == 0)
+            if (reachedKnown && cursor.PostsRead == 0)
+            {
+                _logger.Info($"[Telegram] Канал {cursor.Name}: новых постов с прошлого раза нет.");
+            }
+            else if (cursor.PostsRead == 0)
             {
                 _logger.Warn($"[Telegram] Канал {cursor.Name}: не найдено постов. Возможно канал недоступен или заблокирован.");
                 channelResult.Errors.Add($"Канал {cursor.Name}: посты не найдены");
@@ -246,9 +266,11 @@ internal sealed class TelegramSourceParser
         }
 
         cursor.PostsRead += fresh.Count;
+        cursor.NewestId = Math.Max(cursor.NewestId,
+            fresh.Select(p => ParsePostNumber(p.PostId)).DefaultIfEmpty(0).Max());
 
         var oldest = fresh.Select(p => ParsePostNumber(p.PostId)).Where(n => n > 0).DefaultIfEmpty(0).Min();
-        if (oldest <= 1)
+        if (oldest <= 1 || reachedKnown || cursor.PostsRead >= postLimit)
         {
             cursor.Exhausted = true;
         }
@@ -518,9 +540,22 @@ internal sealed class TelegramChannelCursor(string name)
     /// <summary>Номер самого старого прочитанного поста. 0 — канал ещё не открывали.</summary>
     public int OldestId { get; set; }
 
+    /// <summary>
+    /// Больше читать не нужно: посты кончились, дошли до StopAtId или прочитано MaxPosts.
+    /// </summary>
     public bool Exhausted { get; set; }
+
     public int PostsRead { get; set; }
     public int PagesRead { get; set; }
+
+    /// <summary>Режим «только новые»: посты с этим номером и старше читались в прошлый раз.</summary>
+    public int StopAtId { get; set; }
+
+    /// <summary>Сколько постов канала читать максимум (первый прогон в режиме «только новые»).</summary>
+    public int MaxPosts { get; set; } = int.MaxValue;
+
+    /// <summary>Номер самого свежего прочитанного поста — запоминается для следующего прогона.</summary>
+    public int NewestId { get; set; }
 
     /// <summary>Канал не открылся в текущем чтении. Сбрасывается перед повтором через другой прокси.</summary>
     public bool FailedThisRead { get; set; }

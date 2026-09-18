@@ -1,0 +1,39 @@
+# Сервер: программа сама раз в период читает Telegram-каналы и добавляет новые ассеты.
+#
+#   1. cp .env.example .env   и впишите в .env email, пароль Unity и токен бота
+#   2. docker compose up -d --build
+#   3. напишите боту в Telegram любое сообщение — дальше он будет писать вам сам
+#
+# Логи:        docker compose logs -f        (и файлы в ./logs)
+# Остановить:  docker compose down
+services:
+  unity-assets:
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-}
+    image: unity-assets-downloader
+    container_name: unity-assets-downloader
+    # Постоянное имя: по нему браузер узнаёт свою блокировку папки после перезапуска.
+    hostname: unity-assets
+    restart: unless-stopped
+    # init убирает зависшие процессы браузера, если он упадёт посреди работы.
+    init: true
+    shm_size: "1gb"
+    env_file: .env
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+    command:
+      - "--watch"
+      - "--watch-interval"
+      - "${WATCH_INTERVAL:-24h}"
+      - "--profile"
+      - "${PROFILE:-server}"
+      - "--no-defaults"
+      - "--quiet"
+    volumes:
+      # Сессия Unity, память профиля (что уже добавлено), где остановилось чтение каналов.
+      - ./data:/app/data
+      - ./logs:/app/logs
+      # Каналы можно менять без пересборки: правка файла подхватится в следующем прогоне.
+      - ./telegram_sources.txt:/app/telegram_sources.txt:ro

@@ -408,3 +408,6 @@ config.json
 /logs/
 logs-*.zip
 telegram_sources.local.txt
+
+# Пароль Unity и токен бота для сервера
+.env

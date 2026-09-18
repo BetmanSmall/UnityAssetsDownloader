@@ -35,7 +35,16 @@
     "channels": [],
     "postLimit": 50,
     "batchSize": 30,
+    "onlyNew": false,
     "screenshotOnNoLinks": false
+  },
+  "server": {
+    "watch": false,
+    "interval": "24h"
+  },
+  "notify": {
+    "telegramBotToken": "",
+    "telegramChatId": ""
   },
   "proxy": {
     "type": "socks5",
