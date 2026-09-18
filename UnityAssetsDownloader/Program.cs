@@ -295,6 +295,17 @@ internal sealed class UnityAssetAutomationApp
                 browserArgs.Add("--no-sandbox");
                 browserArgs.Add("--disable-dev-shm-usage");
                 _logger.Debug("Linux: добавлены --no-sandbox и --disable-dev-shm-usage для запуска в контейнере.");
+
+                // Рабочий стол Steam Deck и многие другие работают на Wayland. Программам
+                // из Flatpak (например, терминалу VS Code) там доступен только Wayland,
+                // а Chrome по умолчанию ищет X11 и падает с "Missing X server or $DISPLAY".
+                if (!_options.Headless &&
+                    string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY")) &&
+                    !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY")))
+                {
+                    browserArgs.Add("--ozone-platform=wayland");
+                    _logger.Info("Экрана X11 нет, браузер запускается на Wayland.");
+                }
             }
 
             if (_options.ProxyHost != null && _options.ProxyPort.HasValue)
@@ -1246,50 +1257,65 @@ internal sealed class UnityAssetAutomationApp
     {
         const int attempts = 3;
 
-        for (var attempt = 1; attempt <= attempts; attempt++)
+        for (var attempt = 1; ; attempt++)
         {
             try
             {
                 return await Puppeteer.LaunchAsync(options);
             }
-            catch (Exception ex) when (attempt < attempts)
+            catch (Exception ex) when (attempt < attempts && !IsNoDisplayError(ex))
             {
                 _logger.Warn($"Браузер не запустился (попытка {attempt} из {attempts}): {ex.Message}");
                 _logger.Warn("Обычно это Chrome от прошлого запуска: он ещё держит папку профиля.");
                 _logger.Warn("Ждём 6 секунд и пробуем снова...");
                 await Task.Delay(6000);
             }
-        }
-
-        // Последняя попытка — уже без перехвата, чтобы текст ошибки попал в файл.
-        try
-        {
-            return await Puppeteer.LaunchAsync(options);
-        }
-        catch (Exception ex)
-        {
-            _logger.Error("============================================================");
-            _logger.Error(" БРАУЗЕР НЕ ЗАПУСКАЕТСЯ");
-            _logger.Error("");
-
-            if (_options.UseSystemChromeProfile)
+            catch (Exception ex)
             {
-                _logger.Error(" Включён режим вашего обычного Chrome, а Chrome сейчас запущен.");
-                _logger.Error(" Закройте ВСЕ окна Chrome, включая значок у часов, и повторите.");
-                _logger.Error(" Либо вернитесь к своей папке браузера — пункт B в меню.");
+                // Последняя попытка или ошибка, которую повтор не исправит:
+                // объясняем и отдаём ошибку дальше, чтобы её текст попал в файл.
+                ExplainBrowserLaunchFailure(ex);
+                throw;
             }
-            else
-            {
-                _logger.Error(" Скорее всего, окно Chrome от прошлого запуска ещё живо.");
-                _logger.Error(" Закройте лишние окна Chrome и запустите снова.");
-                _logger.Error(" Если не помогает — перезагрузите компьютер: зависший процесс уйдёт.");
-            }
-
-            _logger.Error("");
-            _logger.Error($" Текст ошибки: {ex.Message}");
-            _logger.Error("============================================================");
-            throw;
         }
+    }
+
+    /// <summary>Браузеру негде показать окно: ни X11, ни Wayland ему не доступны.</summary>
+    private static bool IsNoDisplayError(Exception ex) =>
+        ex.Message.Contains("Missing X server", StringComparison.OrdinalIgnoreCase) ||
+        ex.Message.Contains("platform failed to initialize", StringComparison.OrdinalIgnoreCase);
+
+    private void ExplainBrowserLaunchFailure(Exception ex)
+    {
+        _logger.Error("============================================================");
+        _logger.Error(" БРАУЗЕР НЕ ЗАПУСКАЕТСЯ");
+        _logger.Error("");
+
+        if (IsNoDisplayError(ex))
+        {
+            _logger.Error(" Браузеру негде показать окно: программе не виден экран.");
+            _logger.Error(" Так бывает, если запускать из терминала внутри Flatpak или по SSH.");
+            _logger.Error("");
+            _logger.Error(" Что сделать:");
+            _logger.Error("   - запустите run.sh из обычного терминала рабочего стола (Konsole);");
+            _logger.Error("   - или из терминала Flatpak так: flatpak-spawn --host ./run.sh");
+        }
+        else if (_options.UseSystemChromeProfile)
+        {
+            _logger.Error(" Включён режим вашего обычного Chrome, а Chrome сейчас запущен.");
+            _logger.Error(" Закройте ВСЕ окна Chrome, включая значок у часов, и повторите.");
+            _logger.Error(" Либо вернитесь к своей папке браузера — пункт B в меню.");
+        }
+        else
+        {
+            _logger.Error(" Скорее всего, окно Chrome от прошлого запуска ещё живо.");
+            _logger.Error(" Закройте лишние окна Chrome и запустите снова.");
+            _logger.Error(" Если не помогает — перезагрузите компьютер: зависший процесс уйдёт.");
+        }
+
+        _logger.Error("");
+        _logger.Error($" Текст ошибки: {ex.Message}");
+        _logger.Error("============================================================");
     }
 
     /// <summary>Поднимает отдельный браузер с прокси только для Telegram.</summary>

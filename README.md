@@ -45,6 +45,8 @@ cd UnityAssetsDownloader
 ```
 
 Отличия от Windows: браузер открывается во весь экран, без деления с консолью.
+Если экрана X11 нет, а есть Wayland (рабочий стол Steam Deck, терминал VS Code из
+Flatpak), браузер сам запускается на Wayland.
 Диспетчера учётных данных нет, поэтому email и пароль Unity берутся из
 `config.json` или переменных `UNITY_EMAIL` / `UNITY_PASSWORD`, иначе их спросят
 при входе. Если dotnet установлен скриптом `dotnet-install` в `~/.dotnet`,
