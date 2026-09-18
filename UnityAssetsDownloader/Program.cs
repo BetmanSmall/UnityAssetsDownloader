@@ -916,7 +916,13 @@ internal sealed class UnityAssetAutomationApp
 
             TelegramParseResult result = new();
 
-            for (var i = 0; i < candidates.Count && i < 4; i++)
+            // Бесплатный прокси может открыть один канал и сорваться на другом.
+            // Поэтому каналы, которые не открылись, пробуем через следующий прокси,
+            // а уже прочитанные не перечитываем.
+            var pending = new List<string>(_options.TelegramChannels);
+            var proxySaved = false;
+
+            for (var i = 0; i < candidates.Count && i < 4 && pending.Count > 0; i++)
             {
                 var candidate = candidates[i];
 
@@ -936,7 +942,7 @@ internal sealed class UnityAssetAutomationApp
                 {
                     if (i > 0)
                     {
-                        _logger.Warn($"Пробуем запасной прокси: {candidate}");
+                        _logger.Warn($"Пробуем запасной прокси: {candidate} (каналы: {string.Join(", ", pending)})");
                     }
 
                     ownBrowser = await LaunchTelegramBrowserAsync(candidate);
@@ -945,29 +951,36 @@ internal sealed class UnityAssetAutomationApp
                     _logger.Info("Unity при этом работает напрямую, без прокси.");
                 }
 
-                result = await RunParserAsync(tgBrowser);
+                var partial = await RunParserAsync(tgBrowser, pending);
+                MergeTelegramResults(result, partial);
 
-                if (result.AllPosts.Count > 0)
+                var opened = partial.AllPosts
+                    .Select(p => p.ChannelName)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                pending.RemoveAll(opened.Contains);
+
+                if (opened.Count > 0 && !proxySaved && !string.IsNullOrWhiteSpace(candidate))
                 {
-                    if (!string.IsNullOrWhiteSpace(candidate))
-                    {
-                        await RememberProxyAsync(candidate);
-                    }
-
-                    break;
+                    await RememberProxyAsync(candidate);
+                    proxySaved = true;
                 }
 
-                if (!LooksBlocked(result))
+                if (pending.Count > 0 && !LooksBlocked(partial))
                 {
                     break;
                 }
+            }
+
+            if (pending.Count > 0 && result.AllPosts.Count > 0)
+            {
+                _logger.Warn($"Telegram: не открылись каналы: {string.Join(", ", pending)}. Их посты в этот раз пропущены.");
             }
 
             await SaveTelegramPostsAsync(result);
             ExplainTelegramFailure(result);
             return result;
 
-            async Task<TelegramParseResult> RunParserAsync(IBrowser browser)
+            async Task<TelegramParseResult> RunParserAsync(IBrowser browser, List<string> channels)
             {
                 var parser = new TelegramSourceParser(
                     browser,
@@ -977,7 +990,7 @@ internal sealed class UnityAssetAutomationApp
                     _options.TelegramPostLimit,
                     _options.TelegramScreenshotOnNoLinks);
 
-                return await parser.ParseChannelsAsync(_options.TelegramChannels);
+                return await parser.ParseChannelsAsync(channels);
             }
         }
         finally
@@ -1013,6 +1026,25 @@ internal sealed class UnityAssetAutomationApp
         }
     }
 
+    /// <summary>
+    /// Дописывает к общему результату то, что прочиталось через очередной прокси.
+    /// Ошибки берутся только последние: ошибки каналов, которые потом открылись, уже не важны.
+    /// </summary>
+    private static void MergeTelegramResults(TelegramParseResult total, TelegramParseResult partial)
+    {
+        total.AssetUrls = total.AssetUrls.Concat(partial.AssetUrls).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        total.GitLinks = total.GitLinks.Concat(partial.GitLinks).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        total.Promocodes.AddRange(partial.Promocodes);
+        total.PostsWithoutLinks.AddRange(partial.PostsWithoutLinks);
+        total.AllPosts.AddRange(partial.AllPosts);
+        total.Errors = partial.Errors;
+
+        foreach (var kvp in partial.AssetPromocodes)
+        {
+            total.AssetPromocodes.TryAdd(kvp.Key, kvp.Value);
+        }
+    }
+
     /// <summary>Похожи ли ошибки на блокировку или мёртвый прокси.</summary>
     private static bool LooksBlocked(TelegramParseResult result)
     {
@@ -1020,7 +1052,8 @@ internal sealed class UnityAssetAutomationApp
         [
             "ERR_CONNECTION_TIMED_OUT", "ERR_CONNECTION_RESET", "ERR_CONNECTION_CLOSED",
             "ERR_NAME_NOT_RESOLVED", "ERR_CONNECTION_REFUSED", "ERR_TIMED_OUT",
-            "ERR_PROXY_CONNECTION_FAILED", "ERR_SOCKS_CONNECTION_FAILED", "ERR_ADDRESS_UNREACHABLE"
+            "ERR_PROXY_CONNECTION_FAILED", "ERR_SOCKS_CONNECTION_FAILED", "ERR_ADDRESS_UNREACHABLE",
+            "ERR_NETWORK_CHANGED", "ERR_EMPTY_RESPONSE", "ERR_TUNNEL_CONNECTION_FAILED"
         ];
 
         return result.Errors.Any(e => codes.Any(c => e.Contains(c, StringComparison.OrdinalIgnoreCase)));
@@ -3817,7 +3850,7 @@ internal sealed class UnityAssetAutomationApp
             // 3. Оформление заказа из корзины: магазин сам переводит на pay.unity.com.
             stepSw.Restart();
             _logger.Info("[Промокод][Шаг 3] Нажимаем 'Checkout' в корзине и ждём страницу оплаты pay.unity.com");
-            var onPayPage = await ProceedToCheckoutFromCartAsync(page, TimeSpan.FromSeconds(45));
+            var onPayPage = await ProceedToCheckoutFromCartAsync(page, TimeSpan.FromSeconds(60));
             _logger.Info($"[Промокод][Шаг 3] страница оплаты открылась={onPayPage} | {stepSw.ElapsedMilliseconds}мс | URL: {page.Url}");
 
             if (!onPayPage)
@@ -3834,7 +3867,8 @@ internal sealed class UnityAssetAutomationApp
 
             await SaveErrorScreenshotAsync(page, $"promo_pay_page_{sanitizedId}");
 
-            var elementsReady = await WaitForCartPageElementsAsync(page, TimeSpan.FromSeconds(20));
+            _logger.Info("[Промокод][Шаг 3] Ждём, пока на странице оплаты появятся поле промокода и кнопка оплаты (до 30с)...");
+            var elementsReady = await WaitForCartPageElementsAsync(page, TimeSpan.FromSeconds(30));
             _logger.Info($"[Промокод][Шаг 3] elementsReady={elementsReady} | {stepSw.ElapsedMilliseconds}мс");
             if (!elementsReady)
             {
@@ -4652,37 +4686,79 @@ internal sealed class UnityAssetAutomationApp
             return false;
         }
 
+        // По дороге на pay.unity.com Unity проводит через вход: api.unity.com/v1/oauth2/authorize
+        // и обратно на pay.unity.com/.../auth/login_callback. Адрес pay.unity.com при этом
+        // стоит в параметрах ссылки входа, поэтому смотрим на сам сайт, а не на текст адреса.
         var stopAt = DateTime.UtcNow.Add(timeout);
+        var lastUrl = string.Empty;
+        var loginTried = false;
+
         while (DateTime.UtcNow < stopAt)
         {
-            if (page.Url.Contains("pay.unity.com", StringComparison.OrdinalIgnoreCase))
+            var url = page.Url;
+            if (url != lastUrl)
+            {
+                _logger.Info($"[Промокод][Шаг 3] Сейчас открыто: {ShortUrl(url)}");
+                lastUrl = url;
+            }
+
+            if (IsPayCheckoutPage(url))
             {
                 return true;
             }
 
-            if (page.Url.Contains("assetstore.unity.com/error", StringComparison.OrdinalIgnoreCase))
+            if (url.Contains("assetstore.unity.com/error", StringComparison.OrdinalIgnoreCase))
             {
-                _logger.Warn($"[Промокод][Шаг 3] Магазин показал страницу ошибки: {page.Url}");
+                _logger.Warn($"[Промокод][Шаг 3] Магазин показал страницу ошибки: {url}");
                 return false;
             }
 
             try
             {
-                if (await TryAcceptAddConfirmationAsync(page))
+                if (HostOf(url) == "login.unity.com")
+                {
+                    // Unity просит войти заново перед оплатой.
+                    if (HasCredentials && !loginTried)
+                    {
+                        _logger.Info("[Промокод][Шаг 3] Unity просит войти перед оплатой. Вводим email и пароль профиля...");
+                        loginTried = true;
+                        await TryCompleteUnityLoginFormAsync(page);
+                    }
+                    else if (!HasCredentials && !loginTried)
+                    {
+                        loginTried = true;
+                        _logger.Warn("[Промокод][Шаг 3] Unity просит войти перед оплатой. Войдите в окне браузера — программа подождёт.");
+                        stopAt = DateTime.UtcNow.AddMilliseconds(_options.AuthTimeoutMs);
+                    }
+                }
+                else if (HostOf(url) == "assetstore.unity.com" &&
+                         await TryAcceptAddConfirmationAsync(page))
                 {
                     _logger.Info("[Промокод][Шаг 3] Принят диалог с условиями магазина.");
                 }
             }
             catch (Exception ex) when (IsTransientPageError(ex))
             {
-                // Идёт переход на страницу оплаты — это и нужно.
+                // Идёт переход на следующую страницу — это и нужно.
             }
 
             await Task.Delay(700);
         }
 
-        return page.Url.Contains("pay.unity.com", StringComparison.OrdinalIgnoreCase);
+        return IsPayCheckoutPage(page.Url);
     }
+
+    /// <summary>Сайт из адреса, например "pay.unity.com". Пусто, если адрес не разобрать.</summary>
+    private static string HostOf(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var uri) ? uri.Host.ToLowerInvariant() : string.Empty;
+
+    /// <summary>
+    /// Открыта ли сама страница оформления на pay.unity.com. Промежуточный адрес
+    /// входа (…/auth/login_callback) ещё не она.
+    /// </summary>
+    private static bool IsPayCheckoutPage(string url) =>
+        HostOf(url) == "pay.unity.com" &&
+        !url.Contains("/auth/", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Находит поле промокода (при нужде раскрывает его ссылкой «Have a promo code?»)

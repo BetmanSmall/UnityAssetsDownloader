@@ -24,9 +24,12 @@ internal sealed class TelegramSourceParser
         @"(?:https?:\/\/)?(?:www\.)?(?:github\.com|gitlab\.com|bitbucket\.org)\/[\w\-\.]+\/[\w\-\.]+(?:\/[\w\-\.\/~]+)?",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    // Regex для промокодов
+    // Regex для промокодов: слово «промокод» в любой форме («по промокоду», «промокодом»)
+    // или promo code / coupon, за ним сам код латиницей. Кириллица кодом не бывает:
+    // иначе в «промокод чтобы получить...» кодом становилось слово «чтобы».
     private static readonly Regex PromocodeRegex = new(
-        @"(?:промокод|промо\-код|promocode|promo\s*code|promo|coupon)\s*:?\s*([\w\-]{4,})",
+        @"(?<![\p{L}\d])(?:промо-?код[а-я]*|купон[а-я]*|promo\s*-?\s*codes?|promocodes?|coupon(?:\s*codes?)?|promo)(?![\p{L}\d])" +
+        @"\s*[:\-–—]?\s*([A-Za-z0-9][A-Za-z0-9_\-]{3,39})(?![\p{L}\d_\-])",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     public TelegramSourceParser(
@@ -239,10 +242,7 @@ internal sealed class TelegramSourceParser
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        var promocodes = PromocodeRegex.Matches(text)
-            .Select(m => m.Groups[1].Value.Trim())
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        var promocodes = ExtractPromocodes(text);
 
         channelResult.AssetUrls.AddRange(assetUrls);
         channelResult.GitLinks.AddRange(gitUrls);
@@ -303,6 +303,21 @@ internal sealed class TelegramSourceParser
             });
         }
     }
+
+    /// <summary>Промокоды из текста поста.</summary>
+    internal static List<string> ExtractPromocodes(string text) => PromocodeRegex.Matches(text)
+        .Select(m => m.Groups[1].Value.Trim())
+        .Where(IsLikelyPromocode)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    /// <summary>
+    /// Код раздачи — это «GIANTGREY2026», а не «below» из «use promo code below».
+    /// Настоящие коды пишут заглавными или с цифрами.
+    /// </summary>
+    private static bool IsLikelyPromocode(string code) =>
+        !code.StartsWith("http", StringComparison.OrdinalIgnoreCase) &&
+        (code.Any(char.IsDigit) || code == code.ToUpperInvariant());
 
     /// <summary>Номер поста из "канал/1348". 0, если номера нет.</summary>
     private static int ParsePostNumber(string postId)
