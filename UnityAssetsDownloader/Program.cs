@@ -2140,12 +2140,18 @@ internal sealed class UnityAssetAutomationApp
                 };
 
                 // Превращает '$1,234.56' или '1.234,56 $' в число.
+                // Сумма с валютой до или после числа: '$20.00', 'US$ 20', '22.45€', '1 234,56 ₽', 'EUR 5'.
+                // Цифры без валюты рядом суммой не считаются: '(1)' в 'Items (1)' — это количество.
                 const parseAmount = (text) => {
-                    const m = norm(text).match(/(?:US)?\s*\$\s*([0-9][0-9\s.,]*)/i);
+                    const num = '(\\d{1,3}(?:[ \\u00a0\\u202f.,]\\d{3})+(?:[.,]\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?)';
+                    const cur = '(?:US\\$|\\$|€|£|₽|руб\\.?|EUR|USD|GBP|RUB)';
+                    const re = new RegExp(cur + '\\s*' + num + '|' + num + '\\s*' + cur, 'i');
+                    const m = norm(text).match(re);
                     if (!m) return null;
-                    let n = m[1].replace(/\s/g, '').replace(/[.,]$/, '');
-                    if (/,\d{2}$/.test(n)) n = n.replace(/\./g, '').replace(',', '.');
-                    else n = n.replace(/,/g, '');
+                    let n = (m[1] || m[2]).replace(/[   ]/g, '');
+                    const dec = n.match(/[.,](\d{1,2})$/);
+                    const whole = dec ? n.slice(0, -dec[0].length) : n;
+                    n = whole.replace(/[.,]/g, '') + (dec ? '.' + dec[1] : '');
                     const v = parseFloat(n);
                     return isNaN(v) ? null : v;
                 };
@@ -2165,9 +2171,19 @@ internal sealed class UnityAssetAutomationApp
                 }
 
                 // Сначала точные слова, 'total' последним: он есть и внутри 'subtotal'.
-                const totalWords = ['order total', 'grand total', 'amount due', 'к оплате', 'итого', 'total'];
+                const totalWords = ['to pay now', 'order total', 'grand total', 'amount due', 'amount to pay', 'to pay',
+                    'к оплате', 'итого', 'total'];
                 const nodes = Array.from(document.querySelectorAll('div, span, p, td, li, section, dl'))
                     .filter(visible);
+
+                // Слово итога ищем целиком: 'total' внутри 'Subtotal' — это не итог.
+                // Иначе при итоге прочерком (налог ещё не посчитан) сумма бралась из Subtotal.
+                const lastWordEnd = (lt, w) => {
+                    const re = new RegExp('(^|[^a-zа-яё])' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+                    let m, end = -1;
+                    while ((m = re.exec(lt)) !== null) end = m.index + m[0].length;
+                    return end;
+                };
 
                 // Сумма берётся именно после слова итога. В блоке вида
                 // 'Покупки (1) $20.00 Промежуточный итог $20.00 Налог $4.40 К оплате $24.40'
@@ -2175,9 +2191,9 @@ internal sealed class UnityAssetAutomationApp
                 const amountAfterTotal = (t) => {
                     const lt = t.toLowerCase();
                     for (const w of totalWords) {
-                        const idx = lt.lastIndexOf(w);
-                        if (idx < 0) continue;
-                        const amount = parseAmount(t.slice(idx + w.length));
+                        const end = lastWordEnd(lt, w);
+                        if (end < 0) continue;
+                        const amount = parseAmount(t.slice(end));
                         if (amount !== null) return amount;
                     }
                     return null;
@@ -2189,7 +2205,7 @@ internal sealed class UnityAssetAutomationApp
                     const t = norm(el.innerText || '');
                     if (!t || t.length > 200) continue;
                     const lt = t.toLowerCase();
-                    if (!totalWords.some(w => lt.includes(w))) continue;
+                    if (!totalWords.some(w => lastWordEnd(lt, w) >= 0)) continue;
                     const amount = amountAfterTotal(t);
                     if (amount === null) continue;
                     // Берём самый мелкий подходящий узел: он ближе всего к самой сумме.
@@ -2202,7 +2218,7 @@ internal sealed class UnityAssetAutomationApp
                         const t = norm(el.innerText || '');
                         if (!t || t.length > 60) continue;
                         const lt = t.toLowerCase();
-                        if (!totalWords.some(w => lt.includes(w))) continue;
+                        if (!totalWords.some(w => lastWordEnd(lt, w) >= 0)) continue;
                         if (/\bfree\b|бесплатно/.test(lt)) { best = { raw: t, amount: 0 }; break; }
                     }
                 }
@@ -3930,86 +3946,12 @@ internal sealed class UnityAssetAutomationApp
                 return result;
             }
 
-            // 4. Обработка шага налогообложения "Tax Business use"
+            // 4. Вопрос «Tax Business use»: всегда «No». С «Yes» страница требует адрес
+            // организации, не считает налог и итог и не принимает промокод.
             stepSw.Restart();
-            _logger.Info($"[Промокод][Шаг 4] Проверка налогового вопроса 'Tax Business use' | URL: {page.Url}");
-
-            var taxHandled = await page.EvaluateFunctionAsync<bool>(@"() => {
-                const visible = (el) => {
-                    if (!el) return false;
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-                };
-
-                const labels = Array.from(document.querySelectorAll('label, span, div'));
-                const taxLabel = labels.find(el => {
-                    const txt = (el.innerText || '').toLowerCase();
-                    return txt.includes('tax business use') || txt.includes('business use') || txt.includes('коммерческ') || txt.includes('для бизнеса') || txt.includes('предпринимател') || txt.includes('инн') || txt.includes('tax number');
-                });
-
-                if (!taxLabel) return false;
-
-                const inputs = Array.from(document.querySelectorAll('input[type=""radio""]'));
-                let noRadio = null;
-                for (const input of inputs) {
-                    if (!visible(input)) continue;
-                    
-                    let labelText = '';
-                    if (input.id) {
-                        const lbl = document.querySelector(`label[for=""${input.id}""]`);
-                        if (lbl) labelText = lbl.innerText;
-                    }
-                    if (!labelText) {
-                        let parent = input.parentElement;
-                        while (parent && parent !== document.body) {
-                            if (parent.tagName === 'LABEL') {
-                                labelText = parent.innerText;
-                                break;
-                            }
-                            parent = parent.parentElement;
-                        }
-                    }
-
-                    const labelTextNorm = labelText.toLowerCase().replace(/\s+/g, '');
-                    if (labelTextNorm.includes('no') || labelTextNorm.includes('нет') || input.value.toLowerCase() === 'no') {
-                        noRadio = input;
-                        break;
-                    }
-                }
-
-                if (!noRadio) {
-                    const clickables = Array.from(document.querySelectorAll('button, span, div, label')).filter(visible);
-                    noRadio = clickables.find(el => {
-                        const t = (el.innerText || '').trim().toLowerCase();
-                        return t === 'no' || t === 'нет';
-                    });
-                }
-
-                if (noRadio) {
-                    noRadio.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                    if (typeof noRadio.click === 'function') {
-                        noRadio.click();
-                    }
-                    noRadio.dispatchEvent(new Event('change', { bubbles: true }));
-                    return true;
-                }
-
-                return false;
-            }");
-
-            if (taxHandled)
-            {
-                _logger.Info("[Промокод] Вопрос налогообложения обнаружен: выбран вариант 'No'.");
-                _logger.Info($"[Промокод][Шаг 4] Налоговый вопрос обнаружен: выбран 'No' | {stepSw.ElapsedMilliseconds}мс");
-                await Task.Delay(2000);
-                await SaveErrorScreenshotAsync(page, $"promo_tax_selected_{sanitizedId}");
-            }
-            else
-            {
-                _logger.Debug("[Промокод] Вопрос налогообложения 'Tax Business use' не найден (возможно, не pay.unity.com или шаг пропущен).");
-                _logger.Debug($"[Промокод][Шаг 4] Налоговый вопрос 'Tax Business use' не найден (не pay.unity.com или пропущен) | {stepSw.ElapsedMilliseconds}мс | URL: {page.Url}");
-            }
+            _logger.Info($"[Промокод][Шаг 4] Вопрос 'Tax Business use': выбираем 'No' | URL: {page.Url}");
+            await EnsureTaxBusinessUseNoAsync(page, "Шаг 4");
+            await SaveErrorScreenshotAsync(page, $"promo_tax_selected_{sanitizedId}");
 
             // 4.5. Обработка формы адреса (Billing Address Form), если она открыта
             _logger.Info("[Промокод] Проверка наличия формы ввода адреса (Billing Address)...");
@@ -4094,18 +4036,16 @@ internal sealed class UnityAssetAutomationApp
                 return result;
             }
 
+            // Ответ на налог ещё раз — прямо перед Apply: пока вводился код, страница могла его сбросить.
+            await EnsureTaxBusinessUseNoAsync(page, "Шаг 5");
+
+            // Что написано у поля до нажатия Apply — подпись и прочее. Это не ответ на код.
+            var couponTextBefore = (await ReadCouponMessagesAsync(page)).Select(m => m.Text).ToHashSet();
+
             // 5.5 - Apply button
             stepSw.Restart();
             _logger.Info($"[Промокод][Шаг 5.5] Нажатие кнопки Apply/Redeem | URL: {page.Url}");
-            var applyState = await TryClickPromoApplyAsync(page);
-            if (applyState == "disabled")
-            {
-                // Кнопка не ожила — значит, форма не заметила введённый текст. Вписываем код
-                // ещё раз напрямую и пробуем снова.
-                await ForcePromoInputValueAsync(page, promoCode);
-                await Task.Delay(700);
-                applyState = await TryClickPromoApplyAsync(page);
-            }
+            var applyState = await ClickPromoApplyAsync(page, promoCode);
 
             if (applyState != "clicked")
             {
@@ -4126,22 +4066,70 @@ internal sealed class UnityAssetAutomationApp
             // 6. Промокод сработал только если итоговая цена стала ровно нулём.
             // Ждём, пока страница либо обнулит цену, либо скажет, что код не подходит.
             stepSw.Restart();
-            var priceAfter = await WaitForPromoOutcomeAsync(page, priceBefore, TimeSpan.FromSeconds(20));
+            var priceAfter = await WaitForPromoOutcomeAsync(page, priceBefore, TimeSpan.FromSeconds(20), couponTextBefore);
             _logger.Info($"[Промокод] Стоимость после промокода: {priceAfter.Describe()} | {stepSw.ElapsedMilliseconds}мс");
+
+            // «Organization address info is not complete or correct» — это не про код:
+            // в вопросе «Tax Business use» стоит «Yes». Ставим «No» и применяем код ещё раз.
+            if (priceAfter.HasPromoError && IsTaxOrAddressError(priceAfter.FoundError))
+            {
+                _logger.Info($"[Промокод][Шаг 6] Страница пишет: '{priceAfter.FoundError}'.");
+                _logger.Info("[Промокод][Шаг 6] Это из-за вопроса 'Tax Business use'. Ставим 'No' и применяем код ещё раз.");
+                await EnsureTaxBusinessUseNoAsync(page, "Шаг 6");
+
+                // Ошибка от первой попытки может остаться на странице — ответом на вторую она не считается.
+                couponTextBefore.UnionWith((await ReadCouponMessagesAsync(page)).Select(m => m.Text));
+                var retryPriceBefore = await ReadCartPriceAsync(page);
+                _logger.Info($"[Промокод][Шаг 6] Стоимость после выбора 'No': {retryPriceBefore.Describe()}");
+
+                var reapplied = await TryFillPromoCodeAsync(page, promoCode) &&
+                                await EnsureTaxBusinessUseNoAsync(page, "Шаг 6") &&
+                                await ClickPromoApplyAsync(page, promoCode) == "clicked";
+                if (reapplied)
+                {
+                    stepSw.Restart();
+                    priceAfter = await WaitForPromoOutcomeAsync(page, retryPriceBefore, TimeSpan.FromSeconds(20), couponTextBefore);
+                    if (!priceAfter.HasPromoError && !(priceAfter.Found && priceAfter.Amount == 0))
+                    {
+                        // Если старая ошибка так и висит, а итог не обнулился — проблема осталась.
+                        var lingering = FindCouponError(await ReadCouponMessagesAsync(page), new HashSet<string>());
+                        if (lingering is not null)
+                        {
+                            priceAfter.HasPromoError = true;
+                            priceAfter.FoundError = lingering;
+                        }
+                    }
+                    _logger.Info($"[Промокод] Стоимость после повторного промокода: {priceAfter.Describe()} | {stepSw.ElapsedMilliseconds}мс");
+                    if (retryPriceBefore.Found)
+                    {
+                        priceBefore = retryPriceBefore;
+                    }
+                }
+                else
+                {
+                    _logger.Warn("[Промокод][Шаг 6] Повторно ввести код не получилось.");
+                }
+            }
+
             _logger.Debug($"[Промокод][Шаг 6] URL после Apply: {page.Url}");
             await SaveErrorScreenshotAsync(page, $"promo_coupon_applied_{sanitizedId}");
 
             if (priceAfter.HasPromoError)
             {
-                result.Status = AssetProcessStatus.PromoNotApplied;
-                result.Message =
-                    $"Промокод не принят: страница пишет '{priceAfter.FoundError}'. Скорее всего раздача закончилась.";
+                // В память отвергнутых кодов попадает только явный отказ по коду.
+                // Непонятную ошибку в следующий раз стоит попробовать снова.
+                var codeRejected = IsPromoCodeRejection(priceAfter.FoundError);
+                result.Status = codeRejected ? AssetProcessStatus.PromoNotApplied : AssetProcessStatus.Failed;
+                result.Message = codeRejected
+                    ? $"Промокод не принят: страница пишет '{priceAfter.FoundError}'. Скорее всего раздача закончилась."
+                    : $"Страница оформления пишет '{priceAfter.FoundError}'. Код до конца не проверен — в следующий раз попробуем снова.";
                 _logger.Warn("============================================================");
-                _logger.Warn(" ПРОМОКОД НЕ СРАБОТАЛ");
+                _logger.Warn(codeRejected ? " ПРОМОКОД НЕ СРАБОТАЛ" : " ОФОРМЛЕНИЕ НЕ ПРОШЛО");
                 _logger.Warn($" {result.Message}");
                 _logger.Warn(" Ассет пропущен и убран из корзины, деньги не списаны.");
                 _logger.Warn("============================================================");
                 await SaveErrorScreenshotAsync(page, $"promo_failed_error_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step6_error_{sanitizedId}");
                 await ClearCartAsync(page);
                 return result;
             }
@@ -4162,104 +4150,69 @@ internal sealed class UnityAssetAutomationApp
 
             if (priceAfter.Amount > 0)
             {
-                result.Status = AssetProcessStatus.PromoNotApplied;
-                result.Message =
-                    $"Промокод введён, но цена осталась {priceAfter.Describe()}. Скидка не применилась.";
+                // Цена снизилась, но не до нуля — код рабочий, но не на 100%: запоминаем.
+                // Цена не сдвинулась и страница молчит — непонятно, дошёл ли код: не запоминаем.
+                var partialDiscount = priceBefore.Found && priceAfter.Amount < priceBefore.Amount;
+                result.Status = partialDiscount ? AssetProcessStatus.PromoNotApplied : AssetProcessStatus.Failed;
+                result.Message = partialDiscount
+                    ? $"Промокод дал скидку, но не до нуля: {priceAfter.Describe()}."
+                    : $"После ввода кода цена не изменилась ({priceAfter.Describe()}), а страница ничего не написала.";
                 _logger.Warn("============================================================");
                 _logger.Warn(" ПРОМОКОД НЕ СРАБОТАЛ");
-                _logger.Warn($" Цена не обнулилась: {priceAfter.Describe()}");
+                _logger.Warn($" {result.Message}");
                 if (priceBefore.Found)
                 {
                     _logger.Warn($" Было до промокода: {priceBefore.Describe()}");
                 }
 
-                _logger.Warn(" Скорее всего раздача уже закончилась.");
                 _logger.Warn(" Ассет пропущен и убран из корзины, деньги не списаны.");
                 _logger.Warn("============================================================");
                 await SaveErrorScreenshotAsync(page, $"promo_price_not_zero_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step6_price_not_zero_{sanitizedId}");
                 await ClearCartAsync(page);
                 return result;
             }
 
             _logger.Info($"[Промокод][Шаг 6] Итоговая стоимость обнулилась: {priceAfter.Describe()} | {stepSw.ElapsedMilliseconds}мс");
 
-            // 7. Прохождение EULA (согласие с EULA чекбоксом)
+            // 7. Галки: EULA, отказ от 14 дней на возврат, письма Asset Store.
             stepSw.Restart();
-            _logger.Info($"[Промокод][Шаг 7] Поиск и принятие EULA-чекбокса | URL: {page.Url}");
+            _logger.Info($"[Промокод][Шаг 7] Ставим галки согласия | URL: {page.Url}");
+            var agreementsOk = await EnsureAgreementCheckboxesAsync(page, "Шаг 7");
 
-            var eulaHandled = await page.EvaluateFunctionAsync<bool>(@"() => {
-                const visible = (el) => {
-                    if (!el) return false;
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-                };
+            // Вопрос о налоге ещё раз: страница могла сбросить ответ, пока применялся код.
+            var taxOk = await EnsureTaxBusinessUseNoAsync(page, "Шаг 7");
+            await Task.Delay(1000);
 
-                const checkboxes = Array.from(document.querySelectorAll('input[type=""checkbox""]')).filter(visible);
-                let eulaCheckbox = null;
-                for (const checkbox of checkboxes) {
-                    let labelText = '';
-                    if (checkbox.id) {
-                        const lbl = document.querySelector(`label[for=""${checkbox.id}""]`);
-                        if (lbl) labelText = lbl.innerText;
-                    }
-                    if (!labelText) {
-                        let parent = checkbox.parentElement;
-                        while (parent && parent !== document.body) {
-                            if (parent.tagName === 'LABEL' || parent.innerText.trim().length > 0) {
-                                labelText = parent.innerText;
-                                break;
-                            }
-                            parent = parent.parentElement;
-                        }
-                    }
-
-                    const lt = labelText.toLowerCase();
-                    if (lt.includes('understand and agree') || lt.includes('eula') || lt.includes('license agreement') || lt.includes('withdrawal') || lt.includes('согласен') || lt.includes('условия')) {
-                        eulaCheckbox = checkbox;
-                        break;
-                    }
-                }
-
-                if (!eulaCheckbox && checkboxes.length > 0) {
-                    eulaCheckbox = checkboxes[0];
-                }
-
-                if (eulaCheckbox) {
-                    if (!eulaCheckbox.checked) {
-                        eulaCheckbox.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                        if (typeof eulaCheckbox.click === 'function') {
-                            eulaCheckbox.click();
-                        }
-                        eulaCheckbox.dispatchEvent(new Event('change', { bubbles: true }));
-                    }
-                    return true;
-                }
-
-                return false;
-            }");
-
-            if (eulaHandled)
-            {
-                _logger.Info("[Промокод] Согласие с EULA успешно отмечено.");
-                _logger.Info($"[Промокод][Шаг 7] EULA-чекбокс отмечен | {stepSw.ElapsedMilliseconds}мс");
-                await Task.Delay(1000);
-            }
-            else
-            {
-                _logger.Warn("[Промокод] Предупреждение: чекбокс соглашения с EULA не обнаружен.");
-                _logger.Warn($"[Промокод][Шаг 7] EULA-чекбокс не обнаружен (возможно, не требуется) | URL: {page.Url}");
-            }
-
-            // Последняя проверка перед оплатой: после EULA и налогового вопроса сумма могла пересчитаться.
+            // Последняя проверка перед оплатой: итог ровно ноль, ошибок в блоке купона нет,
+            // обязательные галки стоят, в вопросе о налоге — «No».
             var priceBeforePay = await ReadCartPriceAsync(page);
+            var couponErrorBeforePay = FindCouponError(await ReadCouponMessagesAsync(page), couponTextBefore);
+            string? payBlocker = null;
             if (!priceBeforePay.Found || priceBeforePay.Amount != 0)
             {
+                payBlocker = $"Перед оплатой сумма уже не ноль ({priceBeforePay.Describe()}).";
+            }
+            else if (!string.IsNullOrWhiteSpace(couponErrorBeforePay))
+            {
+                payBlocker = $"Перед оплатой страница пишет '{couponErrorBeforePay}'.";
+            }
+            else if (!agreementsOk)
+            {
+                payBlocker = "Не удалось поставить обязательные галки (EULA / отказ от 14 дней).";
+            }
+            else if (!taxOk)
+            {
+                payBlocker = "Не удалось выбрать 'No' в вопросе 'Tax Business use'.";
+            }
+
+            if (payBlocker is not null)
+            {
                 result.Status = AssetProcessStatus.Failed;
-                result.Message = $"Перед оплатой сумма уже не ноль ({priceBeforePay.Describe()}). Оплату не нажимаем.";
+                result.Message = payBlocker + " Оплату не нажимаем.";
                 _logger.Warn($"[Ошибка][Шаг 8] {result.Message}");
-                await SaveErrorScreenshotAsync(page, $"promo_price_changed_{sanitizedId}");
-                await SaveHtmlDumpAsync(page, $"promo_dump_step8_price_changed_{sanitizedId}");
+                await SaveErrorScreenshotAsync(page, $"promo_pay_blocked_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step8_blocked_{sanitizedId}");
                 await ClearCartAsync(page);
                 return result;
             }
@@ -4856,7 +4809,29 @@ internal sealed class UnityAssetAutomationApp
                     'купон', 'промо', 'код', 'скидк'].some(w => all.includes(w));
             });
 
-            const findInput = () => inputInBoxes() || inputByAttributes();
+            // Поле без говорящих атрибутов узнаём по подписи рядом:
+            // 'Enter Coupon/Credit Code to update your price'.
+            const couponWords = ['coupon', 'promo', 'voucher', 'discount', 'credit code', 'купон', 'промокод', 'промо-код', 'код скидки'];
+            const inputByLabel = () => Array.from(document.querySelectorAll('input')).filter(visible).find(el => {
+                if (!isTextInput(el)) return false;
+                const texts = [];
+                if (el.id) {
+                    const l = document.querySelector(`label[for=""${CSS.escape(el.id)}""]`);
+                    if (l) texts.push(l.innerText);
+                }
+                if (el.closest('label')) texts.push(el.closest('label').innerText);
+                const by = el.getAttribute('aria-labelledby');
+                if (by) by.split(/\s+/).forEach(id => { const l = document.getElementById(id); if (l) texts.push(l.innerText); });
+                // Подпись, стоящая прямо перед полем или перед его обёрткой.
+                for (let node = el, i = 0; node && i < 3; node = node.parentElement, i++) {
+                    const prev = node.previousElementSibling;
+                    if (prev && normalize(prev.innerText).length <= 80) texts.push(prev.innerText);
+                }
+                const all = normalize(texts.join(' '));
+                return couponWords.some(w => all.includes(w));
+            });
+
+            const findInput = () => inputInBoxes() || inputByAttributes() || inputByLabel();
 
             let input = findInput();
             if (!input) {
@@ -4936,6 +4911,363 @@ internal sealed class UnityAssetAutomationApp
     }
 
     /// <summary>
+    /// Вопрос «Tax Business use» на pay.unity.com: всегда отвечаем «No».
+    /// «Yes» — только для юрлиц и ИП с российским ИНН. С «Yes» страница требует адрес
+    /// организации, не считает налог и итог, а на промокод отвечает
+    /// «Organization address info is not complete or correct».
+    ///
+    /// Ищем «No» только рядом с самим вопросом, жмём настоящим кликом мыши
+    /// и проверяем, что выбор сохранился. Возвращает true, если «No» выбрано
+    /// или вопроса на странице нет.
+    /// </summary>
+    private async Task<bool> EnsureTaxBusinessUseNoAsync(IPage page, string step)
+    {
+        const string findJs = @"() => {
+            const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+            const isNo = (t) => t === 'no' || t === 'нет';
+            const isYes = (t) => t === 'yes' || t === 'да';
+
+            for (const attr of ['data-uad-tax-no', 'data-uad-tax-no-input', 'data-uad-tax-yes-input']) {
+                document.querySelectorAll(`[${attr}]`).forEach(el => el.removeAttribute(attr));
+            }
+
+            const questionRe = /tax\s*business\s*use|business use|предпринимател|юридическ|коммерческ/;
+            const mentions = Array.from(document.querySelectorAll('body *'))
+                .filter(el => !['SCRIPT', 'STYLE', 'NOSCRIPT'].includes(el.tagName))
+                .filter(el => {
+                    const t = normalize(el.innerText);
+                    return t.length > 0 && t.length < 600 && questionRe.test(t);
+                });
+            const questions = mentions.filter(el => !mentions.some(o => o !== el && el.contains(o)));
+            if (questions.length === 0) return JSON.stringify({ found: false });
+
+            const labelOf = (input) => {
+                let t = '';
+                if (input.id) {
+                    const l = document.querySelector(`label[for=""${CSS.escape(input.id)}""]`);
+                    if (l) t = l.innerText;
+                }
+                if (!t && input.closest('label')) t = input.closest('label').innerText;
+                if (!t && input.nextElementSibling) t = input.nextElementSibling.innerText;
+                if (!t) t = input.getAttribute('aria-label') || '';
+                return normalize(t);
+            };
+
+            for (const q of questions) {
+                // Поднимаемся от текста вопроса, пока рядом не найдутся варианты ответа.
+                let box = q;
+                for (let depth = 0; box && box !== document.body && depth < 6; depth++, box = box.parentElement) {
+                    const radios = Array.from(box.querySelectorAll('input[type=""radio""]'));
+                    const noInput = radios.find(r => isNo(labelOf(r))) || null;
+                    const yesInput = radios.find(r => isYes(labelOf(r))) || null;
+
+                    const noTexts = Array.from(box.querySelectorAll('label, button, [role=""radio""], [role=""button""], [role=""option""], li, span, div, a'))
+                        .filter(visible)
+                        .filter(el => isNo(normalize(el.innerText)));
+                    const noEls = noTexts.filter(el => !noTexts.some(o => o !== el && el.contains(o)));
+
+                    if (!noInput && noEls.length === 0) continue;
+
+                    let target = noEls[0] || null;
+                    if (noInput) {
+                        const lbl = (noInput.id && document.querySelector(`label[for=""${CSS.escape(noInput.id)}""]`)) || noInput.closest('label');
+                        target = (lbl && visible(lbl)) ? lbl : (visible(noInput) ? noInput : (target || noInput));
+                        noInput.setAttribute('data-uad-tax-no-input', '1');
+                    }
+                    if (yesInput) yesInput.setAttribute('data-uad-tax-yes-input', '1');
+
+                    target.setAttribute('data-uad-tax-no', '1');
+                    target.scrollIntoView({ block: 'center' });
+                    return JSON.stringify({
+                        found: true,
+                        alreadyChecked: !!(noInput && noInput.checked),
+                        question: normalize(q.innerText).slice(0, 90),
+                        target: target.tagName.toLowerCase() + ' ' + normalize(target.innerText).slice(0, 20)
+                    });
+                }
+            }
+
+            return JSON.stringify({ found: false, question: normalize(questions[0].innerText).slice(0, 90) });
+        }";
+
+        const string verifyJs = @"() => {
+            const input = document.querySelector('[data-uad-tax-no-input]');
+            const yes = document.querySelector('[data-uad-tax-yes-input]');
+            const target = document.querySelector('[data-uad-tax-no]');
+            if (input) return input.checked && !(yes && yes.checked) ? 'checked' : 'not-checked';
+            if (!target) return 'lost';
+
+            for (let el = target, i = 0; el && i < 3; el = el.parentElement, i++) {
+                if (['aria-checked', 'aria-pressed', 'aria-selected'].some(a => el.getAttribute(a) === 'true')) return 'checked';
+                const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+                if (/(^|[\s_-])(active|selected|checked|is-checked|is-selected)([\s_-]|$)/.test(cls)) return 'checked';
+                const inner = el.querySelector && el.querySelector('input[type=""radio""]');
+                if (inner) return inner.checked ? 'checked' : 'not-checked';
+            }
+            return 'unknown';
+        }";
+
+        // Вопрос может дорисоваться не сразу после загрузки страницы.
+        var stopAt = DateTime.UtcNow.AddSeconds(8);
+        TaxQuestionInfo? info = null;
+        while (true)
+        {
+            try
+            {
+                info = JsonSerializer.Deserialize<TaxQuestionInfo>(
+                    await page.EvaluateFunctionAsync<string>(findJs), _runtimeJsonOptions);
+            }
+            catch (Exception ex) when (IsTransientPageError(ex))
+            {
+                info = null;
+            }
+
+            if (info?.Found == true || DateTime.UtcNow >= stopAt)
+            {
+                break;
+            }
+
+            await Task.Delay(700);
+        }
+
+        if (info?.Found != true)
+        {
+            _logger.Info(string.IsNullOrWhiteSpace(info?.Question)
+                ? $"[Промокод][{step}] Вопроса 'Tax Business use' на странице нет."
+                : $"[Промокод][{step}] Вопрос есть, но вариант 'No' рядом не найден: '{info.Question}'");
+            return string.IsNullOrWhiteSpace(info?.Question);
+        }
+
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            if (info!.AlreadyChecked)
+            {
+                _logger.Info($"[Промокод][{step}] Tax Business use: уже выбрано 'No'.");
+                return true;
+            }
+
+            // Настоящий клик мышью надёжнее всего для самодельных переключателей.
+            // Если элемент спрятан и мышью не нажимается — кликаем из скрипта.
+            try
+            {
+                var handle = await page.QuerySelectorAsync("[data-uad-tax-no='1']");
+                if (handle is null)
+                {
+                    throw new InvalidOperationException("вариант 'No' пропал со страницы");
+                }
+
+                await handle.ClickAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.Debug($"[Промокод][{step}] Клик мышью по 'No' не прошёл ({ex.Message}), нажимаем из скрипта.");
+                await page.EvaluateFunctionAsync(@"() => {
+                    const input = document.querySelector('[data-uad-tax-no-input]');
+                    const target = document.querySelector('[data-uad-tax-no]');
+                    if (target) target.click();
+                    if (input && !input.checked) input.click();
+                }");
+            }
+
+            await Task.Delay(1000);
+
+            string state;
+            try
+            {
+                state = await page.EvaluateFunctionAsync<string>(verifyJs);
+            }
+            catch (Exception ex) when (IsTransientPageError(ex))
+            {
+                state = "lost";
+            }
+
+            if (state == "checked")
+            {
+                _logger.Info($"[Промокод][{step}] Tax Business use: выбрано 'No' ({info.Target}), выбор проверен.");
+                return true;
+            }
+
+            if (state == "unknown")
+            {
+                _logger.Info($"[Промокод][{step}] Tax Business use: нажато 'No' ({info.Target}). Проверить выбор по разметке не удалось.");
+                return true;
+            }
+
+            _logger.Info($"[Промокод][{step}] Tax Business use: после нажатия 'No' выбор не виден ({state}), пробуем ещё раз ({attempt}/3)...");
+
+            // Страница могла перерисоваться: ищем вопрос заново.
+            try
+            {
+                info = JsonSerializer.Deserialize<TaxQuestionInfo>(
+                    await page.EvaluateFunctionAsync<string>(findJs), _runtimeJsonOptions);
+            }
+            catch (Exception ex) when (IsTransientPageError(ex))
+            {
+                info = null;
+            }
+
+            if (info?.Found != true)
+            {
+                break;
+            }
+        }
+
+        _logger.Warn($"[Промокод][{step}] Не удалось выбрать 'No' в вопросе 'Tax Business use'.");
+        return false;
+    }
+
+    /// <summary>
+    /// Ставит галки на странице оплаты: согласие с EULA, отказ от 14 дней на возврат
+    /// (обязательны для оплаты) и подписку на письма Asset Store.
+    /// Возвращает false, если обязательную галку поставить не удалось.
+    /// </summary>
+    private async Task<bool> EnsureAgreementCheckboxesAsync(IPage page, string step)
+    {
+        const string findJs = @"() => {
+            const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const kinds = [
+                { key: 'EULA', required: true, re: /end user license|eula|license agreement|лицензионн/ },
+                { key: 'отказ от 14 дней', required: true, re: /withdrawal|14-day|14 day|14 дн|отказ/ },
+                { key: 'письма Asset Store', required: false, re: /receive resources|updates, and information|via email|by email|рассылк|электронной почте|получать/ }
+            ];
+
+            document.querySelectorAll('[data-uad-agree]').forEach(el => el.removeAttribute('data-uad-agree'));
+            const boxes = Array.from(document.querySelectorAll('input[type=""checkbox""], [role=""checkbox""]'));
+
+            const labelOf = (cb) => {
+                if (cb.id) {
+                    const l = document.querySelector(`label[for=""${CSS.escape(cb.id)}""]`);
+                    if (l && normalize(l.innerText)) return normalize(l.innerText);
+                }
+                const closest = cb.closest('label');
+                if (closest && normalize(closest.innerText)) return normalize(closest.innerText);
+                if (cb.nextElementSibling && normalize(cb.nextElementSibling.innerText)) return normalize(cb.nextElementSibling.innerText);
+                // Первый родитель с текстом, если в нём только эта галка.
+                for (let p = cb.parentElement, i = 0; p && p !== document.body && i < 4; p = p.parentElement, i++) {
+                    const t = normalize(p.innerText);
+                    if (!t) continue;
+                    return p.querySelectorAll('input[type=""checkbox""], [role=""checkbox""]').length === 1 ? t : '';
+                }
+                return normalize(cb.getAttribute('aria-label'));
+            };
+
+            const result = [];
+            boxes.forEach((cb, i) => {
+                const text = labelOf(cb);
+                const kind = kinds.find(k => k.re.test(text));
+                if (!kind) return;
+                cb.setAttribute('data-uad-agree', String(i));
+                const checked = cb.tagName === 'INPUT' ? cb.checked : cb.getAttribute('aria-checked') === 'true';
+                result.push({ Idx: String(i), Key: kind.key, Required: kind.required, Checked: checked, Text: text.slice(0, 70) });
+            });
+            return JSON.stringify(result);
+        }";
+
+        const string isCheckedJs = @"(idx) => {
+            const cb = document.querySelector(`[data-uad-agree=""${idx}""]`);
+            if (!cb) return false;
+            return cb.tagName === 'INPUT' ? cb.checked : cb.getAttribute('aria-checked') === 'true';
+        }";
+
+        List<AgreementCheckbox> boxes;
+        try
+        {
+            boxes = JsonSerializer.Deserialize<List<AgreementCheckbox>>(
+                await page.EvaluateFunctionAsync<string>(findJs), _runtimeJsonOptions) ?? [];
+        }
+        catch (Exception ex) when (IsTransientPageError(ex))
+        {
+            boxes = [];
+        }
+
+        if (boxes.Count == 0)
+        {
+            _logger.Warn($"[Промокод][{step}] Галок согласия (EULA, 14 дней) на странице не нашлось.");
+            return true;
+        }
+
+        var allRequiredOk = true;
+        foreach (var box in boxes)
+        {
+            var isChecked = box.Checked;
+
+            for (var attempt = 1; attempt <= 2 && !isChecked; attempt++)
+            {
+                try
+                {
+                    var handle = await page.QuerySelectorAsync($"[data-uad-agree='{box.Idx}']");
+                    if (attempt == 1 && handle is not null)
+                    {
+                        await handle.ClickAsync();
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException("клик мышью не подошёл");
+                    }
+                }
+                catch
+                {
+                    // Спрятанный input: жмём его подпись или сам input из скрипта.
+                    await page.EvaluateFunctionAsync(@"(idx) => {
+                        const cb = document.querySelector(`[data-uad-agree=""${idx}""]`);
+                        if (!cb) return;
+                        const lbl = (cb.id && document.querySelector(`label[for=""${CSS.escape(cb.id)}""]`)) || cb.closest('label');
+                        if (lbl) lbl.click(); else cb.click();
+                    }", box.Idx);
+                }
+
+                await Task.Delay(400);
+                isChecked = await page.EvaluateFunctionAsync<bool>(isCheckedJs, box.Idx);
+            }
+
+            _logger.Info($"[Промокод][{step}] Галка '{box.Key}': {(isChecked ? "стоит" : "НЕ СТОИТ")} ({box.Text}...)");
+            if (box.Required && !isChecked)
+            {
+                allRequiredOk = false;
+            }
+        }
+
+        return allRequiredOk;
+    }
+
+    /// <summary>Ошибка из-за вопроса о налоге и адресе организации, а не из-за самого кода.</summary>
+    private static bool IsTaxOrAddressError(string text) =>
+        new[] { "address", "organization", "organisation", "tax", "адрес", "организац", "налог" }
+            .Any(w => text.Contains(w, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Страница прямо говорит, что код не годится: истёк, неверный, исчерпан.</summary>
+    private static bool IsPromoCodeRejection(string text) =>
+        new[]
+            {
+                "expired", "invalid", "not valid", "no longer", "has ended", "not found", "does not exist",
+                "limit", "already", "not applicable", "cannot be applied", "not eligible",
+                "истек", "истёк", "недействител", "не найден", "не существует", "исчерпан",
+                "не применим", "уже использ", "не действует"
+            }
+            .Any(w => text.Contains(w, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Нажимает Apply; если кнопка неактивна, вписывает код напрямую и пробует ещё раз.</summary>
+    private static async Task<string> ClickPromoApplyAsync(IPage page, string promoCode)
+    {
+        var state = await TryClickPromoApplyAsync(page);
+        if (state == "disabled")
+        {
+            // Кнопка не ожила — значит, форма не заметила введённый текст.
+            await ForcePromoInputValueAsync(page, promoCode);
+            await Task.Delay(700);
+            state = await TryClickPromoApplyAsync(page);
+        }
+
+        return state;
+    }
+
+    /// <summary>
     /// Нажимает кнопку Apply рядом с полем промокода. Кнопки оплаты не трогает никогда.
     /// Возвращает "clicked", "disabled" или "none".
     /// </summary>
@@ -4993,14 +5325,15 @@ internal sealed class UnityAssetAutomationApp
     }
 
     /// <summary>
-    /// Ошибка из блока купона на pay.unity.com: текст красной строки под полем
-    /// или пометка, что введённый код зачёркнут как недействительный. Пусто, если ошибки нет.
+    /// Сообщения рядом с полем промокода. Явные — из блока купона pay.unity.com
+    /// (красная строка .error и зачёркнутый код .invalid). Остальные — любой текст,
+    /// который виден в обёртке поля; ошибка ли это, решает <see cref="FindCouponError"/>.
     /// </summary>
-    private static async Task<string> ReadCouponBlockErrorAsync(IPage page)
+    private static async Task<List<CouponMessage>> ReadCouponMessagesAsync(IPage page)
     {
         try
         {
-            return await page.EvaluateFunctionAsync<string>(@"() => {
+            var json = await page.EvaluateFunctionAsync<string>(@"() => {
                 const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim();
                 const visible = (el) => {
                     if (!el) return false;
@@ -5008,26 +5341,55 @@ internal sealed class UnityAssetAutomationApp
                     const rect = el.getBoundingClientRect();
                     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
                 };
+                const out = [];
+                const add = (text, isExplicit) => {
+                    const t = normalize(text).slice(0, 300);
+                    if (t && !out.some(o => o.Text === t)) out.push({ Text: t, Explicit: isExplicit });
+                };
 
                 for (const box of document.querySelectorAll('.summary-coupon, .order-promotion')) {
-                    const error = Array.from(box.querySelectorAll('.error'))
-                        .filter(visible)
-                        .map(e => normalize(e.innerText))
-                        .find(t => t.length > 0);
-                    if (error) return error.slice(0, 200);
-
+                    box.querySelectorAll('.error').forEach(e => { if (visible(e)) add(e.innerText, true); });
                     const invalid = box.querySelector('.coupon-item span.invalid, .coupon-item .invalid');
-                    if (invalid) return 'код зачёркнут как недействительный: ' + normalize(invalid.innerText).slice(0, 60);
+                    if (invalid) add('код зачёркнут как недействительный: ' + normalize(invalid.innerText).slice(0, 60), true);
                 }
 
-                return '';
-            }") ?? string.Empty;
+                // Текст вокруг поля: поднимаемся на пару уровней, но не до формы с кнопкой оплаты.
+                const input = document.querySelector('[data-uad-promo=""1""]');
+                let box = input ? input.parentElement : null;
+                for (let i = 0; box && box !== document.body && i < 3; i++, box = box.parentElement) {
+                    const hasPay = Array.from(box.querySelectorAll('button, [role=""button""]'))
+                        .some(b => /pay|оплат|order|заказ/i.test(b.innerText || ''));
+                    if (hasPay) break;
+                    Array.from(box.querySelectorAll('*'))
+                        .filter(el => el !== input && el.children.length === 0 && visible(el))
+                        .forEach(el => { if (normalize(el.innerText).length >= 8) add(el.innerText, false); });
+                }
+
+                return JSON.stringify(out);
+            }");
+
+            return JsonSerializer.Deserialize<List<CouponMessage>>(json ?? "[]") ?? [];
         }
         catch (Exception ex) when (IsTransientPageError(ex))
         {
-            return string.Empty;
+            return [];
         }
     }
+
+    /// <summary>
+    /// Первая ошибка среди сообщений у поля промокода. Текст, который был там ещё
+    /// до нажатия Apply (подпись поля, старая ошибка), не считается.
+    /// </summary>
+    private static string? FindCouponError(IEnumerable<CouponMessage> messages, ICollection<string> ignore) =>
+        messages
+            .Where(m => !ignore.Contains(m.Text))
+            .FirstOrDefault(m => m.Explicit || IsCouponErrorText(m.Text))
+            ?.Text;
+
+    private static bool IsCouponErrorText(string text) =>
+        IsPromoCodeRejection(text) || IsTaxOrAddressError(text) ||
+        new[] { "error", "wrong", "failed", "incorrect", "not recognized", "unable", "ошибк", "неверн", "не удалось", "не распознан" }
+            .Any(w => text.Contains(w, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Что видно в блоке купона и сколько на странице текстовых полей — для лога,
@@ -5060,7 +5422,7 @@ internal sealed class UnityAssetAutomationApp
     /// Ошибка, которая висела на странице ещё до ввода кода, ответом не считается.
     /// </summary>
     private async Task<CartPriceSnapshot> WaitForPromoOutcomeAsync(
-        IPage page, CartPriceSnapshot before, TimeSpan timeout)
+        IPage page, CartPriceSnapshot before, TimeSpan timeout, ICollection<string> ignoreMessages)
     {
         var stopAt = DateTime.UtcNow.Add(timeout);
         await Task.Delay(1500);
@@ -5074,16 +5436,23 @@ internal sealed class UnityAssetAutomationApp
                 current.HasPromoError = false;
             }
 
-            // Блок купона сам пишет, что код не подошёл: красная строка ошибки
-            // или код в списке, зачёркнутый как недействительный.
-            var couponVerdict = await ReadCouponBlockErrorAsync(page);
-            if (!string.IsNullOrWhiteSpace(couponVerdict))
+            // Ответ магазина у поля промокода: «The code is expired», «Organization address…» и т. п.
+            var couponError = FindCouponError(await ReadCouponMessagesAsync(page), ignoreMessages);
+            if (couponError is not null)
             {
                 current.HasPromoError = true;
-                current.FoundError = couponVerdict;
+                current.FoundError = couponError;
             }
 
-            if (current.HasPromoError || (current.Found && current.Amount == 0) || DateTime.UtcNow >= stopAt)
+            // Ноль засчитываем, только если рядом нет ошибки: без посчитанного налога
+            // страница может показать в итоге что угодно.
+            if (current.Found && current.Amount == 0 && couponError is null)
+            {
+                current.HasPromoError = false;
+                return current;
+            }
+
+            if (current.HasPromoError || DateTime.UtcNow >= stopAt)
             {
                 return current;
             }
@@ -6650,6 +7019,32 @@ internal enum AssetProcessStatus
     PromoNotApplied,
     Deprecated,
     Failed
+}
+
+/// <summary>Сообщение у поля промокода. Explicit — из красной строки ошибки блока купона.</summary>
+internal sealed class CouponMessage
+{
+    public string Text { get; set; } = string.Empty;
+    public bool Explicit { get; set; }
+}
+
+/// <summary>Где на странице оплаты вопрос «Tax Business use» и выбран ли уже «No».</summary>
+internal sealed class TaxQuestionInfo
+{
+    public bool Found { get; set; }
+    public bool AlreadyChecked { get; set; }
+    public string Question { get; set; } = string.Empty;
+    public string Target { get; set; } = string.Empty;
+}
+
+/// <summary>Галка согласия на странице оплаты.</summary>
+internal sealed class AgreementCheckbox
+{
+    public string Idx { get; set; } = string.Empty;
+    public string Key { get; set; } = string.Empty;
+    public bool Required { get; set; }
+    public bool Checked { get; set; }
+    public string Text { get; set; } = string.Empty;
 }
 
 /// <summary>Что лежит в корзине магазина (без отложенных «на потом»).</summary>
