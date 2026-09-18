@@ -76,6 +76,8 @@ async Task RunWatchLoopAsync()
         try
         {
             running = true;
+            // Неудачный прогон не должен помечать неудачей всю службу.
+            Environment.ExitCode = 0;
             current = new UnityAssetAutomationApp(cycleOptions);
             await current.RunAsync();
         }
@@ -260,10 +262,12 @@ internal sealed class UnityAssetAutomationApp
                 if (_notifier is null)
                 {
                     _logger.Error("Бот не настроен: задайте TELEGRAM_BOT_TOKEN (или notify.telegramBotToken в config.json).");
+                    Environment.ExitCode = 2;
                     return;
                 }
 
                 var sent = await _notifier.SendAsync($"👋 Проверка связи от UnityAssetsDownloader (профиль {_profileName}). Сообщения доходят.");
+                Environment.ExitCode = sent ? 0 : 2;
                 _logger.Info(sent
                     ? "Бот: проверочное сообщение отправлено. Проверьте Telegram."
                     : "Бот: сообщение не отправилось. Причина — в строках выше.");
@@ -490,6 +494,7 @@ internal sealed class UnityAssetAutomationApp
                 _logger.Error("============================================================");
                 _logger.Error(" НЕ ПОЛУЧИЛОСЬ ВОЙТИ");
                 _logger.Error($" Профиль: {_profileName}");
+                Environment.ExitCode = 2;
                 _logger.Error(" Что делать написано выше. Обычно помогает вход по email и паролю.");
                 _logger.Error("============================================================");
                 await NotifyAsync(
@@ -999,6 +1004,7 @@ internal sealed class UnityAssetAutomationApp
         else
         {
             _logger.Warn("ИТОГ: на странице нет полей для входа. Автовход не сработает, входите руками.");
+            Environment.ExitCode = 2;
         }
 
         await SaveErrorScreenshotAsync(page, "check-login-page");
@@ -1849,6 +1855,10 @@ internal sealed class UnityAssetAutomationApp
         _logger.Info(result.AllPosts.Count > 0
             ? " Telegram доступен, разбор работает."
             : " Telegram недоступен. Смотрите объяснение выше.");
+        if (result.AllPosts.Count == 0)
+        {
+            Environment.ExitCode = 2;
+        }
         _logger.Info("============================================================");
     }
 
@@ -7483,9 +7493,17 @@ internal sealed class CliOptions
 
         // Telegram из конфига + CLI (CLI имеет приоритет)
         var telegramChannels = new List<string>();
+        var envTelegramChannels = (Environment.GetEnvironmentVariable("TELEGRAM_CHANNELS") ?? string.Empty)
+            .Split([',', ' ', ';', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToList();
         if (cliTelegramChannels.Count > 0)
         {
             telegramChannels.AddRange(cliTelegramChannels);
+        }
+        else if (envTelegramChannels.Count > 0)
+        {
+            // Так каналы задаёт deploy.sh на сервере: в .env, а не в telegram_sources.txt из git.
+            telegramChannels.AddRange(envTelegramChannels);
         }
         else if (config?.Telegram?.Channels?.Count > 0)
         {
