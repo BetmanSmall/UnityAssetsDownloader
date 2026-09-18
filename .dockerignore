@@ -8,3 +8,4 @@ logs/
 config.json
 promts/
 *.zip
+harness/

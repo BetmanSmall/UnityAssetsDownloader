@@ -411,3 +411,6 @@ telegram_sources.local.txt
 
 # Пароль Unity и токен бота для сервера
 .env
+
+# Стенд на макетах страниц — только на Steam Deck, в репозиторий не входит
+/harness/

@@ -298,16 +298,18 @@ if ask_yes "Собрать и проверить всё по шагам?" "$CHEC
     step "Шаг 1/5. Сборка образа (первый раз — несколько минут)" "${DC[@]}" build || stop_here
     step "Шаг 2/5. Браузер в контейнере открывает страницу входа Unity" "${APP[@]}" --check-login-page || stop_here
 
+    # Каналы раньше бота: если Telegram заблокирован, здесь программа найдёт и запомнит
+    # прокси, и бот пойдёт через него же.
+    if ! step "Шаг 3/5. Доступ к Telegram-каналам" "${APP[@]}" --check-telegram; then
+        ask_yes "Продолжить без Telegram (ассеты из каналов не будут находиться)?" N || stop_here
+    fi
+
     if [ -n "$TOKEN" ]; then
-        if ! step "Шаг 3/5. Сообщение от бота" "${APP[@]}" --notify-test; then
+        if ! step "Шаг 4/5. Сообщение от бота" "${APP[@]}" --notify-test; then
             ask_yes "Продолжить без сообщений от бота?" Y || stop_here
         fi
     else
-        bold "Шаг 3/5. Бот не настроен — пропускаю."
-    fi
-
-    if ! step "Шаг 4/5. Доступ к Telegram-каналам" "${APP[@]}" --check-telegram; then
-        ask_yes "Продолжить без Telegram (ассеты из каналов не будут находиться)?" N || stop_here
+        bold "Шаг 4/5. Бот не настроен — пропускаю."
     fi
 
     echo
