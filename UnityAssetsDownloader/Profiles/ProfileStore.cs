@@ -152,12 +152,12 @@ internal sealed class ProfileStore
     {
         if (!string.IsNullOrWhiteSpace(fromCli))
         {
-            return fromCli.Trim();
+            return FindRenamed(fromCli.Trim());
         }
 
         if (!string.IsNullOrWhiteSpace(fromConfig))
         {
-            return fromConfig.Trim();
+            return FindRenamed(fromConfig.Trim());
         }
 
         var registry = Load();
@@ -168,6 +168,35 @@ internal sealed class ProfileStore
 
         var userName = Environment.UserName;
         return string.IsNullOrWhiteSpace(userName) ? "default" : userName.Trim();
+    }
+
+    /// <summary>
+    /// После первого входа профиль переименовывается: «server» становится «server__аккаунт».
+    /// Если профиль задан по-старому, а папки с таким именем нет, берём единственную
+    /// переименованную. Иначе на сервере с --profile server каждый прогон начинался бы
+    /// с пустого профиля: без сессии и без памяти о том, что уже сделано.
+    /// </summary>
+    private string FindRenamed(string name)
+    {
+        try
+        {
+            var clean = Sanitize(name);
+            if (Directory.Exists(GetProfileDirectory(clean)) || !Directory.Exists(ProfilesRoot))
+            {
+                return name;
+            }
+
+            var renamed = Directory.GetDirectories(ProfilesRoot, clean + "__*")
+                .Select(Path.GetFileName)
+                .Where(n => !string.IsNullOrEmpty(n))
+                .ToList();
+
+            return renamed.Count == 1 ? renamed[0]! : name;
+        }
+        catch
+        {
+            return name;
+        }
     }
 
     /// <summary>

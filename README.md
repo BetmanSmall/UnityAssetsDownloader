@@ -556,6 +556,27 @@ docker compose up -d --build
 | Остановить | `docker compose down` |
 | Обновить | `git pull && docker compose up -d --build` |
 
+### Первый запуск по шагам
+
+Каждый шаг — отдельная разовая команда в папке проекта на сервере. Если шаг не прошёл,
+дальше не идите: причина будет в выводе и в `./logs`. Во всех командах указан
+`--profile server` — тот же профиль, что у службы.
+
+| # | Команда | Что должно получиться |
+|---|---|---|
+| 1 | `docker compose build` | `Successfully tagged` / `Built` |
+| 2 | `docker compose run --rm unity-assets --profile server --check-login-page` | «ИТОГ: страница входа в порядке» |
+| 3 | Напишите боту `/start`, затем `docker compose run --rm unity-assets --profile server --notify-test` | Сообщение «👋 Проверка связи» в Telegram |
+| 4 | `docker compose run --rm unity-assets --profile server --check-telegram` | «Telegram доступен, разбор работает» |
+| 5 | `docker compose run --rm unity-assets --profile server --login` | «ГОТОВО. ВЫ ВОШЛИ В UNITY». Спросит код — введите в консоли или ответьте боту |
+| 6 | `docker compose run --rm unity-assets --profile server --no-defaults --tg-only-new --dry-run` | Список ассетов «[Имитация] … был бы добавлен», аккаунт не меняется |
+| 7 | `docker compose run --rm unity-assets --profile server --no-defaults --tg-only-new` | Настоящий прогон: «ИТОГИ», сообщение бота, если что-то добавлено |
+| 8 | `docker compose up -d` и `docker compose logs -f` | «Следующий прогон: …» |
+
+После шага 7 в `data/profiles/server__<аккаунт>/telegram_state.json` лежат номера
+прочитанных постов, и служба начнёт с них. Проверить это можно, повторив шаг 7:
+в логе будет «новых постов с прошлого раза нет».
+
 ### Что где хранится
 
 В `./data/profiles/<профиль>/`: сессия Unity, память об уже добавленных ассетах и

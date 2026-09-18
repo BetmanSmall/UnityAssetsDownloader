@@ -839,7 +839,7 @@ internal sealed class UnityAssetAutomationApp
 
             // Запоминаем, до какого поста дочитали. Только если каналы прочитаны до конца
             // и все собранные ассеты проверены: иначе часть новых постов потерялась бы.
-            if (telegramCursors is not null && !stoppedEarly && queue.Count == 0 && telegramPending.Count == 0)
+            if (telegramCursors is not null && !stoppedEarly && !_options.DryRun && queue.Count == 0 && telegramPending.Count == 0)
             {
                 var advanced = telegramCursors
                     .Where(c => c.Exhausted && c.NewestId > 0 && telegramState.Advance(c.Name, c.NewestId))
@@ -2847,6 +2847,7 @@ internal sealed class UnityAssetAutomationApp
     private int _loginCodeSubmits;
     private bool _autoLoginGaveUp;
     private string? _loginProblem;
+    private DateTime? _loginPageSeenUtc;
     private readonly HashSet<string> _loginNotes = [];
 
     /// <summary>
@@ -2881,6 +2882,19 @@ internal sealed class UnityAssetAutomationApp
             return AutoLoginOutcome.Working;
         }
 
+        // Страница входа открылась, но ещё не «ожила»: клик по Continue в первые мгновения
+        // теряется (видно по логу 18.09: email пришлось отправлять второй раз через 15 с).
+        if (!state.Ready)
+        {
+            return AutoLoginOutcome.Working;
+        }
+
+        _loginPageSeenUtc ??= DateTime.UtcNow;
+        if (DateTime.UtcNow - _loginPageSeenUtc < TimeSpan.FromSeconds(1.5))
+        {
+            return AutoLoginOutcome.Working;
+        }
+
         var sinceSubmit = DateTime.UtcNow - _loginLastSubmitUtc;
 
         // Что страница ответила на наш последний шаг. Ошибки, которые висели ещё до него, не в счёт.
@@ -2904,7 +2918,7 @@ internal sealed class UnityAssetAutomationApp
         switch (state.Step)
         {
             case "email":
-                if (_loginLastStep == "email" && sinceSubmit < TimeSpan.FromSeconds(15))
+                if (_loginLastStep == "email" && sinceSubmit < TimeSpan.FromSeconds(8))
                 {
                     break;
                 }
@@ -3105,7 +3119,7 @@ internal sealed class UnityAssetAutomationApp
             .filter(t => t.length >= 3 && t.length <= 300);
 
         const step = password ? 'password' : (codeInput && mentionsCode && !email) ? 'code' : email ? 'email' : 'unknown';
-        return JSON.stringify({ Step: step, Captcha: captcha, Errors: Array.from(new Set(errors)), Text: text.slice(0, 1500) });
+        return JSON.stringify({ Step: step, Ready: document.readyState === 'complete', Captcha: captcha, Errors: Array.from(new Set(errors)), Text: text.slice(0, 1500) });
     }";
 
     private enum FieldKind
@@ -7940,6 +7954,7 @@ internal sealed class CouponMessage
 internal sealed class LoginPageState
 {
     public string Step { get; set; } = "unknown";
+    public bool Ready { get; set; }
     public bool Captcha { get; set; }
     public List<string> Errors { get; set; } = [];
     public string Text { get; set; } = string.Empty;
