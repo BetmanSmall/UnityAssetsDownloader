@@ -39,6 +39,67 @@ ask_yes() {
     case "$ans" in y|Y|yes|Yes|д|Д|да|Да|ДА) return 0 ;; *) return 1 ;; esac
 }
 
+# ------------------------------------------------------- Telegram Bot API
+
+# Адреса Bot API. DNS с этого сервера может отдавать адрес, до которого нет маршрута,
+# хотя другие адреса того же сервиса отвечают. Программа внутри перебирает их так же
+# (Plan.md, раздел «Связь с Telegram Bot API»).
+TG_ADDRESSES="149.154.167.220 149.154.175.50 149.154.167.50 149.154.171.5 91.108.56.130"
+TG_RESOLVE=""        # пусто — идём напрямую; иначе готовый аргумент для curl --resolve
+TG_ROUTE_FOUND=0
+
+# Отвечает ли Bot API по этому пути. Пустой аргумент — напрямую.
+# Каждый путь пробуем дважды: на сети с потерями одиночная проба объявляет живой адрес
+# мёртвым (проверено в проекте LinuxServerWatcher).
+tg_probe() {
+    local resolve=$1 code try
+    for try in 1 2; do
+        if [ -n "$resolve" ]; then
+            code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' --resolve "$resolve" https://api.telegram.org/ 2>/dev/null || true)
+        else
+            code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' https://api.telegram.org/ 2>/dev/null || true)
+        fi
+        # Любой код, кроме 000, значит, что ответ пришёл: адрес живой.
+        [ -n "$code" ] && [ "$code" != "000" ] && return 0
+    done
+    return 1
+}
+
+# Ищет путь до Bot API и запоминает его в TG_RESOLVE. Вызывать не внутри $(…):
+# переменные, заданные в подстановке команд, наружу не выходят.
+tg_route_detect() {
+    local ip
+    [ "$TG_ROUTE_FOUND" = 1 ] && return 0
+    command -v curl >/dev/null 2>&1 || return 1
+
+    if tg_probe ""; then
+        TG_RESOLVE=""
+        TG_ROUTE_FOUND=1
+        return 0
+    fi
+
+    for ip in $TG_ADDRESSES; do
+        if tg_probe "api.telegram.org:443:$ip"; then
+            TG_RESOLVE="api.telegram.org:443:$ip"
+            TG_ROUTE_FOUND=1
+            warn "Напрямую api.telegram.org не отвечает, а по адресу $ip отвечает. Программа ходит так же."
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# tg_api <метод> — ответ Bot API по найденному пути. Пустой вывод — не дозвонились.
+tg_api() {
+    local method=$1
+    if [ -n "$TG_RESOLVE" ]; then
+        curl -s -m 10 --resolve "$TG_RESOLVE" "https://api.telegram.org/bot$TOKEN/$method" || true
+    else
+        curl -s -m 10 "https://api.telegram.org/bot$TOKEN/$method" || true
+    fi
+}
+
 # ---------------------------------------------------------------- .env
 
 # Значение в формате .env Docker Compose. В двойных кавычках с экранированием
@@ -129,11 +190,12 @@ while :; do
         continue
     fi
 
-    # Проверяем токен у Telegram. Если api.telegram.org с сервера не открывается,
-    # не страшно: программа сама пойдёт через прокси.
+    # Проверяем токен у Telegram: напрямую, а если не вышло — по закреплённым адресам.
+    # Не открылось совсем — не страшно: программа попробует ещё и через прокси.
     BOT_NAME=""
     if command -v curl >/dev/null 2>&1; then
-        RESP=$(curl -s -m 10 "https://api.telegram.org/bot$TOKEN/getMe" || true)
+        tg_route_detect || true
+        RESP=$(tg_api getMe)
         if [[ "$RESP" == *'"ok":true'* ]]; then
             BOT_NAME=$(printf '%s' "$RESP" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')
             ok "Бот найден: @$BOT_NAME"
@@ -142,7 +204,7 @@ while :; do
             [ "$TOKEN" = "$OLD_TOKEN" ] && OLD_TOKEN=""
             continue
         else
-            warn "api.telegram.org с сервера не отвечает. Токен сохраню, связь проверит программа."
+            warn "До api.telegram.org не дозвонился ни одним путём. Токен сохраню: программа попробует ещё и через прокси."
         fi
     fi
     [ "$TOKEN" != "$OLD_TOKEN" ] && CHAT_ID=""
@@ -152,7 +214,7 @@ while :; do
         echo "  Напишите боту @$BOT_NAME в Telegram любое сообщение (например, /start)."
         echo "  Жду до 2 минут..."
         for _ in $(seq 1 40); do
-            UPD=$(curl -s -m 10 "https://api.telegram.org/bot$TOKEN/getUpdates" || true)
+            UPD=$(tg_api getUpdates)
             CHAT_ID=$(printf '%s' "$UPD" | grep -o '"chat":{"id":-\?[0-9]*' | tail -n 1 | grep -o -- '-\?[0-9]*$' || true)
             [ -n "$CHAT_ID" ] && break
             sleep 3

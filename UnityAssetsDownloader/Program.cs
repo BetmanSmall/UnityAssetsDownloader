@@ -1161,10 +1161,8 @@ internal sealed class UnityAssetAutomationApp
 
         if (tgResult.PostsWithoutLinks.Count > 0)
         {
-            var where = _options.TelegramScreenshotOnNoLinks
-                ? " Скриншоты сохранены в logs/telegram/"
-                : " Их тексты есть в telegram_posts_raw.log.";
-            _logger.Info($"Telegram: постов без ссылок на Asset Store: {tgResult.PostsWithoutLinks.Count}.{where}");
+            _logger.Info($"Telegram: постов без ссылок на Asset Store: {tgResult.PostsWithoutLinks.Count}. " +
+                         "Их тексты есть в telegram_posts_raw.log.");
         }
 
         foreach (var err in tgResult.Errors)
@@ -1184,8 +1182,9 @@ internal sealed class UnityAssetAutomationApp
             maxPagesPerChannel: TelegramSourceParser.MaxPagesPerChannel);
 
     /// <summary>
-    /// Разбирает Telegram-каналы. Если задан отдельный прокси для Telegram,
-    /// поднимает под это второй браузер, чтобы Unity продолжал ходить напрямую.
+    /// Разбирает Telegram-каналы. Страницы каналов качаются обычными запросами, без
+    /// браузера: через прокси идут только они, Unity всё так же ходит напрямую своим
+    /// браузером. Не вышло — запасной путь: отдельный браузер через прокси, как раньше.
     ///
     /// Курсоры помнят, где остановилось чтение каждого канала: при сборе пачками
     /// следующий вызов продолжает с более старых постов. Чтение идёт, пока не наберётся
@@ -1299,70 +1298,104 @@ internal sealed class UnityAssetAutomationApp
             var wantedFound = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var proxySaved = false;
 
-            for (var i = 0; i < candidates.Count && i < 4 && pending.Count > 0 && wantedFound.Count < wantAssets; i++)
+            // Сначала читаем каналы обычными запросами: страница t.me/s/<канал> приходит
+            // готовой, браузер для неё не нужен. Так быстрее и не нужен второй Chrome.
+            await TryCandidatesAsync(viaBrowser: false);
+
+            // Не вышло — старый путь: отдельный браузер через прокси. Он медленнее,
+            // но переживает смену вёрстки Telegram и работает там, где простой запрос отбивают.
+            if (pending.Count > 0 && wantedFound.Count < wantAssets)
             {
-                var candidate = candidates[i];
+                _logger.Info("Простым запросом каналы не открылись. Пробуем по-старому — браузером через прокси.");
+                await TryCandidatesAsync(viaBrowser: true);
+            }
 
-                if (ownBrowser is not null)
+            async Task TryCandidatesAsync(bool viaBrowser)
+            {
+                for (var i = 0; i < candidates.Count && i < 4 && pending.Count > 0 && wantedFound.Count < wantAssets; i++)
                 {
-                    await ownBrowser.CloseAsync();
-                    await ownBrowser.DisposeAsync();
-                    ownBrowser = null;
-                }
+                    var candidate = candidates[i];
 
-                if (string.IsNullOrWhiteSpace(candidate))
-                {
-                    _logger.Info("Telegram открываем напрямую, без прокси.");
-                    tgBrowser = mainBrowser;
-                }
-                else
-                {
+                    if (ownBrowser is not null)
+                    {
+                        await ownBrowser.CloseAsync();
+                        await ownBrowser.DisposeAsync();
+                        ownBrowser = null;
+                    }
+
                     if (i > 0)
                     {
                         _logger.Warn($"Пробуем запасной прокси: {candidate} (каналы: {string.Join(", ", pending.Select(c => c.Name))})");
                     }
 
-                    // Запуск браузера под прокси иногда не проходит совсем. Это не повод
-                    // бросать чтение каналов: берём следующий прокси из списка.
+                    // Кто качает страницы: обычный запрос или браузер.
+                    HttpClient? tgClient = null;
+                    Func<string, Task<string?>>? fetchHtml = null;
+                    tgBrowser = mainBrowser;
+
                     try
                     {
-                        ownBrowser = await LaunchTelegramBrowserAsync(candidate);
+                        if (!viaBrowser)
+                        {
+                            tgClient = CreateTelegramHttpClient(candidate);
+                            fetchHtml = url => FetchTelegramPageAsync(tgClient, url);
+                            _logger.Info(string.IsNullOrWhiteSpace(candidate)
+                                ? "Telegram читаем напрямую, без браузера и без прокси."
+                                : $"Telegram читаем без браузера, через прокси: {candidate}");
+                        }
+                        else if (string.IsNullOrWhiteSpace(candidate))
+                        {
+                            _logger.Info("Telegram открываем браузером напрямую, без прокси.");
+                        }
+                        else
+                        {
+                            // Запуск браузера под прокси иногда не проходит совсем. Это не повод
+                            // бросать чтение каналов: берём следующий прокси из списка.
+                            try
+                            {
+                                ownBrowser = await LaunchTelegramBrowserAsync(candidate);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.Warn($"Прокси {candidate} пропускаем: браузер для Telegram не запустился ({ex.Message}).");
+                                continue;
+                            }
+
+                            tgBrowser = ownBrowser;
+                            _logger.Info($"Telegram идёт через отдельный прокси: {candidate}");
+                            _logger.Info("Unity при этом работает напрямую, без прокси.");
+                        }
+
+                        foreach (var cursor in pending)
+                        {
+                            cursor.FailedThisRead = false;
+                        }
+
+                        var partial = await RunParserAsync(tgBrowser, pending, wantAssets - wantedFound.Count, fetchHtml);
+                        MergeTelegramResults(result, partial);
+                        foreach (var url in partial.AssetUrls.Where(isWanted))
+                        {
+                            wantedFound.Add(url);
+                        }
+
+                        var failed = pending.Where(c => c.FailedThisRead).ToList();
+                        if (failed.Count < pending.Count && !proxySaved && !string.IsNullOrWhiteSpace(candidate))
+                        {
+                            await RememberProxyAsync(candidate);
+                            proxySaved = true;
+                        }
+
+                        pending = failed;
+
+                        if (pending.Count > 0 && !LooksBlocked(partial))
+                        {
+                            break;
+                        }
                     }
-                    catch (Exception ex)
+                    finally
                     {
-                        _logger.Warn($"Прокси {candidate} пропускаем: браузер для Telegram не запустился ({ex.Message}).");
-                        continue;
+                        tgClient?.Dispose();
                     }
-
-                    tgBrowser = ownBrowser;
-                    _logger.Info($"Telegram идёт через отдельный прокси: {candidate}");
-                    _logger.Info("Unity при этом работает напрямую, без прокси.");
-                }
-
-                foreach (var cursor in pending)
-                {
-                    cursor.FailedThisRead = false;
-                }
-
-                var partial = await RunParserAsync(tgBrowser, pending, wantAssets - wantedFound.Count);
-                MergeTelegramResults(result, partial);
-                foreach (var url in partial.AssetUrls.Where(isWanted))
-                {
-                    wantedFound.Add(url);
-                }
-
-                var failed = pending.Where(c => c.FailedThisRead).ToList();
-                if (failed.Count < pending.Count && !proxySaved && !string.IsNullOrWhiteSpace(candidate))
-                {
-                    await RememberProxyAsync(candidate);
-                    proxySaved = true;
-                }
-
-                pending = failed;
-
-                if (pending.Count > 0 && !LooksBlocked(partial))
-                {
-                    break;
                 }
             }
 
@@ -1381,7 +1414,11 @@ internal sealed class UnityAssetAutomationApp
             ExplainTelegramFailure(result);
             return result;
 
-            async Task<TelegramParseResult> RunParserAsync(IBrowser browser, List<TelegramChannelCursor> channels, int want)
+            async Task<TelegramParseResult> RunParserAsync(
+                IBrowser browser,
+                List<TelegramChannelCursor> channels,
+                int want,
+                Func<string, Task<string?>>? fetchHtml)
             {
                 var parser = new TelegramSourceParser(
                     browser,
@@ -1389,7 +1426,8 @@ internal sealed class UnityAssetAutomationApp
                     _logsDirectory,
                     _options.NavigationTimeoutMs,
                     _options.TelegramPostLimit,
-                    _options.TelegramScreenshotOnNoLinks);
+                    _options.TelegramScreenshotOnNoLinks,
+                    fetchHtml);
 
                 return await parser.ReadAsync(channels, want, isWanted, maxPostsPerChannel, maxPagesPerChannel);
             }
@@ -1455,7 +1493,9 @@ internal sealed class UnityAssetAutomationApp
             "ERR_CONNECTION_TIMED_OUT", "ERR_CONNECTION_RESET", "ERR_CONNECTION_CLOSED",
             "ERR_NAME_NOT_RESOLVED", "ERR_CONNECTION_REFUSED", "ERR_TIMED_OUT",
             "ERR_PROXY_CONNECTION_FAILED", "ERR_SOCKS_CONNECTION_FAILED", "ERR_ADDRESS_UNREACHABLE",
-            "ERR_NETWORK_CHANGED", "ERR_EMPTY_RESPONSE", "ERR_TUNNEL_CONNECTION_FAILED"
+            "ERR_NETWORK_CHANGED", "ERR_EMPTY_RESPONSE", "ERR_TUNNEL_CONNECTION_FAILED",
+            // Чтение без браузера: своих кодов ошибок у него нет, есть метка парсера.
+            TelegramSourceParser.NetworkFailureMarker
         ];
 
         return result.Errors.Any(e => codes.Any(c => e.Contains(c, StringComparison.OrdinalIgnoreCase)));
@@ -1592,6 +1632,98 @@ internal sealed class UnityAssetAutomationApp
             _logger.Warn("Если GitHub тоже заблокирован — сохраните список в файл и укажите его в --tg-proxy-list.");
             return [];
         }
+    }
+
+    /// <summary>
+    /// Обычная браузерная подпись: t.me отдаёт страницу и без неё, но так меньше
+    /// шансов получить заглушку вместо постов.
+    /// </summary>
+    private const string TelegramUserAgent =
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
+
+    /// <summary>
+    /// Клиент для чтения открытых страниц Telegram. Через него идут только они:
+    /// Unity ходит напрямую и своим браузером.
+    /// </summary>
+    private static HttpClient CreateTelegramHttpClient(string? proxy)
+    {
+        var handler = new HttpClientHandler { AutomaticDecompression = DecompressionMethods.All };
+
+        if (string.IsNullOrWhiteSpace(proxy))
+        {
+            handler.UseProxy = false;
+        }
+        else
+        {
+            handler.Proxy = new WebProxy(proxy);
+            handler.UseProxy = true;
+        }
+
+        // 12 секунд на попытку, попыток три. При подборе прокси обязан ответить за 8,
+        // поэтому дольше ждать смысла нет: лучше быстрее взять следующий прокси.
+        var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(12) };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(TelegramUserAgent);
+        client.DefaultRequestHeaders.AcceptLanguage.ParseAdd("ru,en;q=0.9");
+        return client;
+    }
+
+    /// <summary>
+    /// Качает страницу канала. Бесплатный прокси часто срывается на ровном месте,
+    /// поэтому три попытки. Не получилось — null, и канал пробуется другим путём.
+    ///
+    /// Отдельно разбираются два ответа Telegram: «слишком часто» (429) и его собственные
+    /// ошибки (5xx). Оба лечатся ожиданием, а не сменой прокси, поэтому ждём и повторяем.
+    /// </summary>
+    private async Task<string?> FetchTelegramPageAsync(HttpClient client, string url)
+    {
+        const int attempts = 3;
+
+        for (var attempt = 1; attempt <= attempts; attempt++)
+        {
+            try
+            {
+                using var response = await client.GetAsync(url);
+
+                if (response.StatusCode == HttpStatusCode.TooManyRequests ||
+                    (int)response.StatusCode >= 500)
+                {
+                    if (attempt == attempts)
+                    {
+                        _logger.Warn($"[Telegram] {url}: Telegram отвечает {(int)response.StatusCode}, и после ожидания тоже. Пропускаем страницу.");
+                        return null;
+                    }
+
+                    var wait = response.Headers.RetryAfter?.Delta
+                               ?? TimeSpan.FromSeconds(response.StatusCode == HttpStatusCode.TooManyRequests ? 5 : 2);
+                    _logger.Info($"[Telegram] Telegram просит подождать ({(int)response.StatusCode}). Ждём {wait.TotalSeconds:0} с и пробуем снова.");
+                    await Task.Delay(wait);
+                    continue;
+                }
+
+                // Прочие отказы (нет такого канала, 403) повтором не лечатся.
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger.Warn($"[Telegram] {url}: ответ {(int)response.StatusCode}. Повторять нечего — проверьте имя канала.");
+                    return null;
+                }
+
+                return await response.Content.ReadAsStringAsync();
+            }
+            catch (Exception ex)
+            {
+                if (attempt == attempts)
+                {
+                    _logger.Debug($"[Telegram] Страница {url} не скачалась: {ex.Message}");
+                    return null;
+                }
+
+                // Про паузу в логе должно быть видно, иначе она выглядит зависанием.
+                _logger.Info($"[Telegram] Страница не пришла (попытка {attempt} из {attempts}): {ex.GetBaseException().Message}. Пробуем снова...");
+                await Task.Delay(1500);
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -1859,7 +1991,7 @@ internal sealed class UnityAssetAutomationApp
 
         var blocked = HasError("ERR_CONNECTION_TIMED_OUT", "ERR_CONNECTION_RESET",
             "ERR_NAME_NOT_RESOLVED", "ERR_CONNECTION_REFUSED", "ERR_CONNECTION_CLOSED",
-            "ERR_TIMED_OUT", "ERR_ADDRESS_UNREACHABLE");
+            "ERR_TIMED_OUT", "ERR_ADDRESS_UNREACHABLE", TelegramSourceParser.NetworkFailureMarker);
 
         if (!blocked)
         {

@@ -10,9 +10,21 @@ internal sealed class TelegramSourceParser
     private readonly int _navigationTimeoutMs;
     private readonly int _postLimit;
     private readonly bool _screenshotOnNoLinks;
+
+    /// <summary>
+    /// Качает страницу канала без браузера. null — значит читаем только браузером.
+    /// Ошибки не бросает: вернула null — открываем канал браузером, как раньше.
+    /// </summary>
+    private readonly Func<string, Task<string?>>? _fetchHtmlAsync;
     // Страница канала отдаёт около 20 постов. При чтении за один раз десяти страниц
     // (~200 постов) хватает: старые раздачи давно закончились. Пачками читается без предела.
     public const int MaxPagesPerChannel = 10;
+
+    /// <summary>
+    /// Метка в тексте ошибки: канал не открылся по сети. По ней программа понимает,
+    /// что нужно пробовать следующий прокси, а не сдаваться.
+    /// </summary>
+    public const string NetworkFailureMarker = "канал не открылся по сети";
 
     // Regex для ссылок на ассеты Unity Asset Store
     private static readonly Regex AssetUrlRegex = new(
@@ -38,7 +50,8 @@ internal sealed class TelegramSourceParser
         string logsDirectory,
         int navigationTimeoutMs,
         int postLimit = 50,
-        bool screenshotOnNoLinks = true)
+        bool screenshotOnNoLinks = true,
+        Func<string, Task<string?>>? fetchHtmlAsync = null)
     {
         _browser = browser;
         _logger = logger;
@@ -46,6 +59,7 @@ internal sealed class TelegramSourceParser
         _navigationTimeoutMs = navigationTimeoutMs;
         _postLimit = postLimit;
         _screenshotOnNoLinks = screenshotOnNoLinks;
+        _fetchHtmlAsync = fetchHtmlAsync;
     }
 
     /// <summary>
@@ -83,9 +97,21 @@ internal sealed class TelegramSourceParser
             !c.Exhausted && !c.FailedThisRead &&
             c.PostsRead < Math.Min(maxPostsPerChannel, c.MaxPosts) && c.PagesRead < maxPagesPerChannel;
 
-        var page = await _browser.NewPageAsync();
-        page.DefaultNavigationTimeout = _navigationTimeoutMs;
-        page.DefaultTimeout = _navigationTimeoutMs;
+        // Вкладка открывается только если понадобится: при чтении без браузера
+        // она не нужна совсем.
+        IPage? page = null;
+
+        async Task<IPage> OpenPageAsync()
+        {
+            if (page is null)
+            {
+                page = await _browser.NewPageAsync();
+                page.DefaultNavigationTimeout = _navigationTimeoutMs;
+                page.DefaultTimeout = _navigationTimeoutMs;
+            }
+
+            return page;
+        }
 
         try
         {
@@ -93,7 +119,7 @@ internal sealed class TelegramSourceParser
             {
                 foreach (var cursor in cursors.Where(CanRead).ToList())
                 {
-                    var channelResult = await ReadPageWithRetryAsync(page, cursor, maxPostsPerChannel);
+                    var channelResult = await ReadPageWithRetryAsync(OpenPageAsync, cursor, maxPostsPerChannel);
 
                     result.GitLinks.AddRange(channelResult.GitLinks);
                     result.Promocodes.AddRange(channelResult.Promocodes);
@@ -134,8 +160,11 @@ internal sealed class TelegramSourceParser
         }
         finally
         {
-            await page.CloseAsync();
-            await page.DisposeAsync();
+            if (page is not null)
+            {
+                await page.CloseAsync();
+                await page.DisposeAsync();
+            }
         }
 
         result.GitLinks = result.GitLinks.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
@@ -157,14 +186,14 @@ internal sealed class TelegramSourceParser
     /// поэтому при сетевой ошибке пробует ещё раз; не вышло — помечает канал FailedThisRead.
     /// </summary>
     private async Task<TelegramChannelResult> ReadPageWithRetryAsync(
-        IPage page, TelegramChannelCursor cursor, int maxPostsPerChannel)
+        Func<Task<IPage>> openPageAsync, TelegramChannelCursor cursor, int maxPostsPerChannel)
     {
         for (var attempt = 1; ; attempt++)
         {
             var channelResult = new TelegramChannelResult { ChannelName = cursor.Name };
             try
             {
-                await ReadNextPageAsync(page, cursor, channelResult, maxPostsPerChannel);
+                await ReadNextPageAsync(openPageAsync, cursor, channelResult, maxPostsPerChannel);
                 if (attempt > 1)
                 {
                     _logger.Info($"[Telegram] Со второй попытки канал {cursor.Name} открылся.");
@@ -195,7 +224,8 @@ internal sealed class TelegramSourceParser
     /// последних постов, а более старые лежат именно на страницах ?before.
     /// </summary>
     private async Task ReadNextPageAsync(
-        IPage page, TelegramChannelCursor cursor, TelegramChannelResult channelResult, int maxPostsPerChannel)
+        Func<Task<IPage>> openPageAsync, TelegramChannelCursor cursor,
+        TelegramChannelResult channelResult, int maxPostsPerChannel)
     {
         var channelUrl = $"{TelegramWebBaseUrl}{cursor.Name}";
         var firstPage = cursor.OldestId == 0;
@@ -211,14 +241,40 @@ internal sealed class TelegramSourceParser
             _logger.Info($"[Telegram] Открытие канала: {channelUrl}");
         }
 
-        await page.GoToAsync(url, new NavigationOptions
-        {
-            WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
-            Timeout = _navigationTimeoutMs
-        });
-        await Task.Delay(firstPage ? 2000 : 1500);
+        // Сначала — простой запрос страницы: t.me/s/<канал> приходит уже готовой,
+        // выполнять на ней нечего. Это в разы быстрее браузера и не требует второго Chrome.
+        List<(string Text, string PostId)> pagePosts = [];
+        IPage? page = null;
 
-        var pagePosts = await ExtractPostsRawAsync(page);
+        if (_fetchHtmlAsync is not null)
+        {
+            var html = await _fetchHtmlAsync(url);
+            if (html is null)
+            {
+                throw new InvalidOperationException($"{NetworkFailureMarker}: страница {url} не скачалась");
+            }
+
+            pagePosts = TelegramHtmlParser.ExtractPosts(html);
+
+            // Постов может не быть по двум причинам: они кончились или вместо страницы
+            // пришла заглушка провайдера. Настоящую страницу узнаём по разметке Telegram.
+            if (pagePosts.Count == 0 && !html.Contains("tgme_", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException($"{NetworkFailureMarker}: вместо {url} пришла не та страница");
+            }
+        }
+        else
+        {
+            page = await openPageAsync();
+            await page.GoToAsync(url, new NavigationOptions
+            {
+                WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
+                Timeout = _navigationTimeoutMs
+            });
+            await Task.Delay(firstPage ? 2000 : 1500);
+
+            pagePosts = await ExtractPostsRawAsync(page);
+        }
         var postLimit = Math.Min(maxPostsPerChannel, cursor.MaxPosts);
 
         // Режим «только новые»: посты с номером не больше StopAtId прочитаны в прошлый раз.
@@ -282,7 +338,7 @@ internal sealed class TelegramSourceParser
 
     /// <summary>Ищет в посте ссылки на ассеты, git-ссылки и промокоды.</summary>
     private async Task AnalyzePostAsync(
-        IPage page, string channelName, string text, string postId, TelegramChannelResult channelResult)
+        IPage? page, string channelName, string text, string postId, TelegramChannelResult channelResult)
     {
         channelResult.AllPosts.Add(new TelegramPostInfo
         {
@@ -356,9 +412,15 @@ internal sealed class TelegramSourceParser
         }
 
         // Если не найдено ни одной ссылки — скриншот
-        if (_screenshotOnNoLinks && assetUrls.Count == 0 && gitUrls.Count == 0 && promocodes.Count == 0)
+        if (assetUrls.Count == 0 && gitUrls.Count == 0 && promocodes.Count == 0)
         {
-            await TakePostScreenshotAsync(page, channelName, postId, text);
+            // Скриншот возможен только там, где пост открыт браузером. При чтении
+            // без браузера текст поста всё равно попадает в telegram_posts_raw.log.
+            if (_screenshotOnNoLinks && page is not null)
+            {
+                await TakePostScreenshotAsync(page, channelName, postId, text);
+            }
+
             channelResult.PostsWithoutLinks.Add(new PostWithoutLink
             {
                 ChannelName = channelName,
