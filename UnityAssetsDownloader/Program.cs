@@ -133,6 +133,7 @@ async Task ReportCrashAsync(Exception ex, CliOptions crashOptions)
     try
     {
         Directory.CreateDirectory(crashOptions.LogsDirectory);
+        CliOptions.MigrateProblemsFile(crashOptions.LogsDirectory);
         var problemsPath = Path.Combine(crashOptions.LogsDirectory, CliOptions.ProblemsFileName);
         await File.AppendAllTextAsync(problemsPath, crashText + Environment.NewLine);
         Console.Error.WriteLine();
@@ -226,6 +227,7 @@ internal sealed class UnityAssetAutomationApp
         var logFilePath = string.IsNullOrWhiteSpace(options.LogFilePath)
             ? Path.Combine(_logsDirectory, $"run-log-{DateTime.Now:yyyyMMdd-HHmmss}.log")
             : Path.GetFullPath(options.LogFilePath);
+        CliOptions.MigrateProblemsFile(_logsDirectory);
         var errorsFilePath = Path.Combine(_logsDirectory, CliOptions.ProblemsFileName);
         _logger = new AppLogger(options.Verbose, options.TraceNetwork, logFilePath, errorsFilePath);
         _logger.Info($"ВЕРСИЯ ПРОГРАММЫ: {BuildVersionLine()}");
@@ -7150,7 +7152,32 @@ internal sealed class CliOptions
     /// Единственный файл, который нужно прислать при проблемах.
     /// Имя постоянное, содержимое дописывается — историю запусков видно в одном месте.
     /// </summary>
-    public const string ProblemsFileName = "ПРИШЛИТЕ-ЭТОТ-ФАЙЛ.log";
+    public const string ProblemsFileName = "errors.log";
+
+    /// <summary>Как этот файл назывался до версии 1.21.1. Переименовывается при запуске.</summary>
+    public const string LegacyProblemsFileName = "ПРИШЛИТЕ-ЭТОТ-ФАЙЛ.log";
+
+    /// <summary>
+    /// Переносит файл с ошибками со старого имени на новое, чтобы история запусков
+    /// не разъехалась по двум файлам. Делается один раз и только если нового ещё нет.
+    /// </summary>
+    public static void MigrateProblemsFile(string logsDirectory)
+    {
+        try
+        {
+            var legacy = Path.Combine(logsDirectory, LegacyProblemsFileName);
+            var current = Path.Combine(logsDirectory, ProblemsFileName);
+
+            if (File.Exists(legacy) && !File.Exists(current))
+            {
+                File.Move(legacy, current);
+            }
+        }
+        catch
+        {
+            // Не переименовали — не беда: новые записи пойдут в новый файл.
+        }
+    }
 
     public string? LogFilePath { get; init; }
     public string SignInUrl { get; init; } = DefaultSignInUrl;

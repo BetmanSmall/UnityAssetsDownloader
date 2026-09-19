@@ -5,7 +5,7 @@
         <TargetFramework>net8.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
-        <Version>1.21.0</Version>
+        <Version>1.21.1</Version>
     </PropertyGroup>
 
     <!-- Дописывает к версии короткий номер коммита, чтобы в логе было видно,
