@@ -198,7 +198,28 @@ else
     ok "Каналы: ${CHANNELS_VALUE//,/, }"
 fi
 
-bold "4. Расписание"
+bold "4. Что читать, кроме каналов"
+echo "  1 — только Telegram-каналы. Быстро, так работало до сих пор."
+echo "  2 — ещё страница «топ бесплатных» магазина."
+echo "  3 — ещё китайский архив и расширенные списки. Первый проход долгий (больше двухсот"
+echo "      ссылок), дальше уже добавленные ассеты пропускаются по памяти профиля."
+case "$(env_get SOURCES)" in
+    top-free) SOURCES_DEFAULT=2 ;;
+    all)      SOURCES_DEFAULT=3 ;;
+    *)        SOURCES_DEFAULT=1 ;;
+esac
+while :; do
+    ask SOURCES_CHOICE "Выберите 1, 2 или 3" "$SOURCES_DEFAULT"
+    case "$SOURCES_CHOICE" in
+        1) SOURCES_VALUE=telegram; break ;;
+        2) SOURCES_VALUE=top-free; break ;;
+        3) SOURCES_VALUE=all;      break ;;
+        *) fail "Введите 1, 2 или 3." ;;
+    esac
+done
+ok "Источники: $SOURCES_VALUE"
+
+bold "5. Расписание"
 while :; do
     ask INTERVAL "Как часто проверять каналы (30m, 6h, 1d)" "$(env_get WATCH_INTERVAL || true)"
     INTERVAL=${INTERVAL:-24h}
@@ -226,6 +247,7 @@ umask 077
     echo "TELEGRAM_CHAT_ID=$(env_quote "$CHAT_ID")"
     echo "TELEGRAM_CHANNELS=$(env_quote "$CHANNELS_VALUE")"
     echo "WATCH_INTERVAL=$INTERVAL"
+    echo "SOURCES=$SOURCES_VALUE"
     echo "PROFILE=$PROFILE"
     echo "TZ=$TZ_VALUE"
 } > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
@@ -320,10 +342,10 @@ if ask_yes "Собрать и проверить всё по шагам?" "$CHEC
     echo "  Программа прочитает последние посты каналов, добавит бесплатные ассеты"
     echo "  и выкупит по промокоду те, что станут бесплатными (только при итоге 0)."
     if ask_yes "Сначала проверочный прогон, без изменений аккаунта?" N; then
-        step "Проверочный прогон" "${APP[@]}" --no-defaults --tg-only-new --dry-run || stop_here
+        step "Проверочный прогон" "${APP[@]}" --sources "$SOURCES_VALUE" --tg-only-new --dry-run || stop_here
     fi
     if ask_yes "Сделать первый настоящий прогон сейчас?" Y; then
-        step "Первый прогон" "${APP[@]}" --no-defaults --tg-only-new || stop_here
+        step "Первый прогон" "${APP[@]}" --sources "$SOURCES_VALUE" --tg-only-new || stop_here
     fi
 elif [ "$SERVICE_RUNNING" = 0 ]; then
     step "Сборка образа" "${DC[@]}" build || stop_here

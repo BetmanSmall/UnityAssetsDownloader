@@ -151,7 +151,7 @@ async Task ReportCrashAsync(Exception ex, CliOptions crashOptions)
 internal sealed class UnityAssetAutomationApp
 {
     private const string AssetStoreHomeUrl = "https://assetstore.unity.com/";
-    private const string BaseTopFreeSource = "https://assetstore.unity.com/top-assets/top-free";
+    public const string BaseTopFreeSource = "https://assetstore.unity.com/top-assets/top-free";
 
     private const string BaseFreeListFileName =
         "GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt";
@@ -232,6 +232,11 @@ internal sealed class UnityAssetAutomationApp
         _logger.Info($"Каталог логов: {_logsDirectory}");
         _logger.Info($"Каталог данных (cookies): {_dataDirectory}");
         _logger.Info($"Профиль аккаунта: {_profileName} | папка: {profileDirectory}");
+
+        if (!string.IsNullOrWhiteSpace(options.SourcesPreset))
+        {
+            _logger.Info($"Источники (SOURCES={options.SourcesPreset}): {CliOptions.DescribeSourcesPreset(options.SourcesPreset)}.");
+        }
         _logger.Info($"ЕСЛИ ЧТО-ТО ПОШЛО НЕ ТАК — ПРИШЛИТЕ ЭТОТ ФАЙЛ: {errorsFilePath}");
 
         if (!string.IsNullOrWhiteSpace(options.NotifyBotToken))
@@ -7126,6 +7131,9 @@ internal sealed class CliOptions
     public bool TraceNetwork { get; init; }
     public bool UseExtendedSources { get; init; }
     public bool UseNoDefaults { get; init; }
+
+    /// <summary>Пресет источников: telegram, top-free или all. Пусто — источники заданы флагами.</summary>
+    public string? SourcesPreset { get; init; }
     public List<string> ExtraSourceFiles { get; init; } = [];
     /// <summary>
     /// Точка входа Asset Store. Она сама перебрасывает на страницу входа Unity
@@ -7251,6 +7259,7 @@ internal sealed class CliOptions
         var cliTraceNetwork = false;
         var cliUseExtendedSources = false;
         var cliUseNoDefaults = false;
+        string? cliSourcesPreset = null;
         string? cliLogFilePath = null;
         string? cliLogsDirectory = null;
         string? cliSignInUrl = null;
@@ -7477,6 +7486,9 @@ internal sealed class CliOptions
                 case "--source" when i + 1 < args.Length:
                     cliSources.Add(args[++i]);
                     break;
+                case "--sources" when i + 1 < args.Length:
+                    cliSourcesPreset = args[++i];
+                    break;
                 case "--extra-source-file" when i + 1 < args.Length:
                     cliExtraSourceFiles.Add(args[++i]);
                     break;
@@ -7597,6 +7609,35 @@ internal sealed class CliOptions
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+
+        // Пресет источников: одно слово вместо набора флагов. Так его задаёт сервер
+        // в .env (SOURCES=telegram|top-free|all), чтобы не переписывать docker-compose.yml.
+        var sourcesPreset = NormalizeSourcesPreset(FirstNonEmpty(cliSourcesPreset, Environment.GetEnvironmentVariable("SOURCES")));
+
+        if (sourcesPreset is not null)
+        {
+            // Отдельные флаги сильнее пресета: если их задали руками, пресет не мешает.
+            if (cliUseNoDefaults || cliSources.Count > 0 || cliUseExtendedSources)
+            {
+                Console.WriteLine($"Источники заданы флагами, поэтому SOURCES={sourcesPreset} не применяется.");
+                sourcesPreset = null;
+            }
+            else
+            {
+                switch (sourcesPreset)
+                {
+                    case "telegram":
+                        useNoDefaults = true;
+                        break;
+                    case "top-free":
+                        sources = [UnityAssetAutomationApp.BaseTopFreeSource];
+                        break;
+                    case "all":
+                        useExtendedSources = true;
+                        break;
+                }
+            }
+        }
 
         var unityEmail = config?.UnityEmail;
         var unityPassword = config?.UnityPassword;
@@ -7734,6 +7775,7 @@ internal sealed class CliOptions
             TraceNetwork = traceNetwork,
             UseExtendedSources = useExtendedSources,
             UseNoDefaults = useNoDefaults,
+            SourcesPreset = sourcesPreset,
             ExtraSourceFiles = extraSourceFiles,
             LogFilePath = logFilePath,
             LogsDirectory = logsDirectory,
@@ -7798,6 +7840,53 @@ internal sealed class CliOptions
             return fallback;
         }
     }
+
+    /// <summary>
+    /// Приводит значение SOURCES к одному из трёх: telegram, top-free, all.
+    /// Непонятное значение — предупреждение и telegram: на сервере это привычное
+    /// поведение, а молча включать долгий обход магазина из-за опечатки нельзя.
+    /// </summary>
+    private static string? NormalizeSourcesPreset(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        var value = raw.Trim().ToLowerInvariant().Replace('_', '-').Replace(" ", string.Empty);
+
+        switch (value)
+        {
+            case "telegram":
+            case "tg":
+            case "telegram-only":
+            case "only-telegram":
+                return "telegram";
+            case "top-free":
+            case "topfree":
+            case "top":
+            case "free":
+                return "top-free";
+            case "all":
+            case "everything":
+            case "max":
+            case "все":
+                return "all";
+            default:
+                Console.WriteLine($"SOURCES={raw} — такого набора источников нет. Беру telegram. Возможные значения: telegram, top-free, all.");
+                return "telegram";
+        }
+    }
+
+    /// <summary>Что означает пресет источников — человеческими словами, для лога.</summary>
+    public static string DescribeSourcesPreset(string preset) => preset switch
+    {
+        "telegram" => "только Telegram-каналы",
+        "top-free" => "Telegram-каналы и страница «топ бесплатных» магазина",
+        "all" => "Telegram-каналы, «топ бесплатных», китайский архив и расширенные списки. " +
+                 "Первый проход долгий: ссылок больше двухсот",
+        _ => preset
+    };
 
     private static string? FirstNonEmpty(params string?[] values)
     {

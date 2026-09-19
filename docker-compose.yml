@@ -29,7 +29,10 @@ services:
       - "${WATCH_INTERVAL:-24h}"
       - "--profile"
       - "${PROFILE:-server}"
-      - "--no-defaults"
+      # Что читать: telegram (только каналы), top-free (+ страница топа бесплатных),
+      # all (+ китайский архив и расширенные списки). Меняется в .env.
+      - "--sources"
+      - "${SOURCES:-telegram}"
       - "--quiet"
     volumes:
       # Сессия Unity, память профиля (что уже добавлено), где остановилось чтение каналов.

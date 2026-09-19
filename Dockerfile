@@ -25,10 +25,13 @@ COPY --from=build /out/ ./
 # Списки источников. telegram_sources.txt обычно подключается снаружи (см. docker-compose.yml),
 # чтобы каналы можно было менять без пересборки.
 COPY telegram_sources.txt extra_asset_urls.example.txt extended_sources.txt ./
+# Китайский архив бесплатных ассетов: нужен при SOURCES=all. Берём только список ссылок,
+# html-выгрузки на 3,5 МБ в образе не нужны.
+COPY GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt GreaterChinaUnityAssetArchive/
 
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
     DOTNET_NOLOGO=1
 
 VOLUME ["/app/data", "/app/logs"]
 ENTRYPOINT ["dotnet", "UnityAssetsDownloader.dll", "--logs-dir", "/app/logs", "--data-dir", "/app/data"]
-CMD ["--watch", "--watch-interval", "24h", "--no-defaults", "--quiet"]
+CMD ["--watch", "--watch-interval", "24h", "--sources", "telegram", "--quiet"]

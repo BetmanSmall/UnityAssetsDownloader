@@ -143,6 +143,7 @@ dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- --hea
 | `--verbose` | Подробные логи |
 | `--quiet` | Только важное. Перебивает `verbose` из `config.json`. `run.bat` включает его на обычных запусках |
 | `--trace-network` | Сетевые логи (включает verbose) |
+| `--sources telegram\|top-free\|all` | Набор источников одним словом: только каналы Telegram; каналы и страница «топ бесплатных»; каналы, «топ бесплатных», китайский архив и расширенные списки. На сервере задаётся переменной `SOURCES` в `.env`. Отдельные флаги источников ниже сильнее этого |
 | `--no-defaults` | Не подключать источники по умолчанию. Берутся только те, что заданы явно |
 | `--extended-sources` | Добавить расширенный список источников (страницы search + archive URL) к базовым источникам по умолчанию |
 | `--log-file <path>` | Путь к файлу лога |
@@ -569,7 +570,9 @@ cd UnityAssetsDownloader
 1. email и пароль Unity (пароль не отображается);
 2. токен Telegram-бота — проверяет его и просит написать боту `/start`, чтобы узнать, куда писать;
 3. каналы — имя, `@имя` или ссылку `t.me/…`;
-4. период (`30m`, `6h`, `1d`), часовой пояс и имя профиля.
+4. что читать, кроме каналов: только каналы, плюс «топ бесплатных» или ещё китайский архив
+   и расширенные списки (пишется в `.env` как `SOURCES`);
+5. период (`30m`, `6h`, `1d`), часовой пояс и имя профиля.
 
 Ответы сохраняет в `.env` (права `600`). Если Docker нет — предлагает поставить.
 Затем по шагам проверяет, что всё работает (таблица ниже), и запускает службу.
@@ -581,7 +584,8 @@ cd UnityAssetsDownloader
 | Что | Как |
 |---|---|
 | Логи прогона | `docker compose logs -f` и файлы в `./logs` |
-| Каналы, период, пароль, бот | `./deploy.sh` ещё раз — и согласиться перезапустить службу |
+| Каналы, источники, период, пароль, бот | `./deploy.sh` ещё раз — и согласиться перезапустить службу |
+| Только источники, без вопросов | Поменять `SOURCES` в `.env`, затем `docker compose up -d` |
 | Остановить | `docker compose down` |
 | Обновить | `git pull && ./deploy.sh` |
 
@@ -597,8 +601,8 @@ cd UnityAssetsDownloader
 | 3 | `docker compose run --rm unity-assets --profile server --check-telegram` | «Telegram доступен, разбор работает». Если заблокирован — прокси подберётся и запомнится |
 | 4 | Напишите боту `/start`, затем `docker compose run --rm unity-assets --profile server --notify-test` | Сообщение «👋 Проверка связи» в Telegram. В логе строка «[Бот] Связь с Telegram есть: …» — каким путём получилось |
 | 5 | `docker compose run --rm unity-assets --profile server --login` | «ГОТОВО. ВЫ ВОШЛИ В UNITY». Спросит код — введите в консоли или ответьте боту |
-| 6 | `docker compose run --rm unity-assets --profile server --no-defaults --tg-only-new --dry-run` | Список ассетов «[Имитация] … был бы добавлен», аккаунт не меняется |
-| 7 | `docker compose run --rm unity-assets --profile server --no-defaults --tg-only-new` | Настоящий прогон: «ИТОГИ», сообщение бота, если что-то добавлено |
+| 6 | `docker compose run --rm unity-assets --profile server --sources telegram --tg-only-new --dry-run` | Список ассетов «[Имитация] … был бы добавлен», аккаунт не меняется |
+| 7 | `docker compose run --rm unity-assets --profile server --sources telegram --tg-only-new` | Настоящий прогон: «ИТОГИ», сообщение бота, если что-то добавлено |
 | 8 | `docker compose up -d` и `docker compose logs -f` | «Следующий прогон: …» |
 
 После шага 7 в `data/profiles/server__<аккаунт>/telegram_state.json` лежат номера
@@ -643,7 +647,7 @@ cd UnityAssetsDownloader
 
 ```bash
 dotnet run --project UnityAssetsDownloader/UnityAssetsDownloader.csproj -- \
-    --watch --watch-interval 24h --no-defaults
+    --watch --watch-interval 24h --sources telegram
 ```
 
 `--watch` включает невидимый браузер, режим «только новые посты» и отключает вопросы
