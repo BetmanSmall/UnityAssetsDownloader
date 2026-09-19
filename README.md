@@ -459,7 +459,9 @@ Google намеренно не пускает вход в браузере, ко
 - `telegram_proxy.txt` — последний прокси, через который открылся Telegram.
 
 Общие файлы: `data/profiles.json` — список профилей, `data/telegram_bot_chat.txt` — куда
-пишет бот. Любой из этих файлов можно удалить — программа просто узнает всё заново.
+пишет бот, `data/telegram_bot_route.txt` — каким путём бот дозвонился до Telegram
+(напрямую, по закреплённому адресу или через прокси). Любой из этих файлов можно
+удалить — программа просто узнает всё заново.
 
 Логи — в `logs/`:
 
@@ -593,7 +595,7 @@ cd UnityAssetsDownloader
 | 1 | `docker compose build` | `Successfully tagged` / `Built` |
 | 2 | `docker compose run --rm unity-assets --profile server --check-login-page` | «ИТОГ: страница входа в порядке» |
 | 3 | `docker compose run --rm unity-assets --profile server --check-telegram` | «Telegram доступен, разбор работает». Если заблокирован — прокси подберётся и запомнится |
-| 4 | Напишите боту `/start`, затем `docker compose run --rm unity-assets --profile server --notify-test` | Сообщение «👋 Проверка связи» в Telegram (через тот же прокси, если нужно) |
+| 4 | Напишите боту `/start`, затем `docker compose run --rm unity-assets --profile server --notify-test` | Сообщение «👋 Проверка связи» в Telegram. В логе строка «[Бот] Связь с Telegram есть: …» — каким путём получилось |
 | 5 | `docker compose run --rm unity-assets --profile server --login` | «ГОТОВО. ВЫ ВОШЛИ В UNITY». Спросит код — введите в консоли или ответьте боту |
 | 6 | `docker compose run --rm unity-assets --profile server --no-defaults --tg-only-new --dry-run` | Список ассетов «[Имитация] … был бы добавлен», аккаунт не меняется |
 | 7 | `docker compose run --rm unity-assets --profile server --no-defaults --tg-only-new` | Настоящий прогон: «ИТОГИ», сообщение бота, если что-то добавлено |

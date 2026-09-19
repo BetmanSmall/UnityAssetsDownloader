@@ -1248,6 +1248,30 @@ internal sealed class UnityAssetAutomationApp
                     }
                 }
 
+                // Прокси, найденные в этой же программе раньше: проверить их дешевле,
+                // чем скачивать и перебирать список заново.
+                if (candidates.Count == 0)
+                {
+                    foreach (var known in _telegramProxyPool.ToList())
+                    {
+                        // Запомненный прокси только что проверили выше — второй раз незачем.
+                        if (string.Equals(known, remembered, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _telegramProxyPool.Remove(known);
+                            continue;
+                        }
+
+                        if (await TestProxyAsync(known, probeChannel))
+                        {
+                            _logger.Info($"Прокси из этого прогона ещё живой: {known}");
+                            candidates.Add(known);
+                            break;
+                        }
+
+                        _telegramProxyPool.Remove(known);
+                    }
+                }
+
                 if (candidates.Count == 0 && _options.TelegramAutoProxy)
                 {
                     candidates.AddRange(await AutoSelectTelegramProxiesAsync());
@@ -1291,7 +1315,18 @@ internal sealed class UnityAssetAutomationApp
                         _logger.Warn($"Пробуем запасной прокси: {candidate} (каналы: {string.Join(", ", pending.Select(c => c.Name))})");
                     }
 
-                    ownBrowser = await LaunchTelegramBrowserAsync(candidate);
+                    // Запуск браузера под прокси иногда не проходит совсем. Это не повод
+                    // бросать чтение каналов: берём следующий прокси из списка.
+                    try
+                    {
+                        ownBrowser = await LaunchTelegramBrowserAsync(candidate);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Warn($"Прокси {candidate} пропускаем: браузер для Telegram не запустился ({ex.Message}).");
+                        continue;
+                    }
+
                     tgBrowser = ownBrowser;
                     _logger.Info($"Telegram идёт через отдельный прокси: {candidate}");
                     _logger.Info("Unity при этом работает напрямую, без прокси.");
@@ -1424,6 +1459,16 @@ internal sealed class UnityAssetAutomationApp
         "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt";
 
     /// <summary>
+    /// Рабочие прокси, найденные в этом прогоне. Ассеты собираются пачками, и каждая
+    /// пачка заново читает каналы. Без этого списка запомненный прокси умирал между
+    /// пачками, и программа скачивала 12 тысяч адресов заново (19.09 на сервере — дважды).
+    /// </summary>
+    private readonly List<string> _telegramProxyPool = [];
+
+    /// <summary>Скачанный список адресов: в одном прогоне он один и тот же.</summary>
+    private List<string>? _proxyListCache;
+
+    /// <summary>
     /// Подбирает рабочий прокси для Telegram.
     /// Сначала пробует тот, что сработал в прошлый раз, потом берёт список
     /// и проверяет адреса пачками, пока не найдёт живой.
@@ -1466,6 +1511,12 @@ internal sealed class UnityAssetAutomationApp
                 _logger.Info(
                     $"Найдено рабочих прокси: {working.Count} (проверено адресов: {checkedCount}). " +
                     $"Основной: {working[0]}");
+
+                foreach (var found in working.Where(found => !_telegramProxyPool.Contains(found)))
+                {
+                    _telegramProxyPool.Add(found);
+                }
+
                 return working;
             }
 
@@ -1498,6 +1549,12 @@ internal sealed class UnityAssetAutomationApp
             ? DefaultProxyListUrl
             : _options.TelegramProxyList;
 
+        if (_proxyListCache is { Count: > 0 })
+        {
+            _logger.Info($"Список прокси уже получен в этом прогоне: {_proxyListCache.Count} адресов, скачивать заново не нужно.");
+            return _proxyListCache;
+        }
+
         try
         {
             string text;
@@ -1514,7 +1571,7 @@ internal sealed class UnityAssetAutomationApp
                 text = await _httpClient.GetStringAsync(source, cts.Token);
             }
 
-            return text
+            return _proxyListCache = text
                 .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 .Where(line => !line.StartsWith('#'))
                 .Select(line => line.Contains("://", StringComparison.Ordinal) ? line : "socks5://" + line)
@@ -1747,7 +1804,10 @@ internal sealed class UnityAssetAutomationApp
             Headless = true,
             DefaultViewport = null,
             IgnoredDefaultArgs = ["--enable-automation"],
-            Args = [..args]
+            Args = [..args],
+            // 19.09 на сервере запуск под мёртвым прокси висел 5,5 минуты, прежде чем
+            // отказать. Ждём 45 секунд: дальше быстрее взять следующий прокси.
+            Timeout = 45_000
         };
 
         if (_chromePath != null)
@@ -4561,8 +4621,19 @@ internal sealed class UnityAssetAutomationApp
             var stepSw = Stopwatch.StartNew();
             _logger.Info($"[Промокод][Шаг 1] Кладём ассет #{packageId} в корзину (кнопка 'Add to Cart') | URL: {page.Url}");
             await LogAllButtonsAsync(page, "Шаг 1 - кнопки до клика");
-            var addState = await TryClickAddToCartOnlyAsync(page);
+            var addState = await TryClickAddToCartOnlyAsync(page, packageId);
             _logger.Info($"[Промокод][Шаг 1] результат: {addState} | {stepSw.ElapsedMilliseconds}мс");
+
+            if (addState.StartsWith("foreign", StringComparison.Ordinal))
+            {
+                var foreignIds = addState.Contains(':') ? addState[(addState.IndexOf(':') + 1)..] : "?";
+                result.Status = AssetProcessStatus.Failed;
+                result.Message = $"Кнопка 'Add to Cart' на странице есть, но она от других ассетов (#{foreignIds}), а не от #{packageId}. Ничего не нажимали.";
+                _logger.Warn($"[Ошибка][Шаг 1] {result.Message}");
+                await SaveErrorScreenshotAsync(page, $"promo_foreign_cart_{sanitizedId}");
+                await SaveHtmlDumpAsync(page, $"promo_dump_step1_foreign_{sanitizedId}");
+                return result;
+            }
 
             if (addState == "none")
             {
@@ -5121,12 +5192,18 @@ internal sealed class UnityAssetAutomationApp
 
     /// <summary>
     /// Нажимает «Add to Cart» на странице ассета. «Buy Now» не трогает: это Express Purchase.
+    ///
+    /// Кнопка берётся только у нужного ассета. На странице есть блоки «ещё от автора» и
+    /// «похожие», у их карточек тоже своя «Add to Cart»: 19.09 на сервере так в корзину
+    /// попал чужой ассет #267305 вместо #321010. Принадлежность определяется по ближайшей
+    /// карточке вокруг кнопки: если в ней ссылка на другой ассет — кнопка не наша.
+    ///
     /// Возвращает "clicked", "in-cart" (ассет уже в корзине, повторно не кладём, чтобы не
-    /// удвоить количество) или "none".
+    /// удвоить количество), "none" или "foreign:<номера>" (нашлись только чужие кнопки).
     /// </summary>
-    private static async Task<string> TryClickAddToCartOnlyAsync(IPage page)
+    private static async Task<string> TryClickAddToCartOnlyAsync(IPage page, string packageId)
     {
-        return await page.EvaluateFunctionAsync<string>(@"() => {
+        return await page.EvaluateFunctionAsync<string>(@"(wanted) => {
             const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
             const visible = (el) => {
                 if (!el) return false;
@@ -5135,33 +5212,66 @@ internal sealed class UnityAssetAutomationApp
                 return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
             };
 
+            const idOf = (href) => {
+                const m = (href || '').match(/\/packages\/[^?#]*?-(\d+)\/?(?:[?#]|$)/);
+                return m ? m[1] : null;
+            };
+
+            // Чей это блок: поднимаемся от кнопки, пока не встретим ссылки на ассеты.
+            // Одна ссылка — это карточка одного ассета. Несколько — общий блок страницы,
+            // выше подниматься незачем.
+            const ownerOf = (el) => {
+                let node = el;
+                while (node && node !== document.body) {
+                    const ids = Array.from(new Set(
+                        Array.from(node.querySelectorAll('a[href*=""/packages/""]'))
+                            .map(a => idOf(a.getAttribute('href')))
+                            .filter(Boolean)));
+                    if (ids.length === 1) return ids[0];
+                    if (ids.length > 1) return null;
+                    node = node.parentElement;
+                }
+                return null;
+            };
+
+            const foreign = new Set();
+            const mine = (el) => {
+                const owner = ownerOf(el);
+                if (owner === null || owner === wanted) return true;
+                foreign.add(owner);
+                return false;
+            };
+
             const clickables = Array.from(document.querySelectorAll('button, a, [role=""button""]')).filter(visible);
             const textOf = (el) => normalize(el.innerText || el.getAttribute('aria-label') || '');
 
-            const inCart = clickables.some(el => textOf(el).includes('view in cart'));
+            const inCart = clickables.some(el => textOf(el).includes('view in cart') && mine(el));
             if (inCart) return 'in-cart';
 
             const isBuy = (t) => t.includes('buy') || t.includes('express') || t.includes('купить');
             let target = Array.from(document.querySelectorAll('[data-test=""add-to-cart-button""]'))
                 .filter(visible)
-                .find(el => !isBuy(textOf(el)));
+                .filter(el => !isBuy(textOf(el)))
+                .find(mine);
             if (!target) {
-                target = clickables.find(el => {
+                target = clickables.filter(el => {
                     const t = textOf(el);
                     return t === 'add to cart' || t === 'добавить в корзину';
-                });
+                }).find(mine);
             }
             if (!target) {
-                target = clickables.find(el => {
+                target = clickables.filter(el => {
                     const t = textOf(el);
                     return t.includes('add to cart') && !isBuy(t) && t.length <= 40;
-                });
+                }).find(mine);
             }
 
-            if (!target) return 'none';
+            if (!target) {
+                return foreign.size > 0 ? 'foreign:' + Array.from(foreign).join(',') : 'none';
+            }
             target.click();
             return 'clicked';
-        }");
+        }", packageId);
     }
 
     /// <summary>
@@ -6596,6 +6706,13 @@ internal sealed class UnityAssetAutomationApp
         }");
     }
 
+    /// <summary>
+    /// Нажимает «Add to My Assets» у ассета, открытого на странице.
+    ///
+    /// Номер нужного ассета берётся из адреса страницы. Кнопки из карточек других
+    /// ассетов («ещё от автора», «похожие», «top free assets») не нажимаются: иначе на
+    /// аккаунт уедет не то, что просили, а подтверждения добавления мы так и не увидим.
+    /// </summary>
     private static async Task<bool> TryClickAddButtonAsync(IPage page)
     {
         return await page.EvaluateFunctionAsync<bool>(@"() => {
@@ -6605,6 +6722,34 @@ internal sealed class UnityAssetAutomationApp
                 const style = window.getComputedStyle(el);
                 const rect = el.getBoundingClientRect();
                 return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+            };
+
+            const idOf = (href) => {
+                const m = (href || '').match(/\/packages\/[^?#]*?-(\d+)\/?(?:[?#]|$)/);
+                return m ? m[1] : null;
+            };
+
+            // Ассет, открытый на странице. Если номер не разобрался, чужие кнопки не отсеиваем.
+            const wanted = idOf(location.pathname);
+
+            const ownerOf = (el) => {
+                let node = el;
+                while (node && node !== document.body) {
+                    const ids = Array.from(new Set(
+                        Array.from(node.querySelectorAll('a[href*=""/packages/""]'))
+                            .map(a => idOf(a.getAttribute('href')))
+                            .filter(Boolean)));
+                    if (ids.length === 1) return ids[0];
+                    if (ids.length > 1) return null;
+                    node = node.parentElement;
+                }
+                return null;
+            };
+
+            const mine = (el) => {
+                if (!wanted) return true;
+                const owner = ownerOf(el);
+                return owner === null || owner === wanted;
             };
 
             const rootSelectors = [
@@ -6626,6 +6771,7 @@ internal sealed class UnityAssetAutomationApp
 
             const collectClickables = (root) => Array.from(root.querySelectorAll('button, a, [role=""button""]'))
                 .filter(visible)
+                .filter(mine)
                 .map(el => ({
                     element: el,
                     text: normalize(el.innerText)
@@ -6650,6 +6796,7 @@ internal sealed class UnityAssetAutomationApp
 
             const fallback = Array.from(document.querySelectorAll('button, a, [role=""button""]'))
                 .filter(visible)
+                .filter(mine)
                 .map(el => ({ element: el, text: normalize(el.innerText) }))
                 .filter(x => !!x.text);
 
