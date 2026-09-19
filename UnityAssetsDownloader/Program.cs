@@ -889,6 +889,7 @@ internal sealed class UnityAssetAutomationApp
             Console.CancelKeyPress -= OnCancelRequested;
             SaveCaches();
             FinalizeProfileName();
+            DisposeTelegramClients();
 
             var problemsPath = Path.Combine(_logsDirectory, CliOptions.ProblemsFileName);
             _logger.Info("============================================================");
@@ -913,10 +914,18 @@ internal sealed class UnityAssetAutomationApp
         var built = "дата сборки неизвестна";
         try
         {
-            var exePath = Environment.ProcessPath;
-            if (!string.IsNullOrWhiteSpace(exePath) && File.Exists(exePath))
+            // Дата самой программы (.dll), а не файла запуска: в Docker запускает `dotnet`,
+            // и 19.09 сервер показывал его дату — «собрано 2026-08-21» у сборки того же дня.
+            // У одного .exe сборка внутри него, Location пустой — тогда берём сам exe.
+            var path = assembly.Location;
+            if (string.IsNullOrWhiteSpace(path))
             {
-                built = $"собрано {File.GetLastWriteTime(exePath):yyyy-MM-dd HH:mm}";
+                path = Environment.ProcessPath;
+            }
+
+            if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+            {
+                built = $"собрано {File.GetLastWriteTime(path):yyyy-MM-dd HH:mm}";
             }
         }
         catch
@@ -1329,72 +1338,71 @@ internal sealed class UnityAssetAutomationApp
                     }
 
                     // Кто качает страницы: обычный запрос или браузер.
-                    HttpClient? tgClient = null;
                     Func<string, Task<string?>>? fetchHtml = null;
                     tgBrowser = mainBrowser;
 
-                    try
+                    if (!viaBrowser)
                     {
-                        if (!viaBrowser)
-                        {
-                            tgClient = CreateTelegramHttpClient(candidate);
-                            fetchHtml = url => FetchTelegramPageAsync(tgClient, url);
-                            _logger.Info(string.IsNullOrWhiteSpace(candidate)
-                                ? "Telegram читаем напрямую, без браузера и без прокси."
-                                : $"Telegram читаем без браузера, через прокси: {candidate}");
-                        }
-                        else if (string.IsNullOrWhiteSpace(candidate))
-                        {
-                            _logger.Info("Telegram открываем браузером напрямую, без прокси.");
-                        }
-                        else
-                        {
-                            // Запуск браузера под прокси иногда не проходит совсем. Это не повод
-                            // бросать чтение каналов: берём следующий прокси из списка.
-                            try
-                            {
-                                ownBrowser = await LaunchTelegramBrowserAsync(candidate);
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.Warn($"Прокси {candidate} пропускаем: браузер для Telegram не запустился ({ex.Message}).");
-                                continue;
-                            }
-
-                            tgBrowser = ownBrowser;
-                            _logger.Info($"Telegram идёт через отдельный прокси: {candidate}");
-                            _logger.Info("Unity при этом работает напрямую, без прокси.");
-                        }
-
-                        foreach (var cursor in pending)
-                        {
-                            cursor.FailedThisRead = false;
-                        }
-
-                        var partial = await RunParserAsync(tgBrowser, pending, wantAssets - wantedFound.Count, fetchHtml);
-                        MergeTelegramResults(result, partial);
-                        foreach (var url in partial.AssetUrls.Where(isWanted))
-                        {
-                            wantedFound.Add(url);
-                        }
-
-                        var failed = pending.Where(c => c.FailedThisRead).ToList();
-                        if (failed.Count < pending.Count && !proxySaved && !string.IsNullOrWhiteSpace(candidate))
-                        {
-                            await RememberProxyAsync(candidate);
-                            proxySaved = true;
-                        }
-
-                        pending = failed;
-
-                        if (pending.Count > 0 && !LooksBlocked(partial))
-                        {
-                            break;
-                        }
+                        // Тот же клиент, что проверял прокси: соединение уже открыто.
+                        var tgClient = TelegramClientFor(candidate);
+                        fetchHtml = url => FetchTelegramPageAsync(tgClient, url);
+                        _logger.Info(string.IsNullOrWhiteSpace(candidate)
+                            ? "Telegram читаем напрямую, без браузера и без прокси."
+                            : $"Telegram читаем без браузера, через прокси: {candidate}");
                     }
-                    finally
+                    else if (string.IsNullOrWhiteSpace(candidate))
                     {
-                        tgClient?.Dispose();
+                        _logger.Info("Telegram открываем браузером напрямую, без прокси.");
+                    }
+                    else
+                    {
+                        // Запуск браузера под прокси иногда не проходит совсем. Это не повод
+                        // бросать чтение каналов: берём следующий прокси из списка.
+                        try
+                        {
+                            ownBrowser = await LaunchTelegramBrowserAsync(candidate);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.Warn($"Прокси {candidate} пропускаем: браузер для Telegram не запустился ({ex.Message}).");
+                            continue;
+                        }
+
+                        tgBrowser = ownBrowser;
+                        _logger.Info($"Telegram идёт через отдельный прокси: {candidate}");
+                        _logger.Info("Unity при этом работает напрямую, без прокси.");
+                    }
+
+                    foreach (var cursor in pending)
+                    {
+                        cursor.FailedThisRead = false;
+                    }
+
+                    var partial = await RunParserAsync(tgBrowser, pending, wantAssets - wantedFound.Count, fetchHtml);
+                    MergeTelegramResults(result, partial);
+                    foreach (var url in partial.AssetUrls.Where(isWanted))
+                    {
+                        wantedFound.Add(url);
+                    }
+
+                    var failed = pending.Where(c => c.FailedThisRead).ToList();
+                    if (failed.Count < pending.Count && !proxySaved && !string.IsNullOrWhiteSpace(candidate))
+                    {
+                        await RememberProxyAsync(candidate);
+                        proxySaved = true;
+                    }
+
+                    // Через этот прокси не открылось ничего — его соединения больше не нужны.
+                    if (!viaBrowser && failed.Count == pending.Count)
+                    {
+                        ForgetTelegramClient(candidate);
+                    }
+
+                    pending = failed;
+
+                    if (pending.Count > 0 && !LooksBlocked(partial))
+                    {
+                        break;
                     }
                 }
             }
@@ -1642,12 +1650,69 @@ internal sealed class UnityAssetAutomationApp
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
 
     /// <summary>
+    /// Клиенты для открытых страниц Telegram, по одному на прокси (пустая строка — напрямую).
+    ///
+    /// Проверка прокси и чтение каналов идут через один и тот же клиент. Через бесплатный
+    /// прокси долго только открывается соединение, а страница по нему приходит мгновенно.
+    /// Проверка его уже открыла — чтение просто продолжает по нему. 19.09 на сервере
+    /// отдельный клиент для чтения выбрасывал живое соединение за 50 мс до того, как оно
+    /// понадобилось, и открывал новое по 12+ секунд.
+    /// </summary>
+    private readonly Dictionary<string, HttpClient> _telegramClients = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Клиент для этого прокси: уже открытый или новый.</summary>
+    private HttpClient TelegramClientFor(string? proxy)
+    {
+        lock (_telegramClients)
+        {
+            var key = proxy ?? string.Empty;
+            if (!_telegramClients.TryGetValue(key, out var client))
+            {
+                _telegramClients[key] = client = CreateTelegramHttpClient(proxy);
+            }
+
+            return client;
+        }
+    }
+
+    /// <summary>Прокси не отвечает — закрываем его клиент вместе с соединениями.</summary>
+    private void ForgetTelegramClient(string? proxy)
+    {
+        lock (_telegramClients)
+        {
+            if (_telegramClients.Remove(proxy ?? string.Empty, out var client))
+            {
+                client.Dispose();
+            }
+        }
+    }
+
+    private void DisposeTelegramClients()
+    {
+        lock (_telegramClients)
+        {
+            foreach (var client in _telegramClients.Values)
+            {
+                client.Dispose();
+            }
+
+            _telegramClients.Clear();
+        }
+    }
+
+    /// <summary>
     /// Клиент для чтения открытых страниц Telegram. Через него идут только они:
     /// Unity ходит напрямую и своим браузером.
     /// </summary>
     private static HttpClient CreateTelegramHttpClient(string? proxy)
     {
-        var handler = new HttpClientHandler { AutomaticDecompression = DecompressionMethods.All };
+        var handler = new SocketsHttpHandler
+        {
+            AutomaticDecompression = DecompressionMethods.All,
+            // Соединение через бесплатный прокси открывается до 30 секунд (замерено 19.09).
+            // Дольше — уже не дождёмся, а висящие попытки не должны копиться.
+            ConnectTimeout = TimeSpan.FromSeconds(30)
+        };
 
         if (string.IsNullOrWhiteSpace(proxy))
         {
@@ -1659,17 +1724,15 @@ internal sealed class UnityAssetAutomationApp
             handler.UseProxy = true;
         }
 
-        // 12 секунд на попытку, попыток три. При подборе прокси обязан ответить за 8,
-        // поэтому дольше ждать смысла нет: лучше быстрее взять следующий прокси.
-        var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(12) };
+        // Сроки ставит каждый запрос сам: проверка прокси — короткий, чтение — длиннее.
+        var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
         client.DefaultRequestHeaders.UserAgent.ParseAdd(TelegramUserAgent);
         client.DefaultRequestHeaders.AcceptLanguage.ParseAdd("ru,en;q=0.9");
         return client;
     }
 
     /// <summary>
-    /// Качает страницу канала. Бесплатный прокси часто срывается на ровном месте,
-    /// поэтому три попытки. Не получилось — null, и канал пробуется другим путём.
+    /// Качает страницу канала. Не получилось — null, и канал пробуется другим путём.
     ///
     /// Отдельно разбираются два ответа Telegram: «слишком часто» (429) и его собственные
     /// ошибки (5xx). Оба лечатся ожиданием, а не сменой прокси, поэтому ждём и повторяем.
@@ -1680,10 +1743,21 @@ internal sealed class UnityAssetAutomationApp
 
         for (var attempt = 1; attempt <= attempts; attempt++)
         {
+            HttpResponseMessage response;
             try
             {
-                using var response = await client.GetAsync(url);
+                response = await GetWithSpareConnectionsAsync(client, url);
+            }
+            catch (Exception ex)
+            {
+                // Несколько соединений за полминуты не открылись — этот прокси сейчас не
+                // работает, повторять через него бесполезно. Пусть пробуется следующий.
+                _logger.Info($"[Telegram] Страница не пришла: {ex.Message}");
+                return null;
+            }
 
+            using (response)
+            {
                 if (response.StatusCode == HttpStatusCode.TooManyRequests ||
                     (int)response.StatusCode >= 500)
                 {
@@ -1707,19 +1781,8 @@ internal sealed class UnityAssetAutomationApp
                     return null;
                 }
 
+                // Страница уже скачана целиком: GetAsync без флагов дочитывает тело сам.
                 return await response.Content.ReadAsStringAsync();
-            }
-            catch (Exception ex)
-            {
-                if (attempt == attempts)
-                {
-                    _logger.Debug($"[Telegram] Страница {url} не скачалась: {ex.Message}");
-                    return null;
-                }
-
-                // Про паузу в логе должно быть видно, иначе она выглядит зависанием.
-                _logger.Info($"[Telegram] Страница не пришла (попытка {attempt} из {attempts}): {ex.GetBaseException().Message}. Пробуем снова...");
-                await Task.Delay(1500);
             }
         }
 
@@ -1727,37 +1790,126 @@ internal sealed class UnityAssetAutomationApp
     }
 
     /// <summary>
+    /// Один запрос страницы, но через несколько соединений наперегонки.
+    ///
+    /// Страница канала весит 20–30 КБ и приходит за доли секунды, а вот соединение через
+    /// бесплатный прокси открывается от 3 до 30 с, каждый раз по-разному (замерено 19.09
+    /// на прокси сервера). Одно соединение с таймаутом то и дело в него упирается.
+    /// Поэтому: ответа нет за 6 с — параллельно открываем второе соединение, потом
+    /// третье, и берём ответ от того, что успело первым. Открытое соединение остаётся
+    /// и служит следующим страницам, так что ожидание оплачивается один раз.
+    /// </summary>
+    private async Task<HttpResponseMessage> GetWithSpareConnectionsAsync(HttpClient client, string url)
+    {
+        const int maxConnections = 3;
+        var spareAfter = TimeSpan.FromSeconds(6);
+        var deadline = TimeSpan.FromSeconds(36);
+
+        using var cts = new CancellationTokenSource(deadline);
+        var running = new List<Task<HttpResponseMessage>> { client.GetAsync(url, cts.Token) };
+        var started = 1;
+        var spareTimer = Task.Delay(spareAfter, cts.Token);
+        Exception? lastError = null;
+
+        try
+        {
+            while (running.Count > 0)
+            {
+                var done = started < maxConnections
+                    ? await Task.WhenAny([.. running, spareTimer])
+                    : await Task.WhenAny(running);
+
+                if (done == spareTimer)
+                {
+                    if (cts.IsCancellationRequested)
+                    {
+                        // Время вышло: запросы отменены тем же сроком и сейчас завершатся.
+                        started = maxConnections;
+                        continue;
+                    }
+
+                    if (started == 1)
+                    {
+                        // Про ожидание в логе должно быть видно, иначе оно выглядит зависанием.
+                        _logger.Info($"[Telegram] Прокси долго открывает соединение — параллельно открываем ещё одно ({url}).");
+                    }
+
+                    running.Add(client.GetAsync(url, cts.Token));
+                    started++;
+                    spareTimer = Task.Delay(spareAfter, cts.Token);
+                    continue;
+                }
+
+                var request = (Task<HttpResponseMessage>)done;
+                running.Remove(request);
+
+                if (request.IsCompletedSuccessfully)
+                {
+                    return request.Result;
+                }
+
+                lastError = request.Exception?.GetBaseException();
+
+                // Соединение сорвалось сразу, а не повисло — следующее открываем, не дожидаясь 6 с.
+                if (started < maxConnections && !cts.IsCancellationRequested)
+                {
+                    running.Add(client.GetAsync(url, cts.Token));
+                    started++;
+                }
+            }
+        }
+        finally
+        {
+            cts.Cancel();
+
+            // Опоздавшие ответы закрываем, чтобы соединения вернулись в общий запас.
+            foreach (var late in running)
+            {
+                _ = late.ContinueWith(t =>
+                {
+                    if (t.IsCompletedSuccessfully)
+                    {
+                        t.Result.Dispose();
+                    }
+                    else
+                    {
+                        _ = t.Exception;
+                    }
+                }, TaskScheduler.Default);
+            }
+        }
+
+        throw lastError is null or OperationCanceledException
+            ? new TimeoutException($"за {deadline.TotalSeconds:0} с не открылось ни одно из {started} соединений")
+            : new HttpRequestException(lastError.Message, lastError);
+    }
+
+    /// <summary>
     /// Проверяет один прокси: открывается ли через него страница канала.
     ///
-    /// Восемь секунд — намеренно немного. Живой прокси отдаёт страницу за одну-две,
-    /// а тот, что думает дольше, будет мучительно медленным и в работе.
+    /// Восемь секунд — намеренно немного: так отсеиваются совсем медленные. Прошедший
+    /// проверку прокси оставляет открытое соединение, по нему и пойдёт чтение каналов.
     /// </summary>
-    private static async Task<bool> TestProxyAsync(string? proxy, string channel)
+    private async Task<bool> TestProxyAsync(string? proxy, string channel)
     {
         try
         {
-            using var handler = new HttpClientHandler();
-
-            if (string.IsNullOrWhiteSpace(proxy))
-            {
-                handler.UseProxy = false;
-            }
-            else
-            {
-                handler.Proxy = new WebProxy(proxy);
-                handler.UseProxy = true;
-            }
-
-            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(8) };
-            var html = await client.GetStringAsync($"https://t.me/s/{channel}");
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            var html = await TelegramClientFor(proxy).GetStringAsync($"https://t.me/s/{channel}", cts.Token);
 
             // Признак того, что страница действительно отдала посты, а не заглушку провайдера.
-            return html.Contains("tgme_widget_message", StringComparison.OrdinalIgnoreCase);
+            if (html.Contains("tgme_widget_message", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
         }
         catch
         {
-            return false;
+            // Не ответил — ниже закрываем.
         }
+
+        ForgetTelegramClient(proxy);
+        return false;
     }
 
     /// <summary>
