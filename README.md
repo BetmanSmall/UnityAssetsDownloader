@@ -591,6 +591,7 @@ cd UnityAssetsDownloader
 | Что | Как |
 |---|---|
 | Логи прогона | `docker compose logs -f` и файлы в `./logs` |
+| Собрать логи для разбора | `./collect-logs.sh` — архив в домашней папке, пароли и токен туда не попадают |
 | Каналы, источники, период, пароль, бот | `./deploy.sh` ещё раз — и согласиться перезапустить службу |
 | Любую настройку без вопросов | Поменять её в `.env` (`SOURCES`, `WATCH_INTERVAL`, `TELEGRAM_CHANNELS`…), затем `docker compose up -d` |
 | Остановить | `docker compose down` |
