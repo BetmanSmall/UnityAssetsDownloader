@@ -104,7 +104,7 @@ if [ -d data ]; then
         [ -d "$dir" ] || continue
         p=$(basename "$dir")
         mkdir -p "$OUT/data/profiles/$p"
-        for f in telegram_state.json owned_assets.txt deprecated_assets.txt rejected_promocodes.txt telegram_proxy.txt; do
+        for f in telegram_state.json owned_assets.txt deprecated_assets.txt rejected_promocodes.txt telegram_proxy.txt catalog/meta.json catalog/INDEX.md; do
             [ -f "$dir$f" ] && cp -p "$dir$f" "$OUT/data/profiles/$p/"
         done
         ls -la "$dir" > "$OUT/data/profiles/$p/listing.txt" 2>&1

@@ -111,6 +111,13 @@ internal sealed class InteractiveMenu
                     Console.WriteLine("Ничего не нажимает и никуда не отправляет.");
                     await RunAsync("проверка страницы входа", [], "--check-login-page", "--headless", "false");
                     break;
+                case "K":
+                    Console.WriteLine();
+                    Console.WriteLine("Каталог всех ассетов аккаунта: для ИИ-агента (INDEX.md и разделы) и для вас (catalog.html).");
+                    Console.WriteLine("Аккаунт не меняется. Первый раз — пара минут, дальше берутся только новые ассеты.");
+                    await RunAsync("каталог ассетов", [], "--build-catalog", "--headless", "false");
+                    OfferToOpenCatalog();
+                    break;
                 case "P":
                     await ChooseProfileAsync();
                     break;
@@ -151,6 +158,7 @@ internal sealed class InteractiveMenu
         Console.WriteLine(" T) Проверить Telegram / задать свой прокси");
         Console.WriteLine(" B) Переключить браузер: своя папка <-> мой обычный Chrome");
         Console.WriteLine(" C) Проверить страницу входа Unity (быстро, ничего не меняет)");
+        Console.WriteLine(" K) Каталог ассетов аккаунта: для ИИ-агента и страница для просмотра");
         Console.WriteLine(" P) Сменить профиль аккаунта (второй аккаунт на этом компьютере)");
         Console.WriteLine(" L) Собрать логи в архив для отправки");
         Console.WriteLine(" 0) Выход");
@@ -280,6 +288,36 @@ internal sealed class InteractiveMenu
         Console.WriteLine();
         Console.WriteLine($"Выбран профиль: {_profile ?? Environment.UserName}");
         Pause();
+    }
+
+    /// <summary>После пункта K: открыть страницу каталога в браузере по умолчанию.</summary>
+    private void OfferToOpenCatalog()
+    {
+        var profiles = Path.Combine(_dataDirectory, "profiles");
+        var page = Directory.Exists(profiles)
+            ? Directory.GetFiles(profiles, "catalog.html", SearchOption.AllDirectories)
+                .OrderByDescending(File.GetLastWriteTimeUtc)
+                .FirstOrDefault()
+            : null;
+        if (page is null)
+        {
+            return;
+        }
+
+        var answer = Ask($"Открыть страницу каталога ({page}) в браузере? [Enter = да, Н = нет]: ")?.Trim().ToUpperInvariant();
+        if (answer is "Н" or "N" or "НЕТ" or "NO")
+        {
+            return;
+        }
+
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(page) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Не открылась сама ({ex.Message}). Откройте файл вручную: {page}");
+        }
     }
 
     /// <summary>Вся папка логов одним архивом — на рабочий стол, чтобы ученику было легко найти.</summary>

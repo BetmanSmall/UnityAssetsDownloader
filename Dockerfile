@@ -25,6 +25,8 @@ COPY --from=build /out/ ./
 # Списки источников. telegram_sources.txt обычно подключается снаружи (см. docker-compose.yml),
 # чтобы каналы можно было менять без пересборки.
 COPY telegram_sources.txt extra_asset_urls.example.txt extended_sources.txt ./
+# Разметка ассетов ИИ для каталога: общая для всех аккаунтов, обновляется через git pull.
+COPY asset_ai_tags.json ./
 # Китайский архив бесплатных ассетов: нужен при SOURCES=all. Берём только список ссылок,
 # html-выгрузки на 3,5 МБ в образе не нужны.
 COPY GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt GreaterChinaUnityAssetArchive/

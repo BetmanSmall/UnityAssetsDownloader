@@ -253,6 +253,14 @@ toggle_chrome() {
     pause
 }
 
+build_catalog() {
+    echo
+    echo "Каталог всех ассетов аккаунта: для ИИ-агента (INDEX.md и разделы) и для вас (catalog.html)."
+    echo "Аккаунт не меняется. Первый раз - пара минут, дальше берутся только новые ассеты."
+    run_app "${COMMON[@]}" "${PROFILE_ARG[@]}" "${CHROME_ARG[@]}" --build-catalog --headless false
+    after_run
+}
+
 check_login() {
     echo
     echo "Проверка страницы входа Unity. Программа откроет её и посмотрит,"
@@ -335,6 +343,7 @@ while true; do
     echo " T) Проверить Telegram / задать свой прокси"
     echo " B) Переключить браузер: своя папка <-> мой обычный Chrome"
     echo " C) Проверить страницу входа Unity (быстро, ничего не меняет)"
+    echo " K) Каталог ассетов аккаунта: для ИИ-агента и страница для просмотра"
     echo " P) Сменить профиль аккаунта (для второго аккаунта на этом компьютере)"
     echo " L) Собрать логи в архив для отправки"
     echo " 0) Выход"
@@ -358,6 +367,7 @@ while true; do
         T) telegram_proxy ;;
         B) toggle_chrome ;;
         C) check_login ;;
+        K) build_catalog ;;
         P) choose_profile ;;
         L) collect_logs ;;
         0) break ;;

@@ -1,0 +1,648 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ассеты Unity</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-2: #f0f2f5;
+    --border: #e2e5ea;
+    --text: #1a1d23;
+    --muted: #5d6573;
+    --faint: #8a93a3;
+    --accent: #2f6fde;
+    --accent-soft: #e6eefc;
+    --good: #1f8a4c;
+    --good-soft: #e3f4ea;
+    --warn: #a76100;
+    --warn-soft: #fbf0dd;
+    --bad: #b3261e;
+    --bad-soft: #fbe6e4;
+    --ai: #7a3fc4;
+    --ai-soft: #f1e9fb;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 1px 3px rgba(16, 24, 40, .08);
+    --radius: 12px;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #111317;
+      --surface: #1a1d23;
+      --surface-2: #22262e;
+      --border: #2e333d;
+      --text: #e8eaee;
+      --muted: #a3abb8;
+      --faint: #767f8e;
+      --accent: #6d9eff;
+      --accent-soft: #1f2d4a;
+      --good: #5cc98a;
+      --good-soft: #17301f;
+      --warn: #e6a54a;
+      --warn-soft: #3a2b12;
+      --bad: #f08a82;
+      --bad-soft: #3d1b19;
+      --ai: #b894f0;
+      --ai-soft: #2c2140;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .4);
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #111317;
+    --surface: #1a1d23;
+    --surface-2: #22262e;
+    --border: #2e333d;
+    --text: #e8eaee;
+    --muted: #a3abb8;
+    --faint: #767f8e;
+    --accent: #6d9eff;
+    --accent-soft: #1f2d4a;
+    --good: #5cc98a;
+    --good-soft: #17301f;
+    --warn: #e6a54a;
+    --warn-soft: #3a2b12;
+    --bad: #f08a82;
+    --bad-soft: #3d1b19;
+    --ai: #b894f0;
+    --ai-soft: #2c2140;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4);
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  a { color: var(--accent); }
+  button, input, select { font: inherit; color: inherit; }
+
+  header.top {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px 16px 8px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 16px;
+  }
+  header.top h1 { font-size: 22px; margin: 0; letter-spacing: -.01em; }
+  header.top .sub { color: var(--muted); font-size: 13px; }
+  header.top .theme {
+    margin-left: auto;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    border-radius: 8px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+
+  .toolbar {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: color-mix(in srgb, var(--bg) 92%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  .toolbar-inner {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 10px 16px;
+    display: grid;
+    gap: 8px;
+  }
+  .search {
+    display: flex;
+    gap: 8px;
+  }
+  .search input {
+    flex: 1;
+    min-width: 0;
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    outline: none;
+  }
+  .search input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .ftoggle {
+    display: none;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    border-radius: 10px;
+    padding: 0 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .ftoggle.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+  .filters select {
+    min-width: 0;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    max-width: 100%;
+    font-size: 13px;
+  }
+  .filters select.on { border-color: var(--accent); background: var(--accent-soft); }
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .status button {
+    border: none;
+    background: none;
+    color: var(--accent);
+    cursor: pointer;
+    padding: 0;
+    font-size: 13px;
+  }
+
+  main {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 16px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 14px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    cursor: pointer;
+    transition: border-color .12s, transform .12s;
+    text-align: left;
+    padding: 0;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card:focus-visible { outline: 3px solid var(--accent-soft); border-color: var(--accent); }
+  .thumb {
+    aspect-ratio: 16 / 9;
+    background: var(--surface-2);
+    position: relative;
+    overflow: hidden;
+  }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb .noimg {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: var(--faint);
+    font-size: 12px;
+  }
+  .thumb .flag {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 6px;
+    background: var(--bad-soft);
+    color: var(--bad);
+  }
+  .body { padding: 10px 12px 12px; display: grid; gap: 6px; flex: 1; align-content: start; }
+  .name {
+    font-weight: 600;
+    font-size: 15px;
+    line-height: 1.3;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .meta { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .summary {
+    color: var(--muted);
+    font-size: 13px;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .chip {
+    font-size: 11px;
+    line-height: 1;
+    padding: 4px 6px;
+    border-radius: 6px;
+    background: var(--surface-2);
+    color: var(--muted);
+    border: none;
+    white-space: nowrap;
+  }
+  .chip.rp { background: var(--accent-soft); color: var(--accent); }
+  .chip.style { background: var(--warn-soft); color: var(--warn); }
+  .chip.ai { background: var(--ai-soft); color: var(--ai); }
+  .chip.good { background: var(--good-soft); color: var(--good); }
+  .chip.bad { background: var(--bad-soft); color: var(--bad); }
+  button.chip { cursor: pointer; }
+  button.chip:hover { outline: 1px solid currentColor; }
+  .foot {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: auto;
+    padding-top: 4px;
+    font-size: 12px;
+    color: var(--faint);
+  }
+  .more { text-align: center; color: var(--faint); padding: 24px 0 8px; font-size: 13px; }
+  .empty { text-align: center; padding: 60px 16px; color: var(--muted); }
+
+  dialog {
+    border: none;
+    padding: 0;
+    border-radius: 16px;
+    width: min(760px, calc(100vw - 24px));
+    max-height: calc(100vh - 24px);
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: 0 20px 50px rgba(0, 0, 0, .3);
+  }
+  dialog::backdrop { background: rgba(10, 12, 16, .55); }
+  .dlg-img { aspect-ratio: 16 / 9; background: var(--surface-2); }
+  .dlg-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .dlg-body { padding: 16px 18px 18px; display: grid; gap: 12px; }
+  .dlg-body h2 { margin: 0; font-size: 20px; line-height: 1.25; }
+  .facts {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 8px 16px;
+    font-size: 13px;
+  }
+  .facts div span { display: block; color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .aibox {
+    background: var(--ai-soft);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 14px;
+    display: grid;
+    gap: 6px;
+  }
+  .aibox b { color: var(--ai); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .desc { color: var(--muted); font-size: 14px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .btn {
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    border-radius: 8px;
+    padding: 7px 12px;
+    cursor: pointer;
+    text-decoration: none;
+    color: var(--text);
+    font-size: 14px;
+  }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .close {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(0, 0, 0, .55);
+    color: #fff;
+    font-size: 18px;
+    cursor: pointer;
+  }
+
+  @media (max-width: 700px) {
+    .ftoggle { display: block; }
+    .filters { display: none; }
+    .toolbar.open .filters { display: flex; }
+  }
+  @media (max-width: 600px) {
+    header.top h1 { font-size: 19px; }
+    .grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+    .summary { -webkit-line-clamp: 2; }
+    .filters select { flex: 1 1 calc(50% - 6px); }
+  }
+  @media (max-width: 380px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1 id="title">Ассеты Unity</h1>
+  <span class="sub" id="sub"></span>
+  <button class="theme" id="theme" type="button" title="Тема">◐ Тема</button>
+</header>
+
+<div class="toolbar">
+  <div class="toolbar-inner">
+    <div class="search">
+      <input id="q" type="search" placeholder="Поиск: название, теги, издатель, суть… (несколько слов — все сразу)" autocomplete="off">
+      <button class="ftoggle" id="ftoggle" type="button" aria-expanded="false">Фильтры</button>
+    </div>
+    <div class="filters">
+      <select id="f-root" aria-label="Раздел"></select>
+      <select id="f-sub" aria-label="Подраздел"></select>
+      <select id="f-rp" aria-label="Конвейер">
+        <option value="">Любой конвейер</option>
+        <option value="urp">URP</option>
+        <option value="hdrp">HDRP</option>
+        <option value="builtin">Built-in</option>
+      </select>
+      <select id="f-mark" aria-label="Стиль и тема"></select>
+      <select id="f-how" aria-label="Как получен">
+        <option value="">Как получен: любой</option>
+        <option value="added">Добавлен программой</option>
+        <option value="promo">По промокоду</option>
+        <option value="before">Был раньше</option>
+      </select>
+      <select id="f-state" aria-label="Состояние">
+        <option value="">В продаже и снятые</option>
+        <option value="published">Только в продаже</option>
+        <option value="gone">Только снятые с продажи</option>
+        <option value="ai">С разметкой ИИ</option>
+        <option value="noai">Без разметки ИИ</option>
+      </select>
+      <select id="f-sort" aria-label="Сортировка">
+        <option value="rank">Сначала полученные недавно</option>
+        <option value="name">По названию</option>
+        <option value="updated">Недавно обновлённые</option>
+        <option value="rating">По оценкам</option>
+        <option value="size-desc">Сначала большие</option>
+        <option value="size-asc">Сначала маленькие</option>
+      </select>
+    </div>
+    <div class="status">
+      <span id="count"></span>
+      <button id="reset" type="button" hidden>Сбросить фильтры</button>
+    </div>
+  </div>
+</div>
+
+<main>
+  <div class="grid" id="grid"></div>
+  <div class="more" id="more"></div>
+</main>
+
+<dialog id="dlg"></dialog>
+
+<script id="catalog-data" type="application/json">/*CATALOG_DATA*/</script>
+<script>
+(() => {
+  const DATA = JSON.parse(document.getElementById('catalog-data').textContent);
+  const ITEMS = DATA.items || [];
+  const PAGE = 60;
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch { /* приватный режим */ } }
+  };
+
+  // ---- Тема ----
+  const applyTheme = (t) => { if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme; };
+  applyTheme(store.get('uad-theme'));
+  $('theme').addEventListener('click', () => {
+    const dark = document.documentElement.dataset.theme
+      ? document.documentElement.dataset.theme === 'dark'
+      : matchMedia('(prefers-color-scheme: dark)').matches;
+    const next = dark ? 'light' : 'dark';
+    applyTheme(next);
+    store.set('uad-theme', next);
+  });
+
+  // ---- Шапка ----
+  const RP = { builtin: 'Built-in', urp: 'URP', hdrp: 'HDRP', custom: 'Custom' };
+  const ROOTS = { '3d': '3D', '2d': '2D', tools: 'Инструменты', vfx: 'VFX', audio: 'Звук', templates: 'Шаблоны', essentials: 'Основы', 'add-ons': 'Дополнения' };
+  if (DATA.title) { $('title').textContent = 'Ассеты Unity — ' + DATA.title; document.title = 'Ассеты — ' + DATA.title; }
+  const available = ITEMS.filter((x) => !x.st).length;
+  $('sub').textContent = `${ITEMS.length.toLocaleString('ru-RU')} ассетов · в продаже ${available.toLocaleString('ru-RU')}` +
+    (DATA.synced ? ` · список сверен ${DATA.synced} UTC` : '') +
+    (DATA.written ? ` · собрано ${DATA.written} UTC` : '');
+
+  // ---- Поисковый текст и справочники фильтров ----
+  for (const x of ITEMS) {
+    x._q = [x.n, x.p, x.c, x.i, (x.t || []).join(' '), (x.m || []).join(' '), x.d,
+      x.ai ? [x.ai.sum, (x.ai.tags || []).join(' '), (x.ai.use || []).join(' '), x.ai.note].join(' ') : '']
+      .join(' ').toLowerCase();
+    const parts = (x.c || 'other').split('/');
+    x._root = parts[0];
+    x._sub = parts.slice(0, 2).join('/');
+  }
+
+  const countBy = (fn) => {
+    const m = new Map();
+    for (const x of ITEMS) for (const k of [].concat(fn(x) || [])) m.set(k, (m.get(k) || 0) + 1);
+    return [...m.entries()].sort((a, b) => b[1] - a[1]);
+  };
+  const option = (value, label) => `<option value="${esc(value)}">${esc(label)}</option>`;
+
+  $('f-root').innerHTML = option('', 'Все разделы') +
+    countBy((x) => x._root).map(([k, n]) => option(k, `${ROOTS[k] || k} (${n})`)).join('');
+  const fillSubs = () => {
+    const root = $('f-root').value;
+    const subs = countBy((x) => (!root || x._root === root) && x._sub.includes('/') ? x._sub : null);
+    $('f-sub').innerHTML = option('', 'Все подразделы') + subs.map(([k, n]) => option(k, `${k.split('/')[1]} (${n})`)).join('');
+    $('f-sub').disabled = subs.length === 0;
+  };
+  fillSubs();
+  const MARK_LABEL = (m) => m.replace(/^style:/, 'стиль: ').replace(/^theme:/, 'тема: ').replace(/^platform:/, 'платформа: ').replace(/^kind:/, 'тип: ');
+  const markGroups = countBy((x) => (x.m || []).filter((m) => /^(style|theme|platform|kind):/.test(m)).concat((x.m || []).filter((m) => ['lite', 'old', 'ai-made'].includes(m))));
+  const MISC = { lite: 'урезанная бесплатная версия', old: 'только Unity до 2021', 'ai-made': 'контент от ИИ (по словам издателя)' };
+  $('f-mark').innerHTML = option('', 'Стиль, тема, тип…') +
+    ['kind:', 'style:', 'theme:', 'platform:', ''].map((prefix) =>
+      markGroups.filter(([m]) => prefix ? m.startsWith(prefix) : !m.includes(':'))
+        .map(([m, n]) => option(m, `${MISC[m] || MARK_LABEL(m)} (${n})`)).join('')).join('');
+
+  // ---- Состояние фильтров ----
+  const ids = ['q', 'f-root', 'f-sub', 'f-rp', 'f-mark', 'f-how', 'f-state', 'f-sort'];
+  let saved = {};
+  try { saved = JSON.parse(store.get('uad-filters') || '{}'); } catch { saved = {}; }
+  const restore = (id) => {
+    if (saved[id] == null) return;
+    $(id).value = saved[id];
+    if ($(id).value !== saved[id]) $(id).value = '';
+  };
+  for (const id of ids) if (id !== 'f-sub') restore(id);
+  // Подразделы зависят от раздела: сначала раздел, потом список подразделов, потом выбор.
+  fillSubs();
+  restore('f-sub');
+
+  const SORTS = {
+    rank: (a, b) => (a.k ?? 1e9) - (b.k ?? 1e9),
+    name: (a, b) => a.n.localeCompare(b.n, 'ru'),
+    updated: (a, b) => (b.up || '').localeCompare(a.up || ''),
+    rating: (a, b) => ((b.rc || 0) >= 3 ? b.r || 0 : 0) - ((a.rc || 0) >= 3 ? a.r || 0 : 0) || (b.rc || 0) - (a.rc || 0),
+    'size-desc': (a, b) => (b.s || 0) - (a.s || 0),
+    'size-asc': (a, b) => (a.s ?? 1e15) - (b.s ?? 1e15)
+  };
+
+  let list = [];
+  let shown = 0;
+
+  const apply = () => {
+    const words = $('q').value.toLowerCase().split(/\s+/).filter(Boolean);
+    const root = $('f-root').value, sub = $('f-sub').value, rp = $('f-rp').value,
+      mark = $('f-mark').value, how = $('f-how').value, state = $('f-state').value;
+    list = ITEMS.filter((x) =>
+      (!root || x._root === root) &&
+      (!sub || x._sub === sub) &&
+      (!rp || (x.rp || []).includes(rp)) &&
+      (!mark || (x.m || []).includes(mark)) &&
+      (!how || (how === 'added' ? !!x.h : how === 'promo' ? x.h === 'promo' : !x.h)) &&
+      (!state || (state === 'published' ? !x.st : state === 'gone' ? !!x.st : state === 'ai' ? !!x.ai : !x.ai)) &&
+      words.every((w) => x._q.includes(w)));
+    list.sort(SORTS[$('f-sort').value] || SORTS.rank);
+
+    const values = {};
+    for (const id of ids) values[id] = $(id).value;
+    store.set('uad-filters', JSON.stringify(values));
+    for (const id of ids.slice(1, -1)) $(id).classList.toggle('on', !!$(id).value);
+    const active = ids.slice(1, -1).filter((id) => $(id).value).length;
+    $('ftoggle').textContent = active ? `Фильтры · ${active}` : 'Фильтры';
+    $('ftoggle').classList.toggle('on', active > 0);
+    const filtered = ids.slice(0, -1).some((id) => $(id).value);
+    $('reset').hidden = !filtered;
+    $('count').textContent = filtered
+      ? `Найдено ${list.length.toLocaleString('ru-RU')} из ${ITEMS.length.toLocaleString('ru-RU')}`
+      : `Всего ${ITEMS.length.toLocaleString('ru-RU')}`;
+
+    $('grid').innerHTML = '';
+    shown = 0;
+    more();
+  };
+
+  // ---- Карточки ----
+  const size = (b) => b == null ? '' : b >= 1073741824 ? (b / 1073741824).toFixed(1) + ' ГБ' : b >= 1048576 ? Math.round(b / 1048576) + ' МБ' : Math.max(1, Math.round(b / 1024)) + ' КБ';
+  const stateLabel = (x) => x.st === 'missing' ? 'удалён из магазина' : 'снят с продажи';
+  const styleMarks = (x) => (x.m || []).filter((m) => /^(style|theme):/.test(m));
+
+  const card = (x) => {
+    const rp = (x.rp || []).filter((r) => r !== 'custom').map((r) => `<span class="chip rp">${RP[r]}</span>`).join('');
+    const marks = styleMarks(x).slice(0, 3).map((m) => `<span class="chip style">${esc(m.split(':')[1])}</span>`).join('');
+    const got = x.h ? `<span class="chip good">${x.h === 'promo' ? 'промокод' : 'добавлен'}${x.a ? ' ' + x.a.slice(5).split('-').reverse().join('.') : ''}</span>` : '';
+    const ai = x.ai ? '<span class="chip ai">ИИ</span>' : '';
+    return `<button class="card" type="button" data-i="${esc(x.i)}">
+      <div class="thumb">${x.im ? `<img loading="lazy" decoding="async" src="${esc(x.im)}" alt="">` : '<div class="noimg">нет картинки</div>'}
+        ${x.st ? `<span class="flag">${stateLabel(x)}</span>` : ''}</div>
+      <div class="body">
+        <div class="name">${esc(x.n)}</div>
+        <div class="meta">${esc(x.p || '')}${x.c ? ' · ' + esc(x.c) : ''}</div>
+        <div class="chips">${rp}${x.uv ? `<span class="chip">Unity ${esc(x.uv)}+</span>` : ''}${x.s ? `<span class="chip">${size(x.s)}</span>` : ''}${marks}${got}${ai}</div>
+        <div class="summary">${esc(x.ai?.sum || x.d || '')}</div>
+        <div class="foot"><span>${x.rc && x.r ? `★ ${x.r} (${x.rc})` : 'без оценок'}</span><span>#${esc(x.i)}</span></div>
+      </div>
+    </button>`;
+  };
+
+  const more = () => {
+    const next = list.slice(shown, shown + PAGE);
+    $('grid').insertAdjacentHTML('beforeend', next.map(card).join(''));
+    shown += next.length;
+    $('more').innerHTML = list.length === 0
+      ? '<div class="empty">Ничего не нашлось. Попробуйте другое слово или сбросьте фильтры.</div>'
+      : shown < list.length ? `Показано ${shown} из ${list.length} — листайте дальше` : '';
+  };
+
+  new IntersectionObserver((entries) => {
+    if (entries.some((e) => e.isIntersecting) && shown < list.length) more();
+  }, { rootMargin: '800px' }).observe($('more'));
+
+  // ---- Подробная карточка ----
+  const fact = (label, value) => value ? `<div><span>${label}</span>${value}</div>` : '';
+  const open = (x) => {
+    const chips = (arr, cls, clickable) => (arr || []).map((t) => clickable
+      ? `<button type="button" class="chip ${cls}" data-q="${esc(t)}">${esc(t)}</button>`
+      : `<span class="chip ${cls}">${esc(t)}</span>`).join('');
+    $('dlg').innerHTML = `
+      <div style="position:relative">
+        <div class="dlg-img">${x.ib || x.im ? `<img src="${esc(x.ib || x.im)}" alt="">` : ''}</div>
+        <button class="close" type="button" aria-label="Закрыть" data-close>✕</button>
+      </div>
+      <div class="dlg-body">
+        <h2>${esc(x.n)}</h2>
+        <div class="chips">${x.st ? `<span class="chip bad">${stateLabel(x)}</span>` : ''}${chips(x.m, 'style', true)}</div>
+        <div class="facts">
+          ${fact('Издатель', esc(x.p))}
+          ${fact('Раздел', esc(x.c))}
+          ${fact('Конвейеры', (x.rp || []).map((r) => RP[r] || r).join(', ') || 'не указаны')}
+          ${fact('Unity', x.uv ? esc(x.uv + (x.ux && x.ux !== x.uv ? ' … ' + x.ux : '')) : '')}
+          ${fact('Версия', esc(x.v ? x.v + (x.up ? ', ' + x.up : '') : ''))}
+          ${fact('Размер', size(x.s) + (x.f ? ` · ${x.f} файлов` : ''))}
+          ${fact('Оценка', x.rc && x.r ? `★ ${x.r} (${x.rc})` : '')}
+          ${fact('Получен', x.h ? `${x.h === 'promo' ? 'по промокоду ' + esc(x.pc || '') : 'программой, бесплатно'}${x.a ? ', ' + x.a : ''}` : 'был на аккаунте раньше')}
+          ${fact('Цена сейчас', x.pr ? esc(x.pr) : '')}
+        </div>
+        ${x.ai ? `<div class="aibox"><b>Разметка ИИ</b><div>${esc(x.ai.sum || '')}</div>
+          ${(x.ai.use || []).length ? `<div class="chips">${chips(x.ai.use, 'ai', true)}</div>` : ''}
+          ${x.ai.note ? `<div>⚠ ${esc(x.ai.note)}</div>` : ''}</div>` : ''}
+        ${x.d ? `<div>${esc(x.d)}</div>` : ''}
+        ${x.x && x.x !== x.d ? `<div class="desc">${esc(x.x)}</div>` : ''}
+        ${(x.t || []).length ? `<div class="chips">${chips(x.t, '', true)}</div>` : ''}
+        <div class="actions">
+          <a class="btn primary" href="${esc(x.u)}" target="_blank" rel="noopener">Открыть в магазине</a>
+          <button class="btn" type="button" data-copy="${esc(x.i)}">Скопировать номер #${esc(x.i)}</button>
+        </div>
+      </div>`;
+    $('dlg').showModal();
+  };
+
+  $('grid').addEventListener('click', (e) => {
+    const el = e.target.closest('.card');
+    if (!el) return;
+    const x = ITEMS.find((i) => i.i === el.dataset.i);
+    if (x) open(x);
+  });
+  $('dlg').addEventListener('click', async (e) => {
+    if (e.target === $('dlg') || e.target.closest('[data-close]')) { $('dlg').close(); return; }
+    const q = e.target.closest('[data-q]');
+    if (q) { $('q').value = q.dataset.q; $('dlg').close(); apply(); window.scrollTo({ top: 0 }); return; }
+    const c = e.target.closest('[data-copy]');
+    if (c) {
+      try { await navigator.clipboard.writeText(c.dataset.copy); c.textContent = 'Скопировано'; }
+      catch { c.textContent = '#' + c.dataset.copy; }
+    }
+  });
+
+  $('ftoggle').addEventListener('click', () => {
+    const open = document.querySelector('.toolbar').classList.toggle('open');
+    $('ftoggle').setAttribute('aria-expanded', String(open));
+  });
+
+  let timer;
+  $('q').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(apply, 150); });
+  $('f-root').addEventListener('change', () => { fillSubs(); apply(); });
+  for (const id of ids.slice(2)) $(id).addEventListener('change', apply);
+  $('reset').addEventListener('click', () => {
+    for (const id of ids.slice(0, -1)) $(id).value = '';
+    fillSubs();
+    apply();
+  });
+
+  apply();
+})();
+</script>
+</body>
+</html>

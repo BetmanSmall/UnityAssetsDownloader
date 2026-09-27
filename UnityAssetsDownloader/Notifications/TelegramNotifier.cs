@@ -21,9 +21,10 @@ internal sealed class TelegramNotifier
 {
     /// <summary>
     /// Адрес Bot API. Переменной TELEGRAM_API_BASE его можно заменить — на зеркало
-    /// Bot API или на макет в стенде (например, http://127.0.0.1:8081).
+    /// Bot API или на макет в стенде (например, http://127.0.0.1:8081). Читается при каждом
+    /// вызове: у сценариев стенда в одном процессе макеты на разных портах.
     /// </summary>
-    private static readonly string ApiBase =
+    private static string ApiBase =>
         (Environment.GetEnvironmentVariable("TELEGRAM_API_BASE") is { Length: > 0 } custom
             ? custom.Trim().TrimEnd('/')
             : "https://api.telegram.org") + "/bot";
@@ -102,6 +103,54 @@ internal sealed class TelegramNotifier
         catch (Exception ex)
         {
             _logger.Warn($"[Бот] Не удалось отправить сообщение: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Отправляет файл (например, страницу каталога). Ошибки не пробрасывает, как и SendAsync.
+    /// Bot API принимает файлы до 50 МБ; на медленном пути отправка дольше, поэтому таймаут больше.
+    /// </summary>
+    public async Task<bool> SendDocumentAsync(string path, string caption)
+    {
+        if (!Enabled || !File.Exists(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            var chat = await ResolveChatIdAsync();
+            if (chat is null)
+            {
+                return false;
+            }
+
+            var bytes = await File.ReadAllBytesAsync(path);
+            var fileName = Path.GetFileName(path);
+            var sent = await CallAsync("sendDocument", () =>
+            {
+                var form = new MultipartFormDataContent
+                {
+                    { new StringContent(chat), "chat_id" },
+                    { new StringContent(caption.Length > 1000 ? caption[..1000] + "…" : caption), "caption" }
+                };
+                var file = new ByteArrayContent(bytes);
+                file.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/html");
+                form.Add(file, "document", fileName);
+                return form;
+            }, TimeSpan.FromSeconds(120)) is not null;
+
+            if (sent)
+            {
+                _logger.Info($"[Бот] Файл отправлен: {fileName} ({bytes.Length / 1024} КБ)");
+            }
+
+            return sent;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[Бот] Не удалось отправить файл: {ex.Message}");
             return false;
         }
     }
@@ -246,7 +295,11 @@ internal sealed class TelegramNotifier
     /// по другому пути безопасен и сообщение не удвоится. Если Telegram ответил
     /// отказом (неверный токен, нет чата), перебор прекращается: путь тут не при чём.
     /// </summary>
-    private async Task<JsonElement?> CallAsync(string method, Dictionary<string, object> payload, TimeSpan? timeout = null)
+    private Task<JsonElement?> CallAsync(string method, Dictionary<string, object> payload, TimeSpan? timeout = null) =>
+        CallAsync(method, () => JsonContent.Create(payload), timeout);
+
+    /// <param name="content">Тело запроса. Фабрика — потому что на каждом пути нужно новое: отправленное не переиспользуется.</param>
+    private async Task<JsonElement?> CallAsync(string method, Func<HttpContent> content, TimeSpan? timeout = null)
     {
         var routes = BuildRoutes();
         Exception? lastError = null;
@@ -257,7 +310,8 @@ internal sealed class TelegramNotifier
             try
             {
                 using var client = CreateClient(route, timeout ?? TimeSpan.FromSeconds(20));
-                using var response = await client.PostAsJsonAsync($"{ApiBase}{_token}/{method}", payload);
+                using var body = content();
+                using var response = await client.PostAsync($"{ApiBase}{_token}/{method}", body);
                 var json = await response.Content.ReadAsStringAsync();
                 using var doc = JsonDocument.Parse(json);
                 var root = doc.RootElement;

@@ -5,7 +5,7 @@
         <TargetFramework>net8.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
-        <Version>1.26.0</Version>
+        <Version>1.27.0</Version>
     </PropertyGroup>
 
     <!-- Дописывает к версии короткий номер коммита, чтобы в логе было видно,
@@ -25,6 +25,11 @@
 
     <ItemGroup>
         <PackageReference Include="PuppeteerSharp" Version="20.2.4"/>
+    </ItemGroup>
+
+    <!-- Шаблон страницы каталога: вшит в сборку, чтобы и один .exe для класса умел её собирать. -->
+    <ItemGroup>
+        <EmbeddedResource Include="Catalog\catalog-template.html" LogicalName="catalog-template.html"/>
     </ItemGroup>
 
 </Project>

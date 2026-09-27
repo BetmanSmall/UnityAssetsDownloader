@@ -41,7 +41,7 @@ dotnet publish "$PROJECT" -c Release -r "$RID" --self-contained true \
 mkdir -p "$OUT/GreaterChinaUnityAssetArchive"
 cp "$BUILD"/UnityAssetsDownloader* "$OUT/"
 # Списки ссылок программа ищет рядом с собой.
-cp telegram_sources.txt extended_sources.txt extra_asset_urls.example.txt "$OUT/"
+cp telegram_sources.txt extended_sources.txt extra_asset_urls.example.txt asset_ai_tags.json "$OUT/"
 cp GreaterChinaUnityAssetArchive/free_list_GreaterChinaUnityAssetArchiveLinks.txt "$OUT/GreaterChinaUnityAssetArchive/"
 
 # Инструкция — с переносами Windows, чтобы Блокнот показал её нормально.
@@ -70,6 +70,10 @@ UnityAssetsDownloader $VERSION — бесплатные ассеты Unity на 
 Используется установленный Google Chrome, если его нет — Microsoft Edge.
 Если нет ни того, ни другого, при первом запуске скачается свой (~150 МБ).
 Ваш обычный браузер программа не трогает.
+
+КАТАЛОГ АССЕТОВ
+Пункт K — список всех ассетов вашего аккаунта: страница catalog.html с картинками,
+поиском и фильтрами. Лежит в %LOCALAPPDATA%\\UnityAssetsDownloader\\data\\profiles\\...\\catalog
 
 ЧТО-ТО ПОШЛО НЕ ТАК
 Пункт L в меню — логи одним архивом на рабочий стол. Пришлите этот архив.

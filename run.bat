@@ -60,6 +60,7 @@ echo  9^) Диагностика: Telegram + максимум логов (--trac
 echo  T^) Проверить Telegram / задать свой прокси
 echo  B^) Переключить браузер: своя папка ^<-^> мой обычный Chrome
 echo  C^) Проверить страницу входа Unity (быстро, ничего не меняет^)
+echo  K^) Каталог ассетов аккаунта: для ИИ-агента и страница для просмотра
 echo  P^) Сменить профиль аккаунта (для второго аккаунта на этом компьютере^)
 echo  L^) Собрать логи в архив для отправки
 echo  0^) Выход
@@ -80,6 +81,7 @@ if /i "%opt%"=="9" goto run_diag
 if /i "%opt%"=="T" goto telegram_proxy
 if /i "%opt%"=="B" goto toggle_chrome
 if /i "%opt%"=="C" goto check_login
+if /i "%opt%"=="K" goto build_catalog
 if /i "%opt%"=="P" goto choose_profile
 if /i "%opt%"=="L" goto collect_logs
 if /i "%opt%"=="0" goto end
@@ -232,6 +234,13 @@ if defined CHROME_ARG (
 echo.
 pause
 goto menu
+
+:build_catalog
+echo.
+echo Каталог всех ассетов аккаунта: для ИИ-агента (INDEX.md и разделы^) и для вас (catalog.html^).
+echo Аккаунт не меняется. Первый раз - пара минут, дальше берутся только новые ассеты.
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --build-catalog --headless false
+goto after_run
 
 :check_login
 echo.

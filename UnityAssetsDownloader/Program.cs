@@ -198,6 +198,10 @@ async Task SendDigestIfDueAsync(CliOptions cycleOptions, UnityAssetAutomationApp
         Console.WriteLine($"[Сервер] Сводка боту:{Environment.NewLine}{text}");
         await app.NotifyAsync(text);
         digest.Reset(now);
+        if (cycleOptions.BotCatalog)
+        {
+            await app.SendCatalogIfChangedAsync();
+        }
     }
 
     digest.Save(path);
@@ -384,6 +388,12 @@ internal sealed class UnityAssetAutomationApp
             else if (!string.IsNullOrWhiteSpace(migrationMessage))
             {
                 _logger.Warn(migrationMessage);
+            }
+
+            if (_options.RenderCatalog)
+            {
+                RenderCatalogOnly();
+                return;
             }
 
             ApplySavePasswordPolicy();
@@ -655,6 +665,12 @@ internal sealed class UnityAssetAutomationApp
                 return;
             }
 
+            if (_options.BuildCatalog)
+            {
+                await BuildCatalogAsync(page, EnsureLoggedInAsync);
+                return;
+            }
+
             var sources = ResolveSources();
             var assetUrls = await CollectAssetUrlsAsync(page, sources);
             var assetPromocodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -669,6 +685,10 @@ internal sealed class UnityAssetAutomationApp
             var rejectedPromoCache = new OwnedAssetsCache(
                 profileDirectory, "rejected_promocodes.txt",
                 "Промокоды, которые магазин уже не принял: адрес ассета и код через пробел.");
+
+            // Каталог библиотеки: всё, что уже есть на аккаунте, по номерам. Точнее памяти профиля —
+            // там только то, что эта программа сама проверяла.
+            var catalog = AssetCatalog.Load(profileDirectory);
 
             _ownedCache = ownedCache;
             _deprecatedCache = deprecatedCache;
@@ -700,6 +720,18 @@ internal sealed class UnityAssetAutomationApp
                         Url = url,
                         Status = AssetProcessStatus.AlreadyOwned,
                         Message = "Уже был на аккаунте (известно с прошлых запусков, страница не открывалась)."
+                    });
+                    return true;
+                }
+
+                if (catalog.ContainsUrl(url))
+                {
+                    skippedKnown++;
+                    report.Items.Add(new ProcessResult
+                    {
+                        Url = url,
+                        Status = AssetProcessStatus.AlreadyOwned,
+                        Message = "Уже в библиотеке аккаунта (по каталогу, страница не открывалась)."
                     });
                     return true;
                 }
@@ -777,11 +809,13 @@ internal sealed class UnityAssetAutomationApp
                 ? $"Найдено уникальных ассетов: {assetUrls.Distinct(StringComparer.OrdinalIgnoreCase).Count()}"
                 : $"Найдено уникальных ассетов в списках: {assetUrls.Distinct(StringComparer.OrdinalIgnoreCase).Count()}, из Telegram — пачками дальше.");
 
-            if (!_options.RecheckOwned && (ownedCache.Count > 0 || deprecatedCache.Count > 0))
+            if (!_options.RecheckOwned && (ownedCache.Count > 0 || deprecatedCache.Count > 0 || catalog.Count > 0))
             {
                 _logger.Info(
                     $"В памяти профиля: {ownedCache.Count} уже добавленных ассетов, " +
-                    $"{deprecatedCache.Count} удалённых из магазина. Их страницы открывать не будем.");
+                    $"{deprecatedCache.Count} удалённых из магазина" +
+                    (catalog.Count > 0 ? $", в каталоге библиотеки {catalog.Count}" : string.Empty) +
+                    ". Их страницы открывать не будем.");
             }
 
             var newlyAddedCount = 0;
@@ -819,7 +853,7 @@ internal sealed class UnityAssetAutomationApp
                     _logger.Info($"==== Telegram: собираем пачку №{batchNo + 1} (нужно ещё {need} новых ассетов) ====");
                     var tg = await ParseTelegramChannelsAsync(
                         browser, telegramCursors!, need,
-                        url => !seen.Contains(url) && (_options.RecheckOwned || (!ownedCache.Contains(url) && !deprecatedCache.Contains(url))),
+                        url => !seen.Contains(url) && (_options.RecheckOwned || (!ownedCache.Contains(url) && !deprecatedCache.Contains(url) && !catalog.ContainsUrl(url))),
                         maxPostsPerChannel: int.MaxValue, maxPagesPerChannel: int.MaxValue);
 
                     await ReportTelegramResultAsync(tg, assetPromocodes);
@@ -999,6 +1033,7 @@ internal sealed class UnityAssetAutomationApp
             }
 
             SaveCaches();
+            await UpdateCatalogAfterRunAsync(page, catalog, report, EnsureLoggedInAsync);
 
             if (skippedKnown + skippedDeprecated > 0)
             {
@@ -2383,6 +2418,193 @@ internal sealed class UnityAssetAutomationApp
         if (_notifier is { Enabled: true })
         {
             await _notifier.SendAsync(text);
+        }
+    }
+
+    private string CatalogProfileDirectory => _profileStore.GetProfileDirectory(_profileName);
+
+    /// <summary>--render-catalog: пересобрать файлы каталога из сохранённого (после разметки ИИ). Без браузера.</summary>
+    private void RenderCatalogOnly()
+    {
+        var catalog = AssetCatalog.Load(CatalogProfileDirectory);
+        if (catalog.Count == 0)
+        {
+            _logger.Warn($"[Каталог] Каталога ещё нет: {catalog.Directory}. Сначала --build-catalog (пункт K в меню).");
+            Environment.ExitCode = 2;
+            return;
+        }
+
+        WriteCatalog(catalog);
+    }
+
+    /// <summary>
+    /// --build-catalog: список «My Assets» всего аккаунта → данные каждого ассета из магазина →
+    /// файлы для ИИ-агента и страница для человека. Аккаунт не меняется. Повторный запуск берёт
+    /// из магазина только новые ассеты и те, чьи данные старше месяца.
+    /// </summary>
+    private async Task BuildCatalogAsync(IPage page, Func<Task<bool>> ensureLoggedIn)
+    {
+        var started = Stopwatch.StartNew();
+        var catalog = AssetCatalog.Load(CatalogProfileDirectory);
+        _logger.Info($"[Каталог] Собираем каталог библиотеки аккаунта. Сейчас в нём: {catalog.Count}. Аккаунт не меняется.");
+        if (!await ensureLoggedIn())
+        {
+            return;
+        }
+
+        if (!await SyncLibraryAsync(page, catalog, _options.CatalogRefreshAll))
+        {
+            Environment.ExitCode = 2;
+            return;
+        }
+
+        WriteCatalog(catalog);
+        _logger.Info("============================================================");
+        _logger.Info($" ГОТОВО. Каталог: {catalog.Count} ассетов за {started.Elapsed.TotalSeconds:0} с.");
+        _logger.Info($" Для ИИ-агента:  {catalog.IndexPath}");
+        _logger.Info($" Для человека:   {catalog.HtmlPath}");
+        _logger.Info(" Разметка ИИ: в чате Claude Code «разметь ассеты», затем --render-catalog.");
+        _logger.Info("============================================================");
+    }
+
+    /// <summary>
+    /// После прогона: добавленные ассеты — в каталог (с тем, как и когда получены), и раз в
+    /// CATALOG_REFRESH — сверка со списком «My Assets». Ошибка каталога прогон не портит.
+    /// </summary>
+    private async Task UpdateCatalogAfterRunAsync(IPage page, AssetCatalog catalog, RunReport report, Func<Task<bool>> ensureLoggedIn)
+    {
+        if (_options.DryRun)
+        {
+            return;
+        }
+
+        try
+        {
+            var now = DateTime.UtcNow;
+            var got = report.Items
+                .Where(i => i.Status is AssetProcessStatus.Added or AssetProcessStatus.AlreadyOwned)
+                .Select(i => (Id: ExtractPackageId(i.Url), Item: i))
+                .Where(x => x.Id is not null)
+                .ToList();
+
+            var unknown = got.Select(x => x.Id!).Where(id => !catalog.ContainsId(id)).Distinct().ToList();
+            if (unknown.Count > 0)
+            {
+                await FetchIntoCatalogAsync(catalog, unknown, now);
+            }
+
+            foreach (var (id, item) in got.Where(x => x.Item.Status == AssetProcessStatus.Added))
+            {
+                catalog.MarkAdded(id!, item.PromoCode is null ? "free" : "promo", item.PromoCode,
+                    item.TimestampUtc == default ? now : item.TimestampUtc);
+            }
+
+            if (_options.CatalogRefresh is { } period && catalog.LibrarySyncDue(period, now))
+            {
+                _logger.Info(catalog.Meta.LibrarySyncedUtc is null
+                    ? "[Каталог] Каталога библиотеки ещё нет — собираем (один раз пару минут, дальше только новое)."
+                    : $"[Каталог] Сверяем каталог со списком «My Assets» (раз в {period.TotalDays:0.#} сут., CATALOG_REFRESH).");
+                if (await ensureLoggedIn())
+                {
+                    await SyncLibraryAsync(page, catalog, refreshAll: false);
+                }
+            }
+
+            if (catalog.Changed)
+            {
+                WriteCatalog(catalog);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[Каталог] Не обновился: {ex.Message}. Прогон это не затронуло, попробуем в следующий раз.");
+        }
+    }
+
+    /// <summary>Список «My Assets» → каталог. false — список получить не удалось.</summary>
+    private async Task<bool> SyncLibraryAsync(IPage page, AssetCatalog catalog, bool refreshAll)
+    {
+        var library = await MyAssetsLibrary.FetchOwnedIdsAsync(page);
+        if (library.Error is not null || library.Ids.Count == 0)
+        {
+            _logger.Warn($"[Каталог] Список «My Assets» не получен: {library.Error ?? "магазин вернул пустой список"}.");
+            return false;
+        }
+
+        var now = DateTime.UtcNow;
+        var toFetch = catalog.ApplyLibrary(library.Ids, now, refreshAll);
+        _logger.Info($"[Каталог] В библиотеке аккаунта{(library.UserName is null ? "" : " " + library.UserName)}: {library.Ids.Count} ассетов. " +
+                     (toFetch.Count == 0
+                         ? "Данные всех свежие, в магазин не идём."
+                         : refreshAll
+                             ? $"Перечитываем из магазина данные всех {toFetch.Count}."
+                             : $"Берём из магазина данные {toFetch.Count} (новые и старше {AssetCatalog.StaleAfter.TotalDays:0} дней)."));
+        if (toFetch.Count > 0)
+        {
+            await FetchIntoCatalogAsync(catalog, toFetch, now);
+        }
+
+        return true;
+    }
+
+    private async Task FetchIntoCatalogAsync(AssetCatalog catalog, IReadOnlyList<string> ids, DateTime nowUtc)
+    {
+        using var api = new AssetStoreProductApi(_logger.Info);
+        var products = await api.FetchAsync(ids);
+        foreach (var (id, product) in products)
+        {
+            catalog.Upsert(AssetCatalogEntry.FromProduct(id, product, nowUtc));
+        }
+
+        var failed = ids.Distinct().Count() - products.Count;
+        if (failed > 0)
+        {
+            _logger.Warn($"[Каталог] Не получены данные {failed} ассетов — возьмём при следующей сверке.");
+        }
+    }
+
+    private void WriteCatalog(AssetCatalog catalog)
+    {
+        var ai = AssetAiTags.Load(AssetAiTags.CandidatePaths(_dataDirectory), _logger.Warn);
+        var account = _profileName.Contains("__", StringComparison.Ordinal) ? _profileName[(_profileName.IndexOf("__", StringComparison.Ordinal) + 2)..] : _profileName;
+        catalog.Write(ai, account, _options.CatalogCopyDir);
+        _logger.Info($"[Каталог] Записан: {catalog.Count} ассетов, с разметкой ИИ {catalog.Meta.WithAi}. " +
+                     $"Для ИИ-агента — {catalog.IndexPath}, для человека — {catalog.HtmlPath}" +
+                     (string.IsNullOrWhiteSpace(_options.CatalogCopyDir) ? "." : $". Копия: {Path.GetFullPath(_options.CatalogCopyDir)}."));
+    }
+
+    /// <summary>
+    /// Со сводкой бота: страница каталога файлом, если она изменилась с прошлой отправки.
+    /// На телефоне открывается прямо из Telegram.
+    /// </summary>
+    public async Task SendCatalogIfChangedAsync()
+    {
+        if (_notifier is not { Enabled: true })
+        {
+            return;
+        }
+
+        var catalog = AssetCatalog.Load(CatalogProfileDirectory);
+        if (catalog.Count == 0 || !File.Exists(catalog.HtmlPath))
+        {
+            return;
+        }
+
+        var marker = Path.Combine(catalog.Directory, ".sent-to-bot");
+        var written = File.GetLastWriteTimeUtc(catalog.HtmlPath);
+        if (File.Exists(marker) && File.GetLastWriteTimeUtc(marker) >= written)
+        {
+            return;
+        }
+
+        var available = catalog.Entries.Count(e => e.IsAvailable);
+        var added = catalog.Entries.Count(e => e.How is not null);
+        if (await _notifier.SendDocumentAsync(catalog.HtmlPath,
+                $"📚 Каталог ассетов обновлён: {catalog.Count} (в продаже {available}), добавлено программой {added}. " +
+                "Откройте файл — поиск и фильтры внутри."))
+        {
+            File.WriteAllText(marker, DateTime.UtcNow.ToString("O"));
+            File.SetLastWriteTimeUtc(marker, DateTime.UtcNow);
         }
     }
 
@@ -7871,6 +8093,27 @@ internal sealed class CliOptions
     /// <summary>Читать в каналах только посты, появившиеся после прошлого прогона.</summary>
     public bool TelegramOnlyNew { get; init; }
 
+    /// <summary>Собрать каталог всей библиотеки аккаунта (--build-catalog) и выйти.</summary>
+    public bool BuildCatalog { get; init; }
+
+    /// <summary>Только пересобрать файлы каталога из сохранённых данных (после разметки ИИ). Без браузера и сети.</summary>
+    public bool RenderCatalog { get; init; }
+
+    /// <summary>Перечитать из магазина данные всех ассетов каталога, а не только новых и устаревших.</summary>
+    public bool CatalogRefreshAll { get; init; }
+
+    /// <summary>Куда ещё положить копию каталога (--catalog-dir, CATALOG_DIR): общая папка, Unity-проект.</summary>
+    public string? CatalogCopyDir { get; init; }
+
+    /// <summary>
+    /// Как часто обычный прогон сверяет каталог со списком «My Assets» (CATALOG_REFRESH: 7d, off).
+    /// null — только по --build-catalog. Добавленные программой ассеты попадают в каталог всегда.
+    /// </summary>
+    public TimeSpan? CatalogRefresh { get; init; } = TimeSpan.FromDays(7);
+
+    /// <summary>Присылать ли со сводкой бота страницу каталога файлом, если он изменился (BOT_CATALOG).</summary>
+    public bool BotCatalog { get; init; } = true;
+
     public string? NotifyBotToken { get; init; }
     public string? NotifyChatId { get; init; }
 
@@ -7966,6 +8209,10 @@ internal sealed class CliOptions
         var cliListProfiles = false;
         var cliCheckLoginPage = false;
         var cliCheckTelegram = false;
+        var cliBuildCatalog = false;
+        var cliCatalogRefreshAll = false;
+        var cliRenderCatalog = false;
+        string? cliCatalogDir = null;
         var cliWatch = false;
         var cliNotifyTest = false;
         string? cliWatchInterval = null;
@@ -8063,6 +8310,19 @@ internal sealed class CliOptions
                     break;
                 case "--check-telegram":
                     cliCheckTelegram = true;
+                    break;
+                case "--build-catalog":
+                    cliBuildCatalog = true;
+                    break;
+                case "--catalog-refresh-all":
+                    cliBuildCatalog = true;
+                    cliCatalogRefreshAll = true;
+                    break;
+                case "--render-catalog":
+                    cliRenderCatalog = true;
+                    break;
+                case "--catalog-dir" when i + 1 < args.Length:
+                    cliCatalogDir = args[++i];
                     break;
                 case "--watch":
                     cliWatch = true;
@@ -8479,6 +8739,27 @@ internal sealed class CliOptions
             }
         }
 
+        TimeSpan? catalogRefresh = TimeSpan.FromDays(7);
+        var catalogRefreshText = Environment.GetEnvironmentVariable("CATALOG_REFRESH")?.Trim().ToLowerInvariant();
+        if (!string.IsNullOrWhiteSpace(catalogRefreshText))
+        {
+            if (catalogRefreshText is "off" or "no" or "0" or "false" or "нет")
+            {
+                catalogRefresh = null;
+            }
+            else if (TryParseInterval(catalogRefreshText, out var parsedRefresh))
+            {
+                catalogRefresh = parsedRefresh;
+            }
+            else
+            {
+                Console.WriteLine($"[Каталог] Не понял CATALOG_REFRESH='{catalogRefreshText}'. Примеры: 7d, 1d, off. Берём 7d.");
+            }
+        }
+
+        var botCatalogText = Environment.GetEnvironmentVariable("BOT_CATALOG")?.Trim().ToLowerInvariant();
+        var botCatalog = botCatalogText is not ("off" or "no" or "0" or "false" or "нет");
+
         var telegramPostLimit = config?.Telegram?.PostLimit ?? 50;
         var telegramScreenshotOnNoLinks = config?.Telegram?.ScreenshotOnNoLinks ?? false;
 
@@ -8505,6 +8786,12 @@ internal sealed class CliOptions
             NotifyTest = cliNotifyTest,
             WatchInterval = watchInterval,
             DigestInterval = digestInterval,
+            BuildCatalog = cliBuildCatalog,
+            CatalogRefreshAll = cliCatalogRefreshAll,
+            RenderCatalog = cliRenderCatalog,
+            CatalogCopyDir = FirstNonEmpty(cliCatalogDir, Environment.GetEnvironmentVariable("CATALOG_DIR")),
+            CatalogRefresh = catalogRefresh,
+            BotCatalog = botCatalog,
             TelegramOnlyNew = watch || cliTelegramOnlyNew || (config?.Telegram?.OnlyNew ?? false),
             NotifyBotToken = FirstNonEmpty(cliNotifyBotToken, Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN"), config?.Notify?.TelegramBotToken),
             NotifyChatId = FirstNonEmpty(cliNotifyChatId, Environment.GetEnvironmentVariable("TELEGRAM_CHAT_ID"), config?.Notify?.TelegramChatId),
