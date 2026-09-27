@@ -545,9 +545,23 @@ internal sealed class UnityAssetAutomationApp
                 return;
             }
 
-            var authenticated = await EnsureAuthenticatedAsync(page);
-            if (!authenticated)
+            // Вход в Unity — только когда он нужен: перед первым ассетом, который надо открыть
+            // в магазине. На сервере большинство прогонов не находит новых постов, и тогда
+            // проверка входа (до двух минут Chrome на слабом сервере) не нужна вовсе.
+            bool? authenticated = null;
+            async Task<bool> EnsureLoggedInAsync()
             {
+                if (authenticated is { } known)
+                {
+                    return known;
+                }
+
+                authenticated = await EnsureAuthenticatedAsync(page);
+                if (authenticated == true)
+                {
+                    return true;
+                }
+
                 Stats.LoginFailed = true;
                 _logger.Error("============================================================");
                 _logger.Error(" НЕ ПОЛУЧИЛОСЬ ВОЙТИ");
@@ -560,11 +574,16 @@ internal sealed class UnityAssetAutomationApp
                     (_loginProblem ?? (HasCredentials
                         ? "Unity не подтвердила вход. Подробности в логе."
                         : "Сессия истекла, а email и пароль не заданы (UNITY_EMAIL / UNITY_PASSWORD).")));
-                return;
+                return false;
             }
 
             if (_options.LoginOnly)
             {
+                if (!await EnsureLoggedInAsync())
+                {
+                    return;
+                }
+
                 var whoami = await TryReadSignedInUserAsync(page);
                 _logger.Info("============================================================");
                 _logger.Info(" ГОТОВО. ВЫ ВОШЛИ В UNITY.");
@@ -839,6 +858,13 @@ internal sealed class UnityAssetAutomationApp
                     continue;
                 }
 
+                // Место, где проверенный вход впервые нужен. Не вошли — ассеты не трогаем, и
+                // «где остановились в каналах» не запоминаем: следующий прогон возьмёт их снова.
+                if (!await EnsureLoggedInAsync())
+                {
+                    return;
+                }
+
                 index++;
                 _logger.Info($"[{label}] {assetUrl}");
 
@@ -929,6 +955,17 @@ internal sealed class UnityAssetAutomationApp
 
             report.FinishedAtUtc = DateTime.UtcNow;
             await File.WriteAllTextAsync(_reportPath, JsonSerializer.Serialize(report, _jsonOptions));
+
+            // За прогон магазин мог продлить cookies ещё раз — уходим со свежими.
+            // Только если вход проверен: иначе в файл легли бы cookies гостя.
+            if (authenticated == true)
+            {
+                await SaveSessionCookiesQuietlyAsync(page);
+            }
+            else
+            {
+                _logger.Info("Проверять в магазине было нечего — вход в Unity не понадобился.");
+            }
 
             PrintSummary(report);
             _logger.Info($"Отчет сохранен: {_reportPath}");
@@ -2419,7 +2456,10 @@ internal sealed class UnityAssetAutomationApp
                 if (stable)
                 {
                     _logger.Info("Сессия активна.");
-                    await RememberUnityAccountAsync(page);
+                    // Магазин только что продлил свои cookies — запоминаем свежие, иначе
+                    // следующий запуск вернул бы из файла устаревшие.
+                    await SaveSessionCookiesQuietlyAsync(page);
+                    await RememberUnityAccountAsync(page, sessionRestored: true);
                     return true;
                 }
 
@@ -2433,7 +2473,7 @@ internal sealed class UnityAssetAutomationApp
             if (stable)
             {
                 _logger.Info("Сессия уже активна на текущей странице.");
-                await SaveSessionStateAsync(page);
+                await SaveSessionCookiesQuietlyAsync(page);
                 return true;
             }
         }
@@ -2450,7 +2490,7 @@ internal sealed class UnityAssetAutomationApp
                 if (stable)
                 {
                     _logger.Info("Сессия подтверждена после контрольной навигации.");
-                    await SaveSessionStateAsync(page);
+                    await SaveSessionCookiesQuietlyAsync(page);
                     return true;
                 }
             }
@@ -2932,11 +2972,26 @@ internal sealed class UnityAssetAutomationApp
     /// Запоминает аккаунт Unity, под которым выполнен вход.
     /// Переименование профиля произойдёт в конце запуска, когда браузер закрыт.
     /// </summary>
-    private async Task RememberUnityAccountAsync(IPage page)
+    private async Task RememberUnityAccountAsync(IPage page, bool sessionRestored = false)
     {
         if (!string.IsNullOrWhiteSpace(_unityAccount))
         {
             return;
+        }
+
+        // Сессия восстановлена, нового входа не было — значит, аккаунт тот же, что записан
+        // в профиле, раз имя профиля уже собрано из него. Чтение со страницы стоит 6–18 с.
+        if (sessionRestored)
+        {
+            var known = _profileStore.Load().Profiles
+                .FirstOrDefault(p => string.Equals(p.Name, _profileName, StringComparison.OrdinalIgnoreCase))?.Email;
+            if (!string.IsNullOrWhiteSpace(known) &&
+                string.Equals(BuildProfileName(_options.ProfileBaseName, known), _profileName, StringComparison.OrdinalIgnoreCase))
+            {
+                _unityAccount = known;
+                _logger.Debug($"Аккаунт Unity взят из профиля: {known}");
+                return;
+            }
         }
 
         _unityAccount = await TryReadSignedInUserAsync(page);
@@ -4128,8 +4183,13 @@ internal sealed class UnityAssetAutomationApp
                 return false;
             }
 
-            await page.SetCookieAsync(cookies.Select(c => c.ToCookieParam()).ToArray());
-            _logger.Info($"Загружено cookies: {cookies.Count}");
+            var restore = await CookiesToRestoreAsync(page, cookies);
+            if (restore.Count > 0)
+            {
+                await page.SetCookieAsync(restore.Select(c => c.ToCookieParam()).ToArray());
+            }
+
+            _logger.Info($"Загружено cookies: {restore.Count} из {cookies.Count}");
             _logger.Debug(
                 $"Домены cookies: {string.Join(", ", cookies.Select(c => c.Domain).Where(d => !string.IsNullOrWhiteSpace(d)).Distinct(StringComparer.OrdinalIgnoreCase))}");
             return true;
@@ -4152,8 +4212,15 @@ internal sealed class UnityAssetAutomationApp
                             new SessionStateSnapshot();
                 if (state.Cookies.Count > 0)
                 {
-                    await page.SetCookieAsync(state.Cookies.Select(c => c.ToCookieParam()).ToArray());
-                    _logger.Info($"Загружено cookies из session state: {state.Cookies.Count}");
+                    await LogCookieDifferencesAsync(page, state);
+                    var restore = await CookiesToRestoreAsync(page, state.Cookies);
+                    if (restore.Count > 0)
+                    {
+                        await page.SetCookieAsync(restore.Select(c => c.ToCookieParam()).ToArray());
+                    }
+
+                    _logger.Info($"Загружено cookies из session state: {restore.Count} из {state.Cookies.Count} " +
+                                 "(свежие cookies браузера и просроченные из файла не трогаем)");
                 }
 
                 if (state.LocalStorageByOrigin.Count > 0)
@@ -4183,7 +4250,91 @@ internal sealed class UnityAssetAutomationApp
         return await TryLoadCookiesAsync(page);
     }
 
-    private async Task SaveSessionStateAsync(IPage page)
+    /// <summary>
+    /// Какие сохранённые cookies можно вернуть в браузер. Браузер сам хранит cookies в папке
+    /// профиля и обновляет их при каждом заходе в магазин, поэтому его копия всегда свежее.
+    /// Файл нужен только для того, чего в браузере нет: cookies сеанса (Chrome теряет их при
+    /// закрытии) и вход, перенесённый с другого компьютера.
+    ///
+    /// Раньше файл загружался поверх всего. Магазин продлевает cookie DS на сутки при каждом
+    /// заходе, а файл обновлялся только при полном входе. Через сутки программа подменяла
+    /// свежий DS просроченным, браузер его выбрасывал — и вход пропадал. На сервере так
+    /// «слетала сессия» в каждом четвёртом прогоне (19–27.09), воспроизведено на Deck 27.09.
+    /// </summary>
+    private async Task<List<SerializableCookie>> CookiesToRestoreAsync(IPage page, IEnumerable<SerializableCookie> saved)
+    {
+        var live = new HashSet<string>(StringComparer.Ordinal);
+        try
+        {
+            foreach (var c in await page.GetCookiesAsync(SessionOrigins))
+            {
+                live.Add($"{c.Domain}|{c.Path}|{c.Name}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"Cookies браузера прочитать не удалось ({ex.Message}). Берём все из файла.");
+        }
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        return saved
+            .Where(c => !(c.Expires is > 0 && c.Expires < now))
+            .Where(c => !live.Contains($"{c.Domain}|{c.Path}|{c.Name}"))
+            .ToList();
+    }
+
+    /// <summary>Для --verbose: чем cookies браузера отличаются от сохранённых в session.dat.</summary>
+    private async Task LogCookieDifferencesAsync(IPage page, SessionStateSnapshot state)
+    {
+        try
+        {
+            var live = (await page.GetCookiesAsync(SessionOrigins))
+                .ToDictionary(c => $"{c.Domain}|{c.Path}|{c.Name}", c => c);
+            static string Exp(double? e) => e is null or <= 0 ? "сеанс" : DateTimeOffset.FromUnixTimeSeconds((long)e).ToString("yyyy-MM-dd HH:mm");
+            _logger.Debug($"Cookies: в браузере {live.Count}, в session.dat {state.Cookies.Count} (сохранён {state.SavedAtUtc:yyyy-MM-dd HH:mm} UTC).");
+            foreach (var saved in state.Cookies)
+            {
+                var key = $"{saved.Domain}|{saved.Path}|{saved.Name}";
+                if (!live.TryGetValue(key, out var current))
+                {
+                    _logger.Debug($"Cookie {saved.Domain} {saved.Name}: в браузере нет, в файле до {Exp(saved.Expires)}");
+                }
+                else if (current.Value != saved.Value)
+                {
+                    _logger.Debug($"Cookie {saved.Domain} {saved.Name}: РАЗНЫЕ значения. Браузер до {Exp(current.Expires)}, файл до {Exp(saved.Expires)}");
+                }
+            }
+
+            foreach (var key in live.Keys.Where(k => !state.Cookies.Any(c => $"{c.Domain}|{c.Path}|{c.Name}" == k)))
+            {
+                _logger.Debug($"Cookie {key.Replace('|', ' ')}: есть только в браузере, до {Exp(live[key].Expires)}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"Cookies: сравнить не удалось: {ex.Message}");
+        }
+    }
+
+    /// <summary>Пересохраняет cookies входа. Ошибка здесь не должна срывать прогон.</summary>
+    private async Task SaveSessionCookiesQuietlyAsync(IPage page)
+    {
+        try
+        {
+            await SaveSessionStateAsync(page, captureLocalStorage: false);
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"Не удалось пересохранить вход профиля: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Сохраняет вход профиля в session.dat. localStorage снимается в отдельных вкладках —
+    /// это долго (на сервере до 40 с), поэтому только после полного входа. После обычной
+    /// проверки хватает cookies (captureLocalStorage: false), localStorage берётся из файла.
+    /// </summary>
+    private async Task SaveSessionStateAsync(IPage page, bool captureLocalStorage = true)
     {
         var state = new SessionStateSnapshot
         {
@@ -4193,7 +4344,25 @@ internal sealed class UnityAssetAutomationApp
         var cookies = await page.GetCookiesAsync(SessionOrigins);
         state.Cookies = cookies.Select(SerializableCookie.FromCookie).ToList();
 
-        foreach (var origin in LocalStorageOrigins)
+        if (!captureLocalStorage)
+        {
+            try
+            {
+                var previous = SecretStore.ReadProtectedText(_sessionStatePath);
+                if (!string.IsNullOrWhiteSpace(previous))
+                {
+                    state.LocalStorageByOrigin =
+                        JsonSerializer.Deserialize<SessionStateSnapshot>(previous, _runtimeJsonOptions)?.LocalStorageByOrigin
+                        ?? state.LocalStorageByOrigin;
+                }
+            }
+            catch
+            {
+                // Старый файл не прочитался — сохраним без localStorage, cookies важнее.
+            }
+        }
+
+        foreach (var origin in captureLocalStorage ? LocalStorageOrigins : [])
         {
             try
             {
@@ -7382,7 +7551,15 @@ internal sealed class UnityAssetAutomationApp
 
         if (report.Items.Count == 0)
         {
-            _logger.Warn(" Ни одного ассета не обработано.");
+            // В режиме «только новые посты» пустой прогон — норма, не повод писать в errors.log.
+            if (_options.TelegramOnlyNew)
+            {
+                _logger.Info(" Новых ассетов не было.");
+            }
+            else
+            {
+                _logger.Warn(" Ни одного ассета не обработано.");
+            }
         }
 
         _logger.Info($" Всего обработано: {report.Items.Count}");
