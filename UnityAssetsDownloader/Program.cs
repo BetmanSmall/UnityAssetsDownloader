@@ -5714,6 +5714,13 @@ internal sealed class UnityAssetAutomationApp
         }
 
         var match = Regex.Match(url, @"/packages/[^?#]*?-(\d+)/?(?:[?#]|$)");
+        if (match.Success)
+        {
+            return match.Groups[1].Value;
+        }
+
+        // Короткая ссылка /packages/package/154271: магазин открывает её как есть, без переадресации.
+        match = Regex.Match(url, @"/packages/package/(\d+)/?(?:[?#]|$)");
         return match.Success ? match.Groups[1].Value : null;
     }
 
@@ -7021,9 +7028,20 @@ internal sealed class UnityAssetAutomationApp
         return lastStatus ?? await DetectStatusAsync(page);
     }
 
+    /// <summary>
+    /// Что за ассет открыт: бесплатный ли, есть ли он уже на аккаунте, какие кнопки видны.
+    ///
+    /// Бесплатность берётся из данных самой страницы: в ней есть объект ассета с его номером
+    /// и ценой (originalPrice.isFree, finalPrice). Раньше она угадывалась по текстам кнопок
+    /// на всей странице, а там есть и карточки чужих ассетов («похожие», «ещё от автора»,
+    /// «Top free assets»). Стоило подгрузиться чужой карточке с «Free» — платный ассет
+    /// считался бесплатным, и наоборот; 27.09 на Deck одни и те же ассеты в двух прогонах
+    /// подряд получили разный ответ. Нет данных о цене — работает прежний способ по кнопкам.
+    /// </summary>
     private async Task<AssetStatusSnapshot> DetectStatusAsync(IPage page)
     {
-        var raw = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<string>(@"() => {
+        var packageId = ExtractPackageId(page.Url) ?? string.Empty;
+        var raw = await EvaluateWithRetryAsync(() => page.EvaluateFunctionAsync<string>(@"(packageId) => {
             const normalize = (v) => (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
             const visible = (el) => {
                 if (!el) return false;
@@ -7084,8 +7102,36 @@ internal sealed class UnityAssetAutomationApp
             actionTexts = Array.from(new Set(actionTexts));
             const ctaCombined = actionTexts.join(' | ');
 
+            // Цена именно этого ассета из данных страницы: объект с ""id"":""<номер>"",""productId""
+            // встречается на странице один раз, дальше в нём идёт ""originalPrice"":{...}.
+            let price = null;
+            if (packageId) {
+                const marker = '""id"":""' + packageId + '"",""productId""';
+                for (const script of Array.from(document.scripts)) {
+                    const t = script.textContent || '';
+                    const at = t.indexOf(marker);
+                    if (at < 0) continue;
+                    const key = '""originalPrice"":';
+                    const start = t.indexOf(key, at);
+                    if (start < 0 || start - at > 100000) break;
+                    let from = start + key.length, depth = 0, end = -1;
+                    for (let p = from; p < t.length && p < from + 3000; p++) {
+                        if (t[p] === '{') depth++;
+                        else if (t[p] === '}' && --depth === 0) { end = p; break; }
+                    }
+                    if (end > 0) {
+                        try { price = JSON.parse(t.slice(from, end + 1)); } catch (e) { price = null; }
+                    }
+                    break;
+                }
+            }
+
+            const priceKnown = !!price && typeof price.isFree === 'boolean';
+            const priceFree = priceKnown && (price.isFree === true || parseFloat(price.finalPrice) === 0);
+
             const hasOpenInUnity = actionTexts.some(t => t.includes('open in unity'));
-            const hasAddToMyAssets = actionTexts.some(t => t.includes('add to my assets'));
+            // У платного ассета своей «Add to My Assets» нет — значит, эта кнопка с чужой карточки.
+            const hasAddToMyAssets = actionTexts.some(t => t.includes('add to my assets')) && !(priceKnown && !priceFree);
             const hasBuyNow = actionTexts.some(t => t.includes('buy now'));
             const hasAddToCart = actionTexts.some(t => t.includes('add to cart'));
             const hasOwnedSignals = actionTexts.some(t =>
@@ -7103,13 +7149,14 @@ internal sealed class UnityAssetAutomationApp
             const hasFreeSignals = hasAddToMyAssets ||
                 actionTexts.some(t => t.includes('free') || t.includes('$0') || t.includes('0.00'));
             const hasBuySignals = hasBuyNow || (hasAddToCart && !hasAddToMyAssets && !hasFreeSignals);
-            const hasPaidSignals = hasBuySignals;
+            const hasPaidSignals = priceKnown ? !priceFree : hasBuySignals;
 
             const isOwned = hasOpenInUnity || hasOwnedSignals || !!purchasedOnText;
-            const isFree = (hasAddToMyAssets || hasFreeSignals) && !hasPaidSignals;
+            const isFree = priceKnown ? priceFree : (hasAddToMyAssets || hasFreeSignals) && !hasPaidSignals;
 
             const detectionSummary = [
                 `free=${isFree}`,
+                `price=${priceKnown ? `${price.finalPrice} ${price.currency || ''}`.trim() + (priceFree ? ' (free)' : '') : 'unknown'}`,
                 `owned=${isOwned}`,
                 `addBtn=${hasAddToMyAssets}`,
                 `openInUnity=${hasOpenInUnity}`,
@@ -7129,7 +7176,7 @@ internal sealed class UnityAssetAutomationApp
                 purchasedOnText,
                 detectionSummary
             });
-        }"), "DetectStatus");
+        }", packageId), "DetectStatus");
 
         return JsonSerializer.Deserialize<AssetStatusSnapshot>(raw ?? "{}", _runtimeJsonOptions) ??
                new AssetStatusSnapshot();
