@@ -417,3 +417,6 @@ telegram_sources.local.txt
 
 # Архивы логов с сервера (collect-logs.sh): в них логи и память профиля
 uad-diag-*
+
+# Сборки для класса (publish-class.sh)
+dist/

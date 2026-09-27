@@ -559,6 +559,25 @@ dotnet run --project UnityAssetsDownloader\UnityAssetsDownloader.csproj -- ^
   --headless false --verbose --no-defaults --max-add-attempts 3
 ```
 
+Без параметров из обычной консоли (`dotnet run --project …` или двойной щелчок по
+собранному `.exe`) открывается то же меню, что в `run.bat`. `--menu` открывает его явно,
+остальные параметры рядом с `--menu` (например, `--logs-dir`) добавляются к каждому пункту.
+
+### Один .exe для компьютерного класса
+
+`./publish-class.sh` (на Linux или Steam Deck) собирает `dist/UnityAssetsDownloader-win-x64/`
+и такой же `.zip`: один `UnityAssetsDownloader.exe`, списки ссылок и `README.txt` (инструкция для класса).
+.NET на компьютерах учеников не нужен, `run.bat` тоже: двойной щелчок открывает меню.
+
+- Папку кладут в общую (можно сетевую) папку класса, запускают оттуда.
+- Вход, память ассетов и логи у каждого пользователя Windows свои:
+  `%LOCALAPPDATA%\UnityAssetsDownloader`. В общую папку программа ничего не пишет.
+- Браузер — установленный Chrome, иначе Edge, иначе при первом запуске скачается свой
+  (в ту же личную папку).
+- Пункт **L** кладёт архив логов на рабочий стол.
+
+`./publish-class.sh linux-x64` — то же для Linux (проверка на Steam Deck).
+
 ---
 
 ## 8. Сервер: сам следит за каналами

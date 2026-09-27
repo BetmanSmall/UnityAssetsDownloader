@@ -18,6 +18,27 @@ catch
     // В перенаправленном выводе смена кодировки может не поддерживаться. Это не критично.
 }
 
+// Двойной щелчок по .exe (без параметров, живая консоль) или --menu — меню с пунктами,
+// как в run.bat. Нужно для компьютерного класса, где рядом с .exe нет run.bat.
+if (InteractiveMenu.ShouldOpen(args))
+{
+    var passThrough = args.Where(a => !a.Equals("--menu", StringComparison.OrdinalIgnoreCase)).ToArray();
+    try
+    {
+        var menuOptions = CliOptions.Parse(passThrough);
+        await new InteractiveMenu(RunOnceAsync, passThrough, menuOptions.LogsDirectory, menuOptions.DataDirectory).RunAsync();
+    }
+    catch (Exception ex)
+    {
+        // Окно, открытое двойным щелчком, закроется сразу — даём прочитать ошибку.
+        Console.WriteLine($"[ОШИБКА] Меню не открылось: {ex}");
+        Console.Write("Нажмите Enter, чтобы закрыть окно...");
+        Console.ReadLine();
+    }
+
+    return;
+}
+
 var options = CliOptions.Parse(args);
 
 if (options.ListProfiles)
@@ -43,6 +64,30 @@ try
 catch (Exception ex)
 {
     await ReportCrashAsync(ex, options);
+}
+
+// Один запуск с этими параметрами — для меню. Падение не закрывает меню: оно
+// записывается в errors.log, а код выхода показывается пользователю.
+async Task<int> RunOnceAsync(string[] runArgs)
+{
+    var runOptions = CliOptions.Parse(runArgs);
+    if (runOptions.ListProfiles)
+    {
+        Console.WriteLine(new ProfileStore(runOptions.DataDirectory).Describe());
+        return 0;
+    }
+
+    Environment.ExitCode = 0;
+    try
+    {
+        await new UnityAssetAutomationApp(runOptions).RunAsync();
+    }
+    catch (Exception ex)
+    {
+        await ReportCrashAsync(ex, runOptions, runArgs);
+    }
+
+    return Environment.ExitCode;
 }
 
 // Режим сервера: прогон, пауза до следующего, снова прогон — пока службу не остановят.
@@ -163,14 +208,14 @@ static string DescribeInterval(TimeSpan t) =>
     : t.TotalHours >= 1 && t.TotalHours % 1 == 0 ? $"{t.TotalHours:0} ч"
     : $"{t.TotalMinutes:0} мин";
 
-async Task ReportCrashAsync(Exception ex, CliOptions crashOptions)
+async Task ReportCrashAsync(Exception ex, CliOptions crashOptions, string[]? usedArgs = null)
 {
     // Любое необработанное падение сохраняем в отдельный файл, чтобы его можно было прислать целиком.
     var crashText =
         $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] НЕОБРАБОТАННАЯ ОШИБКА{Environment.NewLine}" +
         $"ВЕРСИЯ ПРОГРАММЫ: {UnityAssetAutomationApp.BuildVersionLine()}{Environment.NewLine}" +
         $"ОС: {RuntimeInformation.OSDescription} | .NET: {RuntimeInformation.FrameworkDescription}{Environment.NewLine}" +
-        $"Аргументы: {string.Join(" ", args)}{Environment.NewLine}" +
+        $"Аргументы: {string.Join(" ", usedArgs ?? args)}{Environment.NewLine}" +
         ex;
 
     Console.Error.WriteLine(crashText);
@@ -363,7 +408,10 @@ internal sealed class UnityAssetAutomationApp
                     @"C:\Program Files\Google\Chrome\Application\chrome.exe",
                     @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
                     Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                        @"Google\Chrome\Application\chrome.exe")
+                        @"Google\Chrome\Application\chrome.exe"),
+                    // Edge тоже Chromium и стоит на любом Windows 10/11 — в классе Chrome может не быть.
+                    @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                    @"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
                 ];
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
@@ -415,7 +463,15 @@ internal sealed class UnityAssetAutomationApp
             {
                 _logger.Info("Локальный Chrome/Chromium не найден. Скачивание встроенного Chromium...");
                 _logger.Debug($"Проверялись пути: {string.Join(", ", potentialChromePaths)}");
-                await new BrowserFetcher().DownloadAsync();
+                // Сборка в один файл лежит в общей папке класса, писать туда нельзя — качаем
+                // в данные пользователя. Обычный запуск — как раньше, рядом с программой.
+                var fetcher = CliOptions.IsSingleFileApp
+                    ? new BrowserFetcher(new BrowserFetcherOptions { Path = Path.Combine(_options.DataDirectory, "browser") })
+                    : new BrowserFetcher();
+                var installed = await fetcher.DownloadAsync();
+                chromePath = installed.GetExecutablePath();
+                _chromePath = chromePath;
+                _logger.Info($"Chromium готов: {chromePath}");
             }
 
             var browserArgs = new List<string>
@@ -1009,7 +1065,9 @@ internal sealed class UnityAssetAutomationApp
             // Дата самой программы (.dll), а не файла запуска: в Docker запускает `dotnet`,
             // и 19.09 сервер показывал его дату — «собрано 2026-08-21» у сборки того же дня.
             // У одного .exe сборка внутри него, Location пустой — тогда берём сам exe.
+#pragma warning disable IL3000 // пустой Location у одного .exe здесь и обрабатывается
             var path = assembly.Location;
+#pragma warning restore IL3000
             if (string.IsNullOrWhiteSpace(path))
             {
                 path = Environment.ProcessPath;
@@ -8553,14 +8611,30 @@ internal sealed class CliOptions
     }
 
     /// <summary>
+    /// Программа собрана в один файл (UnityAssetsDownloader.exe для компьютерного класса),
+    /// а не запущена через dotnet. У такой сборки нет пути к .dll.
+    /// </summary>
+#pragma warning disable IL3000 // пустой Location — как раз признак сборки в один файл
+    public static bool IsSingleFileApp => string.IsNullOrEmpty(typeof(CliOptions).Assembly.Location);
+#pragma warning restore IL3000
+
+    /// <summary>
     /// Определяет каталог для логов или данных.
-    /// Если путь не задан, используется папка рядом с исполняемым файлом.
+    /// Если путь не задан — папка рядом с программой. У сборки в один файл — личная папка
+    /// пользователя (%LOCALAPPDATA%\UnityAssetsDownloader): .exe в классе лежит в общей,
+    /// часто сетевой папке, и десять компьютеров писали бы в один profiles.json, а папка
+    /// браузера по сети медленная и блокируется.
     /// </summary>
     private static string ResolveDirectory(string? configured, string defaultFolderName)
     {
-        return string.IsNullOrWhiteSpace(configured)
-            ? Path.Combine(AppContext.BaseDirectory, defaultFolderName)
-            : Path.GetFullPath(configured);
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            return Path.GetFullPath(configured);
+        }
+
+        return IsSingleFileApp
+            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "UnityAssetsDownloader", defaultFolderName)
+            : Path.Combine(AppContext.BaseDirectory, defaultFolderName);
     }
 
     /// <summary>
