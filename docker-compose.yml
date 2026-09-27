@@ -20,6 +20,13 @@ services:
     # init убирает зависшие процессы браузера, если он упадёт посреди работы.
     init: true
     shm_size: "1gb"
+    # Вывод службы (docker compose logs) не должен съесть диск: храним до 3 файлов по 10 МБ —
+    # это несколько месяцев прогонов.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     env_file: .env
     environment:
       TZ: ${TZ:-Europe/Moscow}

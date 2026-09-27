@@ -72,6 +72,8 @@ async Task RunWatchLoopAsync()
     {
         var startedAt = DateTime.Now;
         var cycleOptions = CliOptions.Parse(args);
+        var crashed = false;
+        current = null;
 
         try
         {
@@ -83,15 +85,33 @@ async Task RunWatchLoopAsync()
         }
         catch (Exception ex)
         {
+            crashed = true;
             await ReportCrashAsync(ex, cycleOptions);
-            if (current is not null)
+            try
             {
-                await current.NotifyAsync($"💥 Программа упала во время прогона: {ex.Message}\nСледующий прогон — по расписанию.");
+                if (current is not null)
+                {
+                    await current.NotifyAsync($"💥 Программа упала во время прогона: {ex.Message}\nСледующий прогон — по расписанию.");
+                }
+            }
+            catch (Exception notifyEx)
+            {
+                // Служба не должна умирать из-за сообщения о падении.
+                Console.Error.WriteLine($"[Сервер] Не удалось сообщить боту о падении: {notifyEx.Message}");
             }
         }
         finally
         {
             running = false;
+        }
+
+        try
+        {
+            await SendDigestIfDueAsync(cycleOptions, current, crashed);
+        }
+        catch (Exception digestEx)
+        {
+            Console.Error.WriteLine($"[Сервер] Сводка не отправлена: {digestEx.Message}");
         }
 
         // Расписание от начала прогона: «раз в сутки» значит в одно и то же время.
@@ -111,6 +131,31 @@ async Task RunWatchLoopAsync()
             break;
         }
     }
+}
+
+// Суточная сводка: копим итоги прогонов и раз в BOT_DIGEST шлём боту, даже если
+// ничего не добавлено, — чтобы молчание бота значило «сломалось», а не «нечего было».
+async Task SendDigestIfDueAsync(CliOptions cycleOptions, UnityAssetAutomationApp? app, bool crashed)
+{
+    if (cycleOptions.DigestInterval is not { } period)
+    {
+        return;
+    }
+
+    var path = Path.Combine(cycleOptions.DataDirectory, "bot_digest.json");
+    var digest = DailyDigest.Load(path);
+    digest.Add(app?.Stats, crashed);
+
+    var now = DateTime.UtcNow;
+    if (app is not null && digest.IsDue(period, now))
+    {
+        var text = digest.Describe(app.ProfileName, period, now);
+        Console.WriteLine($"[Сервер] Сводка боту:{Environment.NewLine}{text}");
+        await app.NotifyAsync(text);
+        digest.Reset(now);
+    }
+
+    digest.Save(path);
 }
 
 static string DescribeInterval(TimeSpan t) =>
@@ -176,6 +221,11 @@ internal sealed class UnityAssetAutomationApp
     private OwnedAssetsCache? _deprecatedCache;
     private OwnedAssetsCache? _rejectedPromoCache;
     private readonly TelegramNotifier? _notifier;
+
+    /// <summary>Что случилось за этот прогон — для суточной сводки бота.</summary>
+    public RunStats Stats { get; } = new();
+
+    public string ProfileName => _profileName;
 
     private bool HasCredentials =>
         !string.IsNullOrWhiteSpace(_unityEmail) && !string.IsNullOrWhiteSpace(_unityPassword);
@@ -498,6 +548,7 @@ internal sealed class UnityAssetAutomationApp
             var authenticated = await EnsureAuthenticatedAsync(page);
             if (!authenticated)
             {
+                Stats.LoginFailed = true;
                 _logger.Error("============================================================");
                 _logger.Error(" НЕ ПОЛУЧИЛОСЬ ВОЙТИ");
                 _logger.Error($" Профиль: {_profileName}");
@@ -881,6 +932,10 @@ internal sealed class UnityAssetAutomationApp
 
             PrintSummary(report);
             _logger.Info($"Отчет сохранен: {_reportPath}");
+            Stats.Added = report.Items.Count(i => i.Status == AssetProcessStatus.Added);
+            Stats.AlreadyOwned = report.Items.Count(i => i.Status == AssetProcessStatus.AlreadyOwned);
+            Stats.PromoFailed = report.Items.Count(i => i.Status == AssetProcessStatus.PromoNotApplied);
+            Stats.Failed = report.Items.Count(i => i.Status is AssetProcessStatus.Failed or AssetProcessStatus.UnknownAfterClick);
             await NotifyRunSummaryAsync(report);
             }
         }
@@ -1138,6 +1193,8 @@ internal sealed class UnityAssetAutomationApp
     /// </summary>
     private async Task ReportTelegramResultAsync(TelegramParseResult tgResult, Dictionary<string, string> assetPromocodes)
     {
+        Stats.AddTelegram(tgResult);
+
         if (tgResult.AssetUrls.Count > 0)
         {
             _logger.Info($"Telegram: найдено ссылок на ассеты: {tgResult.AssetUrls.Count}");
@@ -2416,6 +2473,7 @@ internal sealed class UnityAssetAutomationApp
         }
 
         _logger.Warn("Требуется вход в Unity.");
+        Stats.Relogins++;
         TrySetupCredentialsInteractively();
         _credentialsAsked = true;
 
@@ -2694,7 +2752,16 @@ internal sealed class UnityAssetAutomationApp
         for (var attempt = 1; attempt <= 3; attempt++)
         {
             _logger.Info($"Попытка авторизации {attempt}/3...");
-            await StartAssetStoreSsoAsync(page);
+            try
+            {
+                await StartAssetStoreSsoAsync(page);
+            }
+            catch (Exception ex) when (IsTransientEvaluateError(ex) || IsTransientPageError(ex))
+            {
+                // Страница сменилась посреди шага — обычно это и есть переход на вход Unity.
+                // Дальше ожидание само разберётся, куда мы попали.
+                _logger.Info($"Страница сменилась во время перехода ко входу ({ex.Message.Split('\n')[0]}). Продолжаем по текущей странице: {ShortUrl(page.Url)}");
+            }
 
             // Форму входа по шагам заполняет само ожидание (TryAutoLoginStepAsync).
             if (await WaitForAuthenticatedSessionAsync(page, TimeSpan.FromMilliseconds(_options.AuthTimeoutMs)))
@@ -6982,6 +7049,20 @@ internal sealed class UnityAssetAutomationApp
 
     private static async Task<bool> TryClickSignInWithUnityAsync(IPage page)
     {
+        try
+        {
+            return await ClickSignInWithUnityAsync(page);
+        }
+        catch (Exception ex) when (IsTransientEvaluateError(ex) || IsTransientPageError(ex))
+        {
+            // Страница ушла на вход Unity, пока мы искали кнопку: вход уже начался, это не ошибка.
+            // Раньше это исключение роняло весь прогон (19–21.09 на сервере, трижды).
+            return false;
+        }
+    }
+
+    private static async Task<bool> ClickSignInWithUnityAsync(IPage page)
+    {
         return await page.EvaluateFunctionAsync<bool>(@"() => {
             const actions = Array.from(document.querySelectorAll('button, a, span'));
             for (const element of actions) {
@@ -7330,6 +7411,7 @@ internal sealed class AppLogger : IDisposable
     private readonly StreamWriter? _writer;
     private readonly StreamWriter? _errorWriter;
     private readonly object _sync = new();
+    private bool _disposed;
 
     public AppLogger(bool verbose, bool traceNetwork, string? logFilePath, string? errorsFilePath = null)
     {
@@ -7389,11 +7471,27 @@ internal sealed class AppLogger : IDisposable
         lock (_sync)
         {
             Console.WriteLine(line);
-            _writer?.WriteLine(line);
 
-            if (level is "WARN" or "ERROR")
+            // Лог не должен ронять программу. После Dispose (прогон закончился, а сообщение
+            // о падении ещё уходит боту) пишем только в консоль. 19–21.09 на сервере запись
+            // в закрытый файл трижды убила службу и трижды повторила сообщение бота.
+            if (_disposed)
             {
-                _errorWriter?.WriteLine(line);
+                return;
+            }
+
+            try
+            {
+                _writer?.WriteLine(line);
+
+                if (level is "WARN" or "ERROR")
+                {
+                    _errorWriter?.WriteLine(line);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [WARN] Не удалось записать в файл лога: {ex.Message}");
             }
         }
     }
@@ -7402,6 +7500,7 @@ internal sealed class AppLogger : IDisposable
     {
         lock (_sync)
         {
+            _disposed = true;
             _writer?.Dispose();
             _errorWriter?.Dispose();
         }
@@ -7480,6 +7579,12 @@ internal sealed class CliOptions
     public bool Watch { get; init; }
 
     public TimeSpan WatchInterval { get; init; } = TimeSpan.FromHours(24);
+
+    /// <summary>
+    /// Как часто бот присылает сводку в режиме сервера, даже если ничего не добавлено.
+    /// null — не присылать. Задаётся переменной BOT_DIGEST: 1d (по умолчанию), 12h, off.
+    /// </summary>
+    public TimeSpan? DigestInterval { get; init; } = TimeSpan.FromDays(1);
 
     /// <summary>Читать в каналах только посты, появившиеся после прошлого прогона.</summary>
     public bool TelegramOnlyNew { get; init; }
@@ -8074,6 +8179,24 @@ internal sealed class CliOptions
             }
         }
 
+        TimeSpan? digestInterval = TimeSpan.FromDays(1);
+        var digestText = Environment.GetEnvironmentVariable("BOT_DIGEST")?.Trim().ToLowerInvariant();
+        if (!string.IsNullOrWhiteSpace(digestText))
+        {
+            if (digestText is "off" or "no" or "0" or "false" or "нет")
+            {
+                digestInterval = null;
+            }
+            else if (TryParseInterval(digestText, out var parsedDigest))
+            {
+                digestInterval = parsedDigest;
+            }
+            else if (watch)
+            {
+                Console.WriteLine($"[Сервер] Не понял BOT_DIGEST='{digestText}'. Примеры: 1d, 12h, off. Берём 1d.");
+            }
+        }
+
         var telegramPostLimit = config?.Telegram?.PostLimit ?? 50;
         var telegramScreenshotOnNoLinks = config?.Telegram?.ScreenshotOnNoLinks ?? false;
 
@@ -8099,6 +8222,7 @@ internal sealed class CliOptions
             Watch = watch,
             NotifyTest = cliNotifyTest,
             WatchInterval = watchInterval,
+            DigestInterval = digestInterval,
             TelegramOnlyNew = watch || cliTelegramOnlyNew || (config?.Telegram?.OnlyNew ?? false),
             NotifyBotToken = FirstNonEmpty(cliNotifyBotToken, Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN"), config?.Notify?.TelegramBotToken),
             NotifyChatId = FirstNonEmpty(cliNotifyChatId, Environment.GetEnvironmentVariable("TELEGRAM_CHAT_ID"), config?.Notify?.TelegramChatId),

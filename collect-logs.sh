@@ -99,7 +99,7 @@ fi
 # ---------------------------------------------------------------- память профиля
 if [ -d data ]; then
     mkdir -p "$OUT/data"
-    cp -p data/profiles.json data/telegram_bot_route.txt "$OUT/data/" 2>/dev/null
+    cp -p data/profiles.json data/telegram_bot_route.txt data/bot_digest.json "$OUT/data/" 2>/dev/null
     for dir in data/profiles/*/; do
         [ -d "$dir" ] || continue
         p=$(basename "$dir")

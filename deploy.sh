@@ -312,6 +312,11 @@ umask 077
     echo "SOURCES=$SOURCES_VALUE"
     echo "PROFILE=$PROFILE"
     echo "TZ=$TZ_VALUE"
+    # Настройки, о которых deploy.sh не спрашивает (TELEGRAM_PROXY, BOT_DIGEST и другие,
+    # вписанные руками), переносим как есть — раньше они молча пропадали.
+    if [ -f "$ENV_FILE" ]; then
+        grep -vE '^(#|[[:space:]]*$|(UNITY_EMAIL|UNITY_PASSWORD|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_CHANNELS|WATCH_INTERVAL|SOURCES|PROFILE|TZ)=)' "$ENV_FILE" || true
+    fi
 } > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 mkdir -p data logs

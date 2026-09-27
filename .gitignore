@@ -414,3 +414,6 @@ telegram_sources.local.txt
 
 # Стенд на макетах страниц — только на Steam Deck, в репозиторий не входит
 /harness/
+
+# Архивы логов с сервера (collect-logs.sh): в них логи и память профиля
+uad-diag-*

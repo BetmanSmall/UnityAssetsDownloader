@@ -19,7 +19,14 @@ using System.Text.RegularExpressions;
 /// </summary>
 internal sealed class TelegramNotifier
 {
-    private const string ApiBase = "https://api.telegram.org/bot";
+    /// <summary>
+    /// Адрес Bot API. Переменной TELEGRAM_API_BASE его можно заменить — на зеркало
+    /// Bot API или на макет в стенде (например, http://127.0.0.1:8081).
+    /// </summary>
+    private static readonly string ApiBase =
+        (Environment.GetEnvironmentVariable("TELEGRAM_API_BASE") is { Length: > 0 } custom
+            ? custom.Trim().TrimEnd('/')
+            : "https://api.telegram.org") + "/bot";
 
     /// <summary>
     /// Адреса Bot API. DNS нередко отдаёт тот из них, до которого у сервера нет
@@ -81,7 +88,16 @@ internal sealed class TelegramNotifier
                 ["disable_web_page_preview"] = true
             };
 
-            return await CallAsync("sendMessage", payload) is not null;
+            var sent = await CallAsync("sendMessage", payload) is not null;
+            if (sent)
+            {
+                // По логу должно быть видно, что бот написал: без этой строки молчание
+                // бота снаружи не отличить от сломанной отправки.
+                var firstLine = text.Split('\n', 2)[0].Trim();
+                _logger.Info($"[Бот] Сообщение отправлено: {firstLine}");
+            }
+
+            return sent;
         }
         catch (Exception ex)
         {
@@ -237,6 +253,7 @@ internal sealed class TelegramNotifier
 
         foreach (var route in routes)
         {
+            JsonElement result;
             try
             {
                 using var client = CreateClient(route, timeout ?? TimeSpan.FromSeconds(20));
@@ -245,33 +262,46 @@ internal sealed class TelegramNotifier
                 using var doc = JsonDocument.Parse(json);
                 var root = doc.RootElement;
 
-                if (root.TryGetProperty("ok", out var ok) && ok.GetBoolean())
+                if (!root.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
                 {
-                    RememberRoute(route);
-                    return root.GetProperty("result").Clone();
-                }
-
-                // Telegram ответил, но отказал (неверный токен, чат не найден): другой путь тут не поможет.
-                var description = root.TryGetProperty("description", out var d) ? d.GetString() : response.StatusCode.ToString();
-                if (response.StatusCode == HttpStatusCode.Unauthorized)
-                {
-                    if (!_tokenRejected)
+                    // Telegram ответил, но отказал (неверный токен, чат не найден): другой путь тут не поможет.
+                    var description = root.TryGetProperty("description", out var d) ? d.GetString() : response.StatusCode.ToString();
+                    if (response.StatusCode == HttpStatusCode.Unauthorized)
                     {
-                        _tokenRejected = true;
-                        _logger.Warn("[Бот] Токен бота не подходит (Telegram ответил Unauthorized). Проверьте TELEGRAM_BOT_TOKEN: его выдаёт @BotFather.");
+                        if (!_tokenRejected)
+                        {
+                            _tokenRejected = true;
+                            _logger.Warn("[Бот] Токен бота не подходит (Telegram ответил Unauthorized). Проверьте TELEGRAM_BOT_TOKEN: его выдаёт @BotFather.");
+                        }
+
+                        return null;
                     }
 
+                    _logger.Warn($"[Бот] Telegram отказал ({method}): {description}");
                     return null;
                 }
 
-                _logger.Warn($"[Бот] Telegram отказал ({method}): {description}");
-                return null;
+                result = root.GetProperty("result").Clone();
             }
             catch (Exception ex)
             {
                 lastError = ex;
                 _logger.Debug($"[Бот] Путь не сработал ({route.Describe}): {ex.Message}");
+                continue;
             }
+
+            // Запрос дошёл. Всё, что дальше, — вне перебора путей: любая ошибка здесь
+            // не должна отправить то же сообщение ещё раз другим путём.
+            try
+            {
+                RememberRoute(route);
+            }
+            catch
+            {
+                // Путь не запомнили — в следующий раз найдём заново.
+            }
+
+            return result;
         }
 
         // Путь, который работал, мог перестать: пусть следующий вызов начнёт перебор заново.
