@@ -155,9 +155,19 @@ internal sealed class AssetCatalog
     /// <summary>
     /// Пересобирает все файлы каталога. Метки правил и разметка ИИ пересчитываются каждый
     /// раз: поправили правила или дописали разметку — достаточно пересобрать.
+    ///
+    /// copyTo — куда ещё положить копию (--catalog-dir). Папка запоминается в meta.json, и
+    /// дальше копия обновляется при каждой записи сама; «-» — перестать копировать.
     /// </summary>
     public void Write(IReadOnlyDictionary<string, AssetAiTag> ai, string title, string? copyTo = null)
     {
+        Meta.CopyDir = copyTo switch
+        {
+            "-" => null,
+            { Length: > 0 } dir => Path.GetFullPath(dir),
+            _ => Meta.CopyDir
+        };
+
         System.IO.Directory.CreateDirectory(Directory);
         var nowUtc = DateTime.UtcNow;
         foreach (var e in _entries.Values)
@@ -185,9 +195,9 @@ internal sealed class AssetCatalog
         WriteAtomically(MetaPath, JsonSerializer.Serialize(Meta, MetaJson));
         Changed = false;
 
-        if (!string.IsNullOrWhiteSpace(copyTo))
+        if (Meta.CopyDir is { } target)
         {
-            CopyTo(Path.GetFullPath(copyTo));
+            CopyTo(target);
         }
     }
 
@@ -436,6 +446,9 @@ internal sealed class CatalogMeta
     public int LibraryCount { get; set; }
     public int Total { get; set; }
     public int WithAi { get; set; }
+
+    /// <summary>Куда каждый раз класть копию каталога (запомнено из --catalog-dir).</summary>
+    public string? CopyDir { get; set; }
 }
 
 /// <summary>catalog.html: шаблон из ресурсов сборки + данные каталога, вшитые в страницу как JSON.</summary>

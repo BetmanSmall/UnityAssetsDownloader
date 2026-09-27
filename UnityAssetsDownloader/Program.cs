@@ -2570,7 +2570,7 @@ internal sealed class UnityAssetAutomationApp
         catalog.Write(ai, account, _options.CatalogCopyDir);
         _logger.Info($"[Каталог] Записан: {catalog.Count} ассетов, с разметкой ИИ {catalog.Meta.WithAi}. " +
                      $"Для ИИ-агента — {catalog.IndexPath}, для человека — {catalog.HtmlPath}" +
-                     (string.IsNullOrWhiteSpace(_options.CatalogCopyDir) ? "." : $". Копия: {Path.GetFullPath(_options.CatalogCopyDir)}."));
+                     (catalog.Meta.CopyDir is { } copy ? $". Копия: {copy}." : "."));
     }
 
     /// <summary>
@@ -8102,7 +8102,10 @@ internal sealed class CliOptions
     /// <summary>Перечитать из магазина данные всех ассетов каталога, а не только новых и устаревших.</summary>
     public bool CatalogRefreshAll { get; init; }
 
-    /// <summary>Куда ещё положить копию каталога (--catalog-dir, CATALOG_DIR): общая папка, Unity-проект.</summary>
+    /// <summary>
+    /// Куда ещё положить копию каталога (--catalog-dir, CATALOG_DIR): общая папка, папка с Unity-проектами.
+    /// Запоминается в каталоге профиля; «-» — перестать копировать.
+    /// </summary>
     public string? CatalogCopyDir { get; init; }
 
     /// <summary>
