@@ -1372,6 +1372,34 @@ internal sealed partial class UnityAssetAutomationApp
         {
             _logger.Warn($"Telegram ошибка: {err}");
         }
+
+        await AnnounceNewFabAsync(tgResult);
+    }
+
+    /// <summary>Что из новых ассетов Fab бот уже нашёл, но ещё не отправил (сервер).</summary>
+    private FabAnnouncer? _fabAnnouncer;
+
+    /// <summary>
+    /// Сервер: о новых ассетах Fab в постах бот пишет сразу — забрать их сервер не может
+    /// (Cloudflare просит человека), это делает пункт F на ПК или Deck.
+    /// </summary>
+    private async Task AnnounceNewFabAsync(TelegramParseResult tgResult)
+    {
+        if (!_options.Watch || _notifier is not { Enabled: true })
+        {
+            return;
+        }
+
+        _fabAnnouncer ??= new FabAnnouncer(_profileStore.GetProfileDirectory(_profileName));
+        _fabAnnouncer.Add(tgResult.AllPosts);
+        if (_fabAnnouncer.BuildMessage() is { } text)
+        {
+            _logger.Info("[Fab] В новых постах есть ассеты Fab — сообщаем боту.");
+            if (await _notifier.SendAsync(text))
+            {
+                _fabAnnouncer.MarkSent();
+            }
+        }
     }
 
     /// <summary>Читает каналы за один раз: с каждого до telegram.postLimit последних постов.</summary>
