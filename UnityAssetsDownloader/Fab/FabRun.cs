@@ -38,7 +38,9 @@ internal sealed partial class UnityAssetAutomationApp
         var profileDirectory = _profileStore.GetProfileDirectory(_profileName);
         var fabDirectory = Path.Combine(profileDirectory, "fab");
         Directory.CreateDirectory(fabDirectory);
-        var owned = new OwnedAssetsCache(fabDirectory, "owned.txt", "Ассеты Fab, которые уже в библиотеке аккаунта Epic.");
+        // library.txt — только проверенное: после добавления страница показала «View in My Library».
+        // owned.txt версий 1.28.0–1.28.2 записывался без такой проверки и больше не читается.
+        var owned = new OwnedAssetsCache(fabDirectory, "library.txt", "Ассеты Fab, которые точно в библиотеке аккаунта Epic (проверено по странице).");
         var removed = new OwnedAssetsCache(fabDirectory, "removed.txt", "Ассеты Fab, которых больше нет на сайте.");
         var telegramState = TelegramChannelState.Load(fabDirectory);
 
@@ -304,6 +306,7 @@ internal sealed partial class UnityAssetAutomationApp
                         DetectedFree = claim.Outcome is FabStore.ClaimOutcome.Added or FabStore.ClaimOutcome.WouldAdd,
                         DetectedOwned = claim.Outcome is FabStore.ClaimOutcome.Added or FabStore.ClaimOutcome.AlreadyOwned,
                         DetectionSummary = claim.Summary,
+                        AddedByHuman = claim.ByHuman,
                         Message = $"{claim.Message} Источник: {from}."
                     });
 
@@ -409,12 +412,14 @@ internal sealed partial class UnityAssetAutomationApp
 
         foreach (var group in report.Items.GroupBy(i => i.Status).OrderBy(g => g.Key))
         {
-            _logger.Info($" {DescribeStatus(group.Key)}: {group.Count()}");
-            if (group.Key is AssetProcessStatus.Added or AssetProcessStatus.WouldAddInDryRun or AssetProcessStatus.Failed)
+            var byHuman = group.Count(i => i.AddedByHuman);
+            _logger.Info($" {DescribeStatus(group.Key)}: {group.Count()}" +
+                         (group.Key == AssetProcessStatus.Added && byHuman > 0 ? $" (программой: {group.Count() - byHuman}, вами в окне: {byHuman})" : string.Empty));
+            if (group.Key is AssetProcessStatus.Added or AssetProcessStatus.WouldAddInDryRun or AssetProcessStatus.Failed or AssetProcessStatus.UnknownAfterClick)
             {
                 foreach (var item in group)
                 {
-                    _logger.Info($"   - {item.DetectionSummary ?? item.Url}");
+                    _logger.Info($"   - {item.DetectionSummary ?? item.Url}{(item.AddedByHuman ? " — вами в окне" : string.Empty)}");
                 }
             }
         }

@@ -9225,6 +9225,9 @@ internal sealed class ProcessResult
 
     /// <summary>Промокод, по которому выкупался ассет (если выкупался).</summary>
     public string? PromoCode { get; set; }
+
+    /// <summary>Fab: ассет получил человек в обычном окне (раздача, лицензия), а не программа.</summary>
+    public bool AddedByHuman { get; set; }
 }
 
 internal sealed class AssetStatusSnapshot

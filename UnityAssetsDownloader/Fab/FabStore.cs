@@ -462,6 +462,9 @@ internal sealed partial class FabStore
         public string? Price { get; set; }
         public string Message { get; set; } = string.Empty;
 
+        /// <summary>Добавил человек в обычном окне, а не программа.</summary>
+        public bool ByHuman { get; set; }
+
         public string Summary =>
             string.Join(" | ", new[]
             {
@@ -556,6 +559,29 @@ internal sealed partial class FabStore
           buttonPaid: texts.some(t => /^(buy now|add to cart)$/i.test(t)),
           heading: norm((document.querySelector('h1') || {}).innerText).slice(0, 120) || null };
         """);
+
+    /// <summary>Открывает страницу ассета заново и ждёт до ButtonWait, что она покажет «View in My Library».</summary>
+    private async Task<bool> ConfirmOwnedAsync(string uid)
+    {
+        if (!await OpenAsync(PageUrl(uid)))
+        {
+            return false;
+        }
+
+        var sw = Stopwatch.StartNew();
+        while (sw.Elapsed < ButtonWait)
+        {
+            var view = await ReadListingViewAsync(uid);
+            if (view is { ButtonOwned: true } or { Acquired: true })
+            {
+                return true;
+            }
+
+            await Task.Delay(700);
+        }
+
+        return false;
+    }
 
     /// <summary>
     /// Читает открытую страницу ассета: ждёт его кнопку до ButtonWait. Если на месте страницы —
@@ -717,16 +743,35 @@ internal sealed partial class FabStore
             return await AddByHandAsync(uid, result, "на странице нет данных о лицензиях");
         }
 
+        // «В библиотеку» Fab кладёт только то, что бесплатно само по себе (базовая цена 0) — так
+        // решает и сама страница (isFree = priceTier.price === 0). Раздача со скидкой 100 % — это
+        // покупка за 0 через оформление заказа: на add-to-library Fab отвечает «Not free.»
+        // (Windows 28.09). Покупки программа не оформляет — раздачу получает человек в окне.
+        var trulyFree = free.Where(l => l.Price is null or 0m).ToList();
+        if (trulyFree.Count == 0)
+        {
+            var gift = free.MinBy(l => l.Price ?? 0m)!;
+            result.License = gift.Name ?? gift.Slug;
+            result.Price = $"бесплатно по раздаче (обычно {gift.Price} {gift.Currency})".Replace(" )", ")");
+            if (dryRun)
+            {
+                result.Outcome = ClaimOutcome.WouldAdd;
+                result.Message = "Был бы получен человеком в окне (раздача оформляется как покупка за 0).";
+                return result;
+            }
+
+            return await AddByHandAsync(uid, result,
+                "раздача со скидкой 100 % оформляется как покупка за 0 — покупки программа сама не делает, получает человек");
+        }
+
         // Бесплатная профессиональная лицензия шире личной: берём её, если отдают даром.
-        var ordered = free
+        var ordered = trulyFree
             .OrderBy(l => string.Equals(l.Slug, "professional", StringComparison.OrdinalIgnoreCase) ? 0
                 : string.Equals(l.Slug, "personal", StringComparison.OrdinalIgnoreCase) ? 1 : 2)
             .ToList();
         var offer = ordered[0];
         result.License = offer.Name ?? offer.Slug;
-        result.Price = offer.Price is > 0m && offer.Effective == 0m
-            ? $"бесплатно по раздаче (обычно {offer.Price} {offer.Currency})".Replace(" )", ")")
-            : "бесплатно";
+        result.Price = "бесплатно";
 
         if (dryRun)
         {
@@ -756,9 +801,21 @@ internal sealed partial class FabStore
 
             if (add is { Ok: true })
             {
+                // Ответу «добавлено» не верим на слово: открываем страницу заново и смотрим, что
+                // она сама показывает. Заодно человек видит в окне, что ассет действительно добавлен.
                 result.License = candidate.Name ?? candidate.Slug;
-                result.Outcome = ClaimOutcome.Added;
-                result.Message = "Добавлен в библиотеку Fab.";
+                if (await ConfirmOwnedAsync(uid))
+                {
+                    result.Outcome = ClaimOutcome.Added;
+                    result.Message = "Добавлен в библиотеку Fab (проверено: страница показывает «View in My Library»).";
+                }
+                else
+                {
+                    result.Outcome = ClaimOutcome.Unknown;
+                    result.Message = $"Fab ответил «добавлено» ({add.Describe()}), но страница после перезагрузки не показывает «View in My Library».";
+                    await SaveDiagnosticsAsync($"fab-unconfirmed-{uid[..8]}");
+                }
+
                 return result;
             }
 
@@ -788,9 +845,10 @@ internal sealed partial class FabStore
         var byHand = await AskHumanAsync(
             "FAB: ДОБАВЬТЕ АССЕТ КНОПКОЙ",
             [
-                $"Ассет «{result.Title ?? uid}»: {Shorten(reason, 120)}.",
-                "Сейчас откроется обычное окно Chrome с этим ассетом. Нажмите «Add to My Library»;",
-                "если Fab попросит принять лицензию (Fab EULA) — примите её: это один раз на аккаунт.",
+                $"Ассет «{result.Title ?? uid}»: {Shorten(reason, 160)}.",
+                "Сейчас откроется обычное окно Chrome с этим ассетом. Получите его кнопкой на странице",
+                "(«Add to My Library» или оформление за 0 — проверьте, что к оплате 0). Попросит",
+                "принять лицензию Fab EULA — примите: это один раз на аккаунт.",
                 "Когда кнопка сменится на «View in My Library» — закройте окно, программа продолжит."
             ],
             PageUrl(uid),
@@ -798,6 +856,7 @@ internal sealed partial class FabStore
             ManualAddWait,
             "fab-add-by-hand");
 
+        result.ByHuman = byHand;
         result.Outcome = byHand ? ClaimOutcome.Added : ClaimOutcome.Failed;
         result.Message = byHand ? "Добавлен в библиотеку Fab (кнопкой в окне)." : $"Не добавился: {reason}";
         return result;
