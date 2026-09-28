@@ -11,8 +11,14 @@ using PuppeteerSharp;
 /// Chrome 154, запущенный как обычная программа, открыл fab.com сам за 4 секунды.
 ///
 /// Поэтому здесь: настоящий Chrome (или Edge) из системы, своя постоянная папка профиля,
-/// никаких ключей автоматизации, и только разовые команды DevTools. Проверку «я человек»
-/// программа не проходит за человека: если она появится, её отмечает человек в окне.
+/// никаких ключей автоматизации, и только разовые команды DevTools.
+///
+/// Окно, которым управляет программа, честно сообщает сайту об этом (navigator.webdriver),
+/// и проверка Cloudflare «я человек» ему не верит даже после клика человека — просит снова,
+/// по кругу (Windows, 28.09). Поэтому всё, что делает человек, он делает в обычном окне без
+/// программы: HandOverToHumanAsync закрывает окно программы и открывает тот же профиль как
+/// обычный Chrome; человек закрывает его — программа открывает своё и продолжает.
+/// Скрывать от сайта, что окном управляет программа, мы не стали: это уже обход защиты.
 /// </summary>
 internal sealed class HumanBrowser : IAsyncDisposable
 {
@@ -33,6 +39,12 @@ internal sealed class HumanBrowser : IAsyncDisposable
         /// <summary>Только для стенда на макетах: fab.com невидимый браузер не пускает.</summary>
         public bool Headless { get; init; }
 
+        /// <summary>
+        /// Только для стенда: «человек» в окне без программы. Вызывается вместо ожидания, пока
+        /// человек закроет окно; потом окно закрывается само.
+        /// </summary>
+        public Func<Task>? HumanStandIn { get; init; }
+
         public TimeSpan StartTimeout { get; init; } = TimeSpan.FromSeconds(60);
     }
 
@@ -46,46 +58,45 @@ internal sealed class HumanBrowser : IAsyncDisposable
     private static readonly bool InsideFlatpak = File.Exists("/.flatpak-info");
 
     private readonly AppLogger _logger;
-    private readonly Process? _process;
-    private readonly int _port;
-    private readonly CdpSession _page;
+    private readonly LaunchSettings _settings;
+    private Candidate? _candidate;
+    private bool _noSandbox;
+    private Process? _process;
+    private int _port;
+    private CdpSession? _pageSession;
+
+    private CdpSession Tab => _pageSession ?? throw new CdpException("окно браузера не открыто", disconnected: true);
 
     /// <summary>Что за браузер: «Google Chrome 154 (Flatpak)».</summary>
-    public string Description { get; }
+    public string Description { get; private set; } = string.Empty;
 
     /// <summary>Настоящий браузер, а не запасной Chromium для тестов.</summary>
-    public bool IsRealBrowser { get; }
+    public bool IsRealBrowser { get; private set; }
 
     /// <summary>Окно браузера на месте: его не закрыли и связь с ним есть.</summary>
-    public bool IsAlive => _page.IsOpen && (_process is null || !_process.HasExited);
+    public bool IsAlive => _pageSession is { IsOpen: true } && (_process is null || !_process.HasExited);
 
-    private HumanBrowser(AppLogger logger, Process? process, int port, CdpSession page, string description, bool real)
+    private HumanBrowser(AppLogger logger, LaunchSettings settings)
     {
         _logger = logger;
-        _process = process;
-        _port = port;
-        _page = page;
-        Description = description;
-        IsRealBrowser = real;
+        _settings = settings;
     }
 
     public static async Task<HumanBrowser> LaunchAsync(LaunchSettings settings, AppLogger logger)
     {
         Directory.CreateDirectory(settings.UserDataDir);
+        var browser = new HumanBrowser(logger, settings);
 
         // Окно от прошлого запуска ещё открыто (программу прервали) — работаем в нём же:
         // второй браузер на ту же папку профиля всё равно не запустится.
-        var attached = await TryAttachAsync(settings.UserDataDir, logger, null, "окно от прошлого запуска", true);
-        if (attached is not null)
+        if (await browser.TryAttachAsync(null, "окно от прошлого запуска", real: true))
         {
             logger.Info("[Браузер] Окно Fab от прошлого запуска ещё открыто — продолжаем в нём.");
-            return attached;
+            return browser;
         }
 
-        var candidates = await FindCandidatesAsync(settings, logger);
         var failures = new List<string>();
-
-        foreach (var candidate in candidates)
+        foreach (var candidate in await FindCandidatesAsync(settings, logger))
         {
             if (!candidate.Real)
             {
@@ -94,14 +105,15 @@ internal sealed class HumanBrowser : IAsyncDisposable
                 logger.Warn("[Браузер] Лучше поставить Google Chrome (на Steam Deck — из Discover, это Flatpak).");
             }
 
-            var browser = await TryStartAsync(candidate, settings, logger, noSandbox: NeedsNoSandbox(candidate), failures);
-            if (browser is null && candidate.FlatpakApp is null && OperatingSystem.IsLinux() && !NeedsNoSandbox(candidate))
+            var noSandbox = NeedsNoSandbox(candidate);
+            if (await browser.TryStartAsync(candidate, noSandbox, failures))
             {
-                // Песочница Chrome не везде доступна (контейнеры, вложенные песочницы) — второй раз без неё.
-                browser = await TryStartAsync(candidate, settings, logger, noSandbox: true, failures);
+                return browser;
             }
 
-            if (browser is not null)
+            // Песочница Chrome не везде доступна (контейнеры, вложенные песочницы) — второй раз без неё.
+            if (candidate.FlatpakApp is null && OperatingSystem.IsLinux() && !noSandbox &&
+                await browser.TryStartAsync(candidate, noSandbox: true, failures))
             {
                 return browser;
             }
@@ -117,13 +129,15 @@ internal sealed class HumanBrowser : IAsyncDisposable
         OperatingSystem.IsLinux() && candidate.FlatpakApp is null &&
         (InsideFlatpak || File.Exists("/.dockerenv") || Environment.UserName == "root");
 
-    private static async Task<HumanBrowser?> TryStartAsync(
-        Candidate candidate, LaunchSettings settings, AppLogger logger, bool noSandbox, List<string> failures)
-    {
-        var udd = Path.GetFullPath(settings.UserDataDir);
-        var portFile = Path.Combine(udd, "DevToolsActivePort");
-        TryDelete(portFile);
+    private string UserDataDir => Path.GetFullPath(_settings.UserDataDir);
 
+    /// <summary>
+    /// Ключи запуска. debug — окно программы (с портом DevTools); без него — обычное окно для
+    /// человека: тот же профиль, тот же браузер, никакой связи с программой.
+    /// </summary>
+    private List<string> BuildArgs(Candidate candidate, bool noSandbox, bool debug, string url)
+    {
+        var udd = UserDataDir;
         var args = new List<string>(candidate.Prefix);
         if (candidate.FlatpakApp is not null)
         {
@@ -132,9 +146,13 @@ internal sealed class HumanBrowser : IAsyncDisposable
         }
 
         args.Add($"--user-data-dir={udd}");
-        // Порт выбирает сам браузер и пишет его в DevToolsActivePort: у каждого запуска свой,
-        // постоянный порт на машине не висит.
-        args.Add("--remote-debugging-port=0");
+        if (debug)
+        {
+            // Порт выбирает сам браузер и пишет его в DevToolsActivePort: у каждого запуска свой,
+            // постоянный порт на машине не висит.
+            args.Add("--remote-debugging-port=0");
+        }
+
         args.Add("--no-first-run");
         args.Add("--no-default-browser-check");
         args.Add("--disable-search-engine-choice-screen");
@@ -145,7 +163,7 @@ internal sealed class HumanBrowser : IAsyncDisposable
             // окно, которого никто не ждёт. Папка профиля и так только ваша.
             args.Add("--password-store=basic");
 
-            if (candidate.FlatpakApp is null && !settings.Headless &&
+            if (candidate.FlatpakApp is null && !_settings.Headless &&
                 string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY")) &&
                 !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY")))
             {
@@ -158,7 +176,7 @@ internal sealed class HumanBrowser : IAsyncDisposable
             }
         }
 
-        if (settings.Window is { } w)
+        if (_settings.Window is { } w)
         {
             args.Add($"--window-position={w.X},{w.Y}");
             args.Add($"--window-size={w.Width},{w.Height}");
@@ -168,64 +186,75 @@ internal sealed class HumanBrowser : IAsyncDisposable
             args.Add("--window-size=1280,900");
         }
 
-        if (settings.Headless)
+        if (_settings.Headless)
         {
             args.Add("--headless=new");
         }
 
-        args.Add("about:blank");
+        args.Add(url);
+        return args;
+    }
 
-        logger.Info($"[Браузер] Запускаем: {candidate.Title}");
-        logger.Debug($"[Браузер] {candidate.FileName} {string.Join(" ", args)}");
+    private Process StartProcess(Candidate candidate, List<string> args, Queue<string> errorTail)
+    {
+        _logger.Debug($"[Браузер] {candidate.FileName} {string.Join(" ", args)}");
+        var psi = new ProcessStartInfo(candidate.FileName)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        foreach (var a in args)
+        {
+            psi.ArgumentList.Add(a);
+        }
 
+        var process = Process.Start(psi) ?? throw new InvalidOperationException("процесс не создан");
+        // Chrome много пишет в консоль; не читать — значит однажды повиснуть на полном буфере.
+        process.OutputDataReceived += (_, _) => { };
+        process.ErrorDataReceived += (_, e) =>
+        {
+            if (string.IsNullOrWhiteSpace(e.Data)) return;
+            lock (errorTail)
+            {
+                errorTail.Enqueue(e.Data);
+                while (errorTail.Count > 12) errorTail.Dequeue();
+            }
+        };
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+        return process;
+    }
+
+    /// <summary>Запускает окно программы и подключается к нему. false — не вышло (причина в failures).</summary>
+    private async Task<bool> TryStartAsync(Candidate candidate, bool noSandbox, List<string> failures)
+    {
+        var portFile = Path.Combine(UserDataDir, "DevToolsActivePort");
+        TryDelete(portFile);
+
+        _logger.Info($"[Браузер] Запускаем: {candidate.Title}");
         var errorTail = new Queue<string>();
         Process process;
         try
         {
-            var psi = new ProcessStartInfo(candidate.FileName)
-            {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-            foreach (var a in args)
-            {
-                psi.ArgumentList.Add(a);
-            }
-
-            process = Process.Start(psi) ?? throw new InvalidOperationException("процесс не создан");
-            // Chrome много пишет в консоль; не читать — значит однажды повиснуть на полном буфере.
-            process.OutputDataReceived += (_, _) => { };
-            process.ErrorDataReceived += (_, e) =>
-            {
-                if (string.IsNullOrWhiteSpace(e.Data)) return;
-                lock (errorTail)
-                {
-                    errorTail.Enqueue(e.Data);
-                    while (errorTail.Count > 12) errorTail.Dequeue();
-                }
-            };
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
+            process = StartProcess(candidate, BuildArgs(candidate, noSandbox, debug: true, "about:blank"), errorTail);
         }
         catch (Exception ex)
         {
             failures.Add($"{candidate.Title}: не запустился ({ex.Message})");
-            return null;
+            return false;
         }
 
         var started = Stopwatch.StartNew();
-        while (started.Elapsed < settings.StartTimeout)
+        while (started.Elapsed < _settings.StartTimeout)
         {
             await Task.Delay(250);
-            if (File.Exists(portFile))
+            if (File.Exists(portFile) && await TryAttachAsync(process, candidate.Title, candidate.Real))
             {
-                var browser = await TryAttachAsync(udd, logger, process, candidate.Title, candidate.Real);
-                if (browser is not null)
-                {
-                    return browser;
-                }
+                _candidate = candidate;
+                _noSandbox = noSandbox;
+                return true;
             }
 
             if (process.HasExited)
@@ -241,31 +270,33 @@ internal sealed class HumanBrowser : IAsyncDisposable
                     failures.Add("похоже, окно браузера Fab уже открыто без связи с программой — закройте его и запустите снова");
                 }
 
-                return null;
+                process.Dispose();
+                return false;
             }
         }
 
-        failures.Add($"{candidate.Title}: не ответил за {settings.StartTimeout.TotalSeconds:0} с");
+        failures.Add($"{candidate.Title}: не ответил за {_settings.StartTimeout.TotalSeconds:0} с");
         TryKill(process);
-        return null;
+        process.Dispose();
+        return false;
     }
 
     /// <summary>Подключается к браузеру, который держит эту папку профиля (по DevToolsActivePort).</summary>
-    private static async Task<HumanBrowser?> TryAttachAsync(string udd, AppLogger logger, Process? process, string title, bool real)
+    private async Task<bool> TryAttachAsync(Process? process, string title, bool real)
     {
-        var portFile = Path.Combine(udd, "DevToolsActivePort");
+        var portFile = Path.Combine(UserDataDir, "DevToolsActivePort");
         int port;
         try
         {
             if (!File.Exists(portFile) ||
                 !int.TryParse(File.ReadLines(portFile).FirstOrDefault()?.Trim(), out port) || port <= 0)
             {
-                return null;
+                return false;
             }
         }
         catch
         {
-            return null;
+            return false;
         }
 
         try
@@ -276,24 +307,223 @@ internal sealed class HumanBrowser : IAsyncDisposable
             var pageUrl = await FindPageTargetAsync(port);
             if (pageUrl is null)
             {
-                return null;
+                return false;
             }
 
-            var page = await CdpSession.ConnectAsync(pageUrl, TimeSpan.FromSeconds(10));
-            var description = string.IsNullOrWhiteSpace(product) ? title : $"{title} — {product}";
-            logger.Info($"[Браузер] Готов: {description}");
-            return new HumanBrowser(logger, process, port, page, description, real);
+            _pageSession = await CdpSession.ConnectAsync(pageUrl, TimeSpan.FromSeconds(10));
+            _process = process;
+            _port = port;
+            Description = string.IsNullOrWhiteSpace(product) ? title : $"{title} — {product}";
+            IsRealBrowser = real;
+            _logger.Info($"[Браузер] Готов: {Description}");
+            return true;
         }
         catch (Exception ex) when (process is null)
         {
             // Старый файл порта от закрытого браузера — это нормально, запустим новый.
-            logger.Debug($"[Браузер] К прошлому окну не подключились: {ex.Message}");
-            return null;
+            _logger.Debug($"[Браузер] К прошлому окну не подключились: {ex.Message}");
+            return false;
         }
         catch (Exception ex)
         {
-            logger.Debug($"[Браузер] Порт {port} ещё не отвечает: {ex.Message}");
-            return null;
+            _logger.Debug($"[Браузер] Порт {port} ещё не отвечает: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Отдаёт браузер человеку: закрывает окно программы, открывает тот же профиль как обычный
+    /// Chrome на странице url и ждёт, пока человек закроет окно (или timeout). Потом снова
+    /// открывает окно программы — с тем же профилем, где уже пройдена проверка или выполнен вход.
+    /// true — человек закрыл окно сам.
+    /// </summary>
+    public async Task<bool> HandOverToHumanAsync(string url, TimeSpan timeout)
+    {
+        var candidate = _candidate ?? (await FindCandidatesAsync(_settings, _logger)).FirstOrDefault()
+            ?? throw new CdpException("не найден браузер для окна человека", disconnected: true);
+        var noSandbox = _candidate is null ? NeedsNoSandbox(candidate) : _noSandbox;
+
+        await CloseBrowserAsync();
+        TryDelete(Path.Combine(UserDataDir, "DevToolsActivePort"));
+
+        bool closedByHuman;
+        var errorTail = new Queue<string>();
+        using (var human = StartProcess(candidate, BuildArgs(candidate, noSandbox, debug: false, url), errorTail))
+        {
+            var opened = Stopwatch.StartNew();
+            if (_settings.HumanStandIn is { } standIn)
+            {
+                await standIn();
+                closedByHuman = true;
+                await CloseGracefullyAsync(human, candidate);
+            }
+            else
+            {
+                closedByHuman = await WaitForExitAsync(human, timeout);
+                if (!closedByHuman)
+                {
+                    await CloseGracefullyAsync(human, candidate);
+                }
+                else if (opened.Elapsed < TimeSpan.FromSeconds(3))
+                {
+                    _logger.Warn("[Браузер] Обычное окно закрылось сразу — возможно, Chrome с этой папкой ещё не закрылся.");
+                }
+            }
+        }
+
+        var failures = new List<string>();
+        if (!await TryStartAsync(candidate, noSandbox, failures))
+        {
+            throw new CdpException("окно программы не открылось снова: " + string.Join(" | ", failures), disconnected: true);
+        }
+
+        return closedByHuman;
+    }
+
+    /// <summary>Закрывает окно программы штатно (Chrome записывает cookies на диск) и ждёт, пока оно закроется.</summary>
+    private async Task CloseBrowserAsync()
+    {
+        try
+        {
+            using var version = JsonDocument.Parse(await Local.GetStringAsync($"http://127.0.0.1:{_port}/json/version"));
+            if (version.RootElement.TryGetProperty("webSocketDebuggerUrl", out var ws) && ws.GetString() is { } url)
+            {
+                await using var browser = await CdpSession.ConnectAsync(url, TimeSpan.FromSeconds(5));
+                try
+                {
+                    await browser.SendAsync("Browser.close", timeout: TimeSpan.FromSeconds(5));
+                }
+                catch (CdpException)
+                {
+                    // Браузер закрывается и рвёт соединение, не успев ответить, — так и должно быть.
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"[Браузер] Штатно закрыть не вышло: {ex.Message}");
+        }
+
+        if (_pageSession is not null)
+        {
+            await _pageSession.DisposeAsync();
+            _pageSession = null;
+        }
+
+        if (_process is not null)
+        {
+            if (!await WaitForExitAsync(_process, TimeSpan.FromSeconds(10)) && _candidate is not null)
+            {
+                await CloseGracefullyAsync(_process, _candidate);
+            }
+
+            TryKill(_process);
+            _process.Dispose();
+            _process = null;
+        }
+        else
+        {
+            // Окно от прошлого запуска: процесса у нас нет — ждём, пока порт перестанет отвечать.
+            var sw = Stopwatch.StartNew();
+            while (sw.Elapsed < TimeSpan.FromSeconds(10))
+            {
+                try
+                {
+                    await Local.GetStringAsync($"http://127.0.0.1:{_port}/json/version");
+                    await Task.Delay(300);
+                }
+                catch
+                {
+                    break;
+                }
+            }
+        }
+
+        // Chrome дописывает профиль ещё мгновение после выхода процесса.
+        await Task.Delay(500);
+    }
+
+    private static async Task<bool> WaitForExitAsync(Process process, TimeSpan timeout)
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(timeout);
+            await process.WaitForExitAsync(cts.Token);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Просит окно закрыться, как будто нажали крестик; не закрылось за 10 с — закрывает силой.
+    ///
+    /// Flatpak-браузер — отдельный процесс хоста: сигнал процессу flatpak/flatpak-spawn до него
+    /// не доходит (проверено на Deck 28.09 — Chrome оставался). Поэтому сигнал идёт самому браузеру,
+    /// найденному по папке профиля. Шаблон начинается с /app/ — так он не заденет ни личный Chrome
+    /// человека, ни терминал, в строке запуска которого случайно встретится этот путь.
+    /// </summary>
+    private async Task CloseGracefullyAsync(Process process, Candidate candidate)
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                process.CloseMainWindow();
+            }
+            else if (candidate.FlatpakApp is not null)
+            {
+                await SignalFlatpakBrowserAsync("-TERM");
+            }
+            else
+            {
+                await RunQuietAsync("kill", ["-TERM", process.Id.ToString()]);
+            }
+        }
+        catch
+        {
+            // Уже закрылось.
+        }
+
+        if (!await WaitForExitAsync(process, TimeSpan.FromSeconds(10)))
+        {
+            if (candidate.FlatpakApp is not null)
+            {
+                await SignalFlatpakBrowserAsync("-KILL");
+            }
+
+            TryKill(process);
+        }
+    }
+
+    private Task SignalFlatpakBrowserAsync(string signal)
+    {
+        var pattern = $"^/app/\\S+ .*--user-data-dir={EscapeRegex(UserDataDir)}( |$)";
+        return InsideFlatpak
+            ? RunQuietAsync("/usr/bin/flatpak-spawn", ["--host", "pkill", signal, "-f", pattern])
+            : RunQuietAsync("pkill", [signal, "-f", pattern]);
+    }
+
+    private static string EscapeRegex(string text) =>
+        string.Concat(text.Select(c => "\\.^$|?*+()[]{}".Contains(c) ? "\\" + c : c.ToString()));
+
+    private static async Task RunQuietAsync(string file, string[] args)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(file) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (var a in args) psi.ArgumentList.Add(a);
+            using var p = Process.Start(psi);
+            if (p is not null)
+            {
+                await WaitForExitAsync(p, TimeSpan.FromSeconds(5));
+            }
+        }
+        catch
+        {
+            // Нет pkill/kill — закроем силой ниже.
         }
     }
 
@@ -475,7 +705,7 @@ internal sealed class HumanBrowser : IAsyncDisposable
     public async Task NavigateAsync(string url, TimeSpan timeout)
     {
         var before = await TryEvaluateAsync("performance.timeOrigin");
-        var reply = await _page.SendAsync("Page.navigate", new Dictionary<string, object?> { ["url"] = url }, timeout);
+        var reply = await Tab.SendAsync("Page.navigate", new Dictionary<string, object?> { ["url"] = url }, timeout);
         if (reply.ValueKind == JsonValueKind.Object && reply.TryGetProperty("errorText", out var error) &&
             error.GetString() is { Length: > 0 } text && !text.Contains("ERR_ABORTED", StringComparison.OrdinalIgnoreCase))
         {
@@ -513,7 +743,7 @@ internal sealed class HumanBrowser : IAsyncDisposable
     /// <summary>Выполняет JavaScript на странице и возвращает значение (объекты — как JSON).</summary>
     public async Task<JsonElement> EvaluateAsync(string expression, TimeSpan? timeout = null)
     {
-        var reply = await _page.SendAsync("Runtime.evaluate", new Dictionary<string, object?>
+        var reply = await Tab.SendAsync("Runtime.evaluate", new Dictionary<string, object?>
         {
             ["expression"] = expression,
             ["returnByValue"] = true,
@@ -558,7 +788,7 @@ internal sealed class HumanBrowser : IAsyncDisposable
     {
         try
         {
-            await _page.SendAsync("Page.bringToFront");
+            await Tab.SendAsync("Page.bringToFront");
         }
         catch (CdpException ex) when (!ex.IsDisconnected)
         {
@@ -570,7 +800,7 @@ internal sealed class HumanBrowser : IAsyncDisposable
     {
         try
         {
-            var shot = await _page.SendAsync("Page.captureScreenshot",
+            var shot = await Tab.SendAsync("Page.captureScreenshot",
                 new Dictionary<string, object?> { ["format"] = "png" }, TimeSpan.FromSeconds(20));
             await File.WriteAllBytesAsync(path, Convert.FromBase64String(shot.GetProperty("data").GetString()!));
         }
@@ -599,7 +829,7 @@ internal sealed class HumanBrowser : IAsyncDisposable
         var result = new List<(string, bool)>();
         try
         {
-            var reply = await _page.SendAsync("Network.getCookies",
+            var reply = await Tab.SendAsync("Network.getCookies",
                 new Dictionary<string, object?> { ["urls"] = new[] { url } });
             foreach (var c in reply.GetProperty("cookies").EnumerateArray())
             {
@@ -615,46 +845,7 @@ internal sealed class HumanBrowser : IAsyncDisposable
     }
 
     /// <summary>Закрывает браузер штатно: так Chrome успевает записать cookies на диск.</summary>
-    public async ValueTask DisposeAsync()
-    {
-        try
-        {
-            using var version = JsonDocument.Parse(await Local.GetStringAsync($"http://127.0.0.1:{_port}/json/version"));
-            if (version.RootElement.TryGetProperty("webSocketDebuggerUrl", out var ws) && ws.GetString() is { } url)
-            {
-                await using var browser = await CdpSession.ConnectAsync(url, TimeSpan.FromSeconds(5));
-                try
-                {
-                    await browser.SendAsync("Browser.close", timeout: TimeSpan.FromSeconds(5));
-                }
-                catch (CdpException)
-                {
-                    // Браузер закрывается и рвёт соединение, не успев ответить, — так и должно быть.
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.Debug($"[Браузер] Штатно закрыть не вышло: {ex.Message}");
-        }
-
-        await _page.DisposeAsync();
-
-        if (_process is not null)
-        {
-            try
-            {
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-                await _process.WaitForExitAsync(cts.Token);
-            }
-            catch
-            {
-                TryKill(_process);
-            }
-
-            _process.Dispose();
-        }
-    }
+    public async ValueTask DisposeAsync() => await CloseBrowserAsync();
 
     private static void TryKill(Process process)
     {

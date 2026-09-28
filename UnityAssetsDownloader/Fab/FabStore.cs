@@ -36,7 +36,7 @@ internal sealed partial class FabStore
     public TimeSpan ManualAddWait { get; init; } = TimeSpan.FromMinutes(3);
 
     /// <summary>Сколько Cloudflare даём пропустить браузер самому, прежде чем звать человека.</summary>
-    public TimeSpan ChallengeSelfPass { get; init; } = TimeSpan.FromSeconds(25);
+    public TimeSpan ChallengeSelfPass { get; init; } = TimeSpan.FromSeconds(15);
 
     /// <summary>Сколько ждём, что Epic вспомнит аккаунт и вернёт на Fab без пароля.</summary>
     public TimeSpan EpicRememberWait { get; init; } = TimeSpan.FromSeconds(20);
@@ -226,7 +226,8 @@ internal sealed partial class FabStore
 
             if (probe is { Challenge: true } && !announced)
             {
-                _logger.Info("[Fab] Cloudflare проверяет браузер. Обычно он пропускает сам за несколько секунд...");
+                _logger.Info($"[Fab] Cloudflare проверяет браузер — ждём {ChallengeSelfPass.TotalSeconds:0} с, вдруг пропустит сам.");
+                _logger.Info("[Fab] В этом окне галочку не нажимайте: если понадобится, откроется обычное окно Chrome.");
                 announced = true;
             }
 
@@ -234,16 +235,29 @@ internal sealed partial class FabStore
         }
 
         ChallengesByHuman++;
-        return await WaitForHumanAsync(
+        var url = (await ProbeAsync())?.Url is { Length: > 0 } now && !now.StartsWith("about:", StringComparison.Ordinal) ? now : LimitedTimeFreeUrl;
+        var passed = await AskHumanAsync(
             "FAB ПРОСИТ ПОДТВЕРДИТЬ, ЧТО ВЫ ЧЕЛОВЕК",
             [
-                "В окне браузера отметьте галочку «Verify you are human» (Cloudflare).",
-                "Программа сама её не нажимает — это делает человек, один раз:",
-                "после проверки браузер запоминает её, следующие страницы откроются сами."
+                "Сейчас окно программы закроется и откроется обычное окно Chrome — тот же профиль,",
+                "но без программы. Отметьте в нём галочку «Verify you are human» и дождитесь",
+                "обычной страницы Fab. Ещё не входили в Epic — можно войти прямо там (Sign in).",
+                "Потом просто закройте это окно — программа продолжит сама.",
+                "(В окне программы галочка не проходит: Cloudflare видит, что им управляют, и просит снова.)"
             ],
+            url,
             async () => (await ProbeAsync()) is { Challenge: false },
             ChallengeWait,
             "fab-challenge");
+
+        if (!passed && _lastHandOverClosedByHuman)
+        {
+            _logger.Warn("[Fab] Обычное окно прошло проверку, а окно программы Cloudflare всё равно не пускает.");
+            _logger.Warn("[Fab] Так бывает, когда адрес недавно открывал Fab слишком часто. Подождите час-другой и");
+            _logger.Warn("[Fab] запустите снова — Cloudflare успокаивается сам.");
+        }
+
+        return passed;
     }
 
     // ------------------------------------------------------------------ вход
@@ -354,14 +368,15 @@ internal sealed partial class FabStore
             }
         }
 
-        var ok = await WaitForHumanAsync(
+        var ok = await AskHumanAsync(
             "ВОЙДИТЕ В АККАУНТ EPIC GAMES",
             [
-                "В открытом окне браузера войдите в Epic Games — так, как вам удобно:",
-                "почта и пароль, Google, Apple, код из письма. Если попросят подтвердить,",
-                "что вы человек, — подтвердите. Это обычный браузер, входить можно спокойно.",
+                "Сейчас откроется обычное окно Chrome (без программы, профиль Fab). Войдите в Epic Games",
+                "как удобно: почта и пароль, Google, Apple, код из письма. Попросят подтвердить,",
+                "что вы человек, — подтвердите. Когда увидите Fab — закройте окно, программа продолжит.",
                 "Вход запоминается в папке браузера Fab: в следующий раз войдёт сам."
             ],
+            loginUrl,
             async () => await IsSignedInAsync() == true,
             LoginWait,
             "fab-login");
@@ -588,7 +603,13 @@ internal sealed partial class FabStore
 
         if (!await OpenAsync(PageUrl(uid)))
         {
-            return new ClaimResult { Outcome = ClaimOutcome.Failed, Message = "Страница ассета не открылась." };
+            return new ClaimResult
+            {
+                Outcome = ClaimOutcome.Failed,
+                Message = await ProbeAsync() is { Challenge: true }
+                    ? "Cloudflare не пропустил страницу ассета в окно программы."
+                    : "Страница ассета не открылась."
+            };
         }
 
         // Страница сама узнаёт, есть ли ассет в библиотеке, и рисует кнопку — ждём её. Если вместо
@@ -764,13 +785,15 @@ internal sealed partial class FabStore
         _logger.Info($"[Fab] Нужен человек: {reason}.");
         await SaveDiagnosticsAsync($"fab-add-failed-{uid[..8]}");
 
-        var byHand = await WaitForHumanAsync(
-            "FAB: ДОБАВЬТЕ АССЕТ РУКАМИ",
+        var byHand = await AskHumanAsync(
+            "FAB: ДОБАВЬТЕ АССЕТ КНОПКОЙ",
             [
-                $"Ассет «{result.Title ?? uid}» не добавился автоматически ({Shorten(reason, 120)}).",
-                "В окне браузера нажмите «Add to My Library». Если Fab попросит принять лицензию",
-                "(Fab EULA) — примите её: это нужно один раз на аккаунт, дальше программа справится сама."
+                $"Ассет «{result.Title ?? uid}»: {Shorten(reason, 120)}.",
+                "Сейчас откроется обычное окно Chrome с этим ассетом. Нажмите «Add to My Library»;",
+                "если Fab попросит принять лицензию (Fab EULA) — примите её: это один раз на аккаунт.",
+                "Когда кнопка сменится на «View in My Library» — закройте окно, программа продолжит."
             ],
+            PageUrl(uid),
             async () => (await ReadListingViewAsync(uid))?.ButtonOwned == true,
             ManualAddWait,
             "fab-add-by-hand");
@@ -857,11 +880,17 @@ internal sealed partial class FabStore
 
     // ------------------------------------------------------------------ человек
 
+    /// <summary>Закрыл ли человек обычное окно сам в последний раз (а не истекло время).</summary>
+    private bool _lastHandOverClosedByHuman;
+
     /// <summary>
-    /// Зовёт человека: крупное сообщение в консоли, окно браузера наверх, сообщение боту.
-    /// Ждёт, пока done() не скажет «готово», или timeout.
+    /// Зовёт человека. Окно программы закрывается, открывается тот же профиль обычным Chrome на
+    /// странице url — в нём человек проходит проверку, входит или жмёт кнопку, как на своём
+    /// компьютере. Закрыл окно — программа открывает своё, идёт на url и проверяет done().
+    /// Не вышло — ещё одна попытка. Сообщение в консоли и боту — чтобы человек знал, что делать.
     /// </summary>
-    private async Task<bool> WaitForHumanAsync(string title, string[] lines, Func<Task<bool>> done, TimeSpan timeout, string shotPrefix)
+    private async Task<bool> AskHumanAsync(string title, string[] lines, string url, Func<Task<bool>> done,
+        TimeSpan timeout, string shotPrefix, int attempts = 2)
     {
         if (!_interactive)
         {
@@ -870,47 +899,58 @@ internal sealed partial class FabStore
             return false;
         }
 
-        _logger.Info("============================================================");
-        _logger.Info($" {title}");
-        foreach (var line in lines)
+        _lastHandOverClosedByHuman = false;
+        for (var attempt = 1; attempt <= attempts; attempt++)
         {
-            _logger.Info($" {line}");
-        }
-
-        _logger.Info($" Программа ждёт до {timeout.TotalMinutes:0} мин и продолжит сама.");
-        _logger.Info("============================================================");
-
-        await _browser.BringToFrontAsync();
-        if (_notify is not null)
-        {
-            await _notify($"⏳ Fab ждёт вас: {title.ToLowerInvariant()}. Окно браузера открыто на компьютере.");
-        }
-
-        var sw = Stopwatch.StartNew();
-        var nextNote = TimeSpan.FromMinutes(1);
-        while (sw.Elapsed < timeout)
-        {
-            if (!_browser.IsAlive)
+            _logger.Info("============================================================");
+            _logger.Info($" {title}{(attempt > 1 ? " (ещё раз)" : string.Empty)}");
+            foreach (var line in lines)
             {
-                throw new CdpException("окно браузера закрыли", disconnected: true);
+                _logger.Info($" {line}");
             }
 
-            if (await done())
+            _logger.Info($" Программа ждёт до {timeout.TotalMinutes:0} мин.");
+            _logger.Info("============================================================");
+
+            if (attempt == 1 && _notify is not null)
             {
-                _logger.Info($"[Fab] Готово, спасибо. Продолжаем ({sw.Elapsed.TotalSeconds:0} с).");
-                return true;
+                await _notify($"⏳ Fab ждёт вас: {title.ToLowerInvariant()}. Окно Chrome открыто на компьютере.");
             }
 
-            if (sw.Elapsed > nextNote)
+            _lastHandOverClosedByHuman = await _browser.HandOverToHumanAsync(url, timeout);
+            _logger.Info(_lastHandOverClosedByHuman
+                ? "[Fab] Окно закрыто — продолжаем в окне программы."
+                : $"[Fab] За {timeout.TotalMinutes:0} мин окно не закрыли — закрыли сами, проверяем, что успели.");
+
+            try
             {
-                _logger.Info($"[Fab] Ждём... ({sw.Elapsed.TotalMinutes:0} из {timeout.TotalMinutes:0} мин)");
-                nextNote += TimeSpan.FromMinutes(1);
+                await _browser.NavigateAsync(url, _navigationTimeout);
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.Warn($"[Fab] {ex.Message}");
             }
 
-            await Task.Delay(2000);
+            // Страница может ещё секунды догружаться или пройти короткую проверку сама.
+            var sw = Stopwatch.StartNew();
+            while (sw.Elapsed < TimeSpan.FromSeconds(20))
+            {
+                if (await done())
+                {
+                    _logger.Info("[Fab] Готово, спасибо.");
+                    return true;
+                }
+
+                await Task.Delay(1500);
+            }
+
+            if (!_lastHandOverClosedByHuman)
+            {
+                break;
+            }
         }
 
-        _logger.Warn($"[Fab] Не дождались: {title.ToLowerInvariant()} ({timeout.TotalMinutes:0} мин).");
+        _logger.Warn($"[Fab] Не получилось: {title.ToLowerInvariant()}.");
         await SaveDiagnosticsAsync(shotPrefix);
         return false;
     }
