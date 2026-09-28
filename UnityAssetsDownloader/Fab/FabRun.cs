@@ -145,6 +145,7 @@ internal sealed partial class UnityAssetAutomationApp
         var fabReportPath = Path.Combine(_logsDirectory, $"fab-report-{DateTime.Now:yyyyMMdd-HHmmss}.json");
         var stoppedEarly = false;
         var closedByUser = false;
+        var challenges = string.Empty;
 
         await using (browser)
         {
@@ -170,6 +171,12 @@ internal sealed partial class UnityAssetAutomationApp
                     _logger.Error("============================================================");
                     Environment.ExitCode = 2;
                     return;
+                }
+
+                if (fab.EulaAccepted == false)
+                {
+                    _logger.Info("[Fab] Лицензия Fab EULA на этом аккаунте ещё не принята. Первый ассет программа попросит");
+                    _logger.Info("[Fab] добавить кнопкой в окне и принять лицензию — один раз, дальше всё само.");
                 }
 
                 var cookies = await browser.CookieNamesAsync(fab.BaseUrl);
@@ -231,7 +238,9 @@ internal sealed partial class UnityAssetAutomationApp
                 var index = 0;
                 var added = 0;
                 var toCheck = queue.Count - known;
-                var pace = TimeSpan.FromMilliseconds(Math.Max(_options.DelayMs, 2000));
+                // Спокойный темп: человек тоже не открывает страницы каждую секунду, а частые
+                // заходы Cloudflare замечает и начинает спрашивать галочку.
+                var pace = TimeSpan.FromMilliseconds(Math.Max(_options.DelayMs, 4000));
 
                 foreach (var (url, from) in queue)
                 {
@@ -333,6 +342,11 @@ internal sealed partial class UnityAssetAutomationApp
             {
                 owned.Save();
                 removed.Save();
+                if (fab.ChallengesSelfPassed + fab.ChallengesByHuman > 0)
+                {
+                    challenges = $"Проверок Cloudflare: {fab.ChallengesSelfPassed + fab.ChallengesByHuman} " +
+                                 $"(прошли сами: {fab.ChallengesSelfPassed}, галочка человеком: {fab.ChallengesByHuman})";
+                }
             }
         }
 
@@ -371,6 +385,11 @@ internal sealed partial class UnityAssetAutomationApp
         }
 
         PrintFabSummary(report, closedByUser);
+        if (challenges.Length > 0)
+        {
+            _logger.Info(challenges);
+        }
+
         _logger.Info($"Отчёт Fab: {fabReportPath}");
 
         var addedItems = report.Items.Where(i => i.Status == AssetProcessStatus.Added).ToList();

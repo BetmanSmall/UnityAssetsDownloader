@@ -44,6 +44,10 @@ internal sealed partial class FabStore
     /// <summary>Сколько ждём, пока страница ассета нарисует свою кнопку (она узнаёт о библиотеке сама).</summary>
     public TimeSpan ButtonWait { get; init; } = TimeSpan.FromSeconds(12);
 
+    /// <summary>Сколько раз Cloudflare проверял браузер: пропустил сам / понадобился человек.</summary>
+    public int ChallengesSelfPassed { get; private set; }
+    public int ChallengesByHuman { get; private set; }
+
     /// <summary>Имя аккаунта Epic, если Fab его показал.</summary>
     public string? AccountName { get; private set; }
 
@@ -127,14 +131,32 @@ internal sealed partial class FabStore
         const signInShown = () => !!document.querySelector('form[action*="/social/login"], a[href*="/social/login"]')
           || hasButton(/^(sign in|log in)$/i);
         const ownedShown = () => hasButton(/^(view in my library|saved in my library|view in launcher|open in launcher)$/i);
+        // Гостю сайт тоже вшивает «пользователя» — {uid: "anonymous", isAnonymous: true}. Это не вход.
+        const currentUser = d => {
+          const u = d && d['/i/users/me'];
+          return u && typeof u === 'object' && !u.isAnonymous && u.uid !== 'anonymous' ? u : null;
+        };
         """;
 
+    /// <summary>
+    /// Страница проверки Cloudflare. Заголовок у неё на языке браузера («Just a moment...»,
+    /// «Один момент…»), поэтому главные признаки — служебные: объект <c>_cf_chl_opt</c> и скрипт
+    /// <c>challenge-platform/…/orchestrate</c>, которые есть только на ней. 28.09 на Windows
+    /// с русским Chrome проверка по одному заголовку её не узнала, и программа уходила со страницы,
+    /// не дав человеку отметить галочку.
+    /// </summary>
     private const string ProbeScript = """
         (() => {
           const t = document.title || '';
-          const challenge = /just a moment|one more step|attention required|verify you are human|checking your browser/i.test(t)
-            || !!document.querySelector('#challenge-form, #challenge-stage, #challenge-running, #cf-challenge-running, .cf-turnstile, #turnstile-wrapper');
-          return { url: location.href, host: location.hostname, title: t, ready: document.readyState, challenge };
+          const nav = (performance.getEntriesByType('navigation') || [])[0];
+          const status = nav && typeof nav.responseStatus === 'number' ? nav.responseStatus : 0;
+          const pageData = !!document.getElementById('js-json-data-prefetched-data');
+          const challenge = typeof window._cf_chl_opt !== 'undefined'
+            || !!document.querySelector('script[src*="/challenge-platform/"][src*="orchestrate"], iframe[src*="challenges.cloudflare.com"], ' +
+                 '#challenge-form, #challenge-stage, #challenge-running, #challenge-error-text, #cf-challenge-running, .cf-turnstile, #turnstile-wrapper')
+            || /just a moment|one more step|attention required|verify you are human|checking your browser|один момент|ещё один шаг|еще один шаг|вы человек|проверка браузера/i.test(t)
+            || (status === 403 && !pageData && /(^|\.)fab\.com$/i.test(location.hostname));
+          return { url: location.href, host: location.hostname, title: t, ready: document.readyState, challenge, status };
         })()
         """;
 
@@ -145,6 +167,7 @@ internal sealed partial class FabStore
         public string Title { get; set; } = string.Empty;
         public string Ready { get; set; } = string.Empty;
         public bool Challenge { get; set; }
+        public int Status { get; set; }
     }
 
     private async Task<PageProbe?> ProbeAsync()
@@ -194,6 +217,7 @@ internal sealed partial class FabStore
             {
                 if (announced)
                 {
+                    ChallengesSelfPassed++;
                     _logger.Info($"[Fab] Cloudflare пропустил сам за {sw.Elapsed.TotalSeconds:0} с.");
                 }
 
@@ -209,6 +233,7 @@ internal sealed partial class FabStore
             await Task.Delay(1000);
         }
 
+        ChallengesByHuman++;
         return await WaitForHumanAsync(
             "FAB ПРОСИТ ПОДТВЕРДИТЬ, ЧТО ВЫ ЧЕЛОВЕК",
             [
@@ -226,6 +251,8 @@ internal sealed partial class FabStore
     private sealed class SignInView
     {
         public bool HasData { get; set; }
+        public bool Known { get; set; }
+        public bool? Eula { get; set; }
         public bool Me { get; set; }
         public string? Name { get; set; }
         public bool SignIn { get; set; }
@@ -245,9 +272,10 @@ internal sealed partial class FabStore
 
         var view = await ReadPageAsync<SignInView>("""
             const d = pageData();
-            const u = d && d['/i/users/me'] && typeof d['/i/users/me'] === 'object' ? d['/i/users/me'] : null;
+            const u = currentUser(d);
             const name = u ? (u.displayName || u.publicDisplayName || u.username || u.name || u.sellerName || null) : null;
-            return { hasData: !!d, me: !!u, name, signIn: signInShown() };
+            const eula = u && 'hasAcceptedBuyerTos' in u ? u.hasAcceptedBuyerTos === 'accepted' : null;
+            return { hasData: !!d, known: !!(d && d['/i/users/me']), me: !!u, name, eula, signIn: signInShown() };
             """);
         if (view is null)
         {
@@ -257,19 +285,21 @@ internal sealed partial class FabStore
         if (view.Me)
         {
             AccountName = view.Name ?? AccountName;
+            EulaAccepted = view.Eula ?? EulaAccepted;
             return true;
         }
 
-        if (view.SignIn)
+        if (view.Known || view.SignIn)
         {
             return false;
         }
 
-        // Ни данных пользователя, ни кнопки входа: вёрстка поменялась. Кнопки «Sign in» нет —
-        // значит, скорее всего, вошли; если нет, добавление ответит 401 и вход повторится.
-        _logger.Debug($"[Fab] Вход по странице не понять (данные страницы: {view.HasData}) — считаем, что вошли.");
-        return true;
+        _logger.Debug($"[Fab] Вход по странице не понять (данные страницы: {view.HasData}, кнопки «Sign in» нет).");
+        return null;
     }
+
+    /// <summary>Принята ли на аккаунте лицензия Fab EULA. null — неизвестно. Без неё добавляет человек.</summary>
+    public bool? EulaAccepted { get; private set; }
 
     /// <summary>
     /// Проверяет вход и, если его нет, открывает вход через Epic Games. Epic, который помнит
@@ -284,7 +314,18 @@ internal sealed partial class FabStore
             return false;
         }
 
-        if (await IsSignedInAsync() == true)
+        var signed = await IsSignedInAsync();
+        if (signed is null && await ProbeAsync() is { Challenge: true })
+        {
+            if (!await PassChallengeAsync())
+            {
+                return false;
+            }
+
+            signed = await IsSignedInAsync();
+        }
+
+        if (signed == true)
         {
             _logger.Info($"[Fab] Вход в аккаунт Epic есть{(AccountName is null ? string.Empty : $": {AccountName}")}.");
             return true;
@@ -443,11 +484,16 @@ internal sealed partial class FabStore
         public ListingData? Listing { get; set; }
         public bool? Acquired { get; set; }
         public bool Me { get; set; }
+        public bool? Eula { get; set; }
+        public bool Anonymous { get; set; }
         public bool SignIn { get; set; }
         public bool ButtonAdd { get; set; }
         public bool ButtonOwned { get; set; }
         public bool ButtonPaid { get; set; }
         public string? Heading { get; set; }
+
+        /// <summary>Страница так и осталась проверкой Cloudflare.</summary>
+        public bool Challenged { get; set; }
 
         public bool AnyButton => ButtonAdd || ButtonOwned || ButtonPaid;
     }
@@ -488,12 +534,44 @@ internal sealed partial class FabStore
         return {
           hasData: !!d, keys: entries.map(([k]) => k).slice(0, 40), listing,
           acquired: mine ? !!(mine.acquired || mine.entitlementId) : null,
-          me: !!(d && d['/i/users/me']), signIn: signInShown(),
+          eula: currentUser(d) && 'hasAcceptedBuyerTos' in currentUser(d) ? currentUser(d).hasAcceptedBuyerTos === 'accepted' : null,
+          me: !!currentUser(d), anonymous: !!(d && d['/i/users/me']) && !currentUser(d), signIn: signInShown(),
           buttonAdd: texts.some(t => /^add to my library$/i.test(t)),
           buttonOwned: ownedShown(),
           buttonPaid: texts.some(t => /^(buy now|add to cart)$/i.test(t)),
           heading: norm((document.querySelector('h1') || {}).innerText).slice(0, 120) || null };
         """);
+
+    /// <summary>
+    /// Читает открытую страницу ассета: ждёт его кнопку до ButtonWait. Если на месте страницы —
+    /// проверка Cloudflare, ждёт человека (PassChallengeAsync) и только потом читает дальше.
+    /// Challenged — человек так и не отметил галочку.
+    /// </summary>
+    private async Task<ListingView?> ReadListingPageAsync(string uid)
+    {
+        ListingView? view = null;
+        var sw = Stopwatch.StartNew();
+        while (true)
+        {
+            if (await ProbeAsync() is { Challenge: true })
+            {
+                if (!await PassChallengeAsync())
+                {
+                    return new ListingView { Challenged = true };
+                }
+
+                sw.Restart();
+            }
+
+            view = await ReadListingViewAsync(uid) ?? view;
+            if (view is { AnyButton: true } || sw.Elapsed >= ButtonWait)
+            {
+                return view;
+            }
+
+            await Task.Delay(700);
+        }
+    }
 
     /// <summary>
     /// Добавляет ассет Fab в библиотеку, если он бесплатный (в том числе по раздаче со скидкой 100 %).
@@ -513,13 +591,12 @@ internal sealed partial class FabStore
             return new ClaimResult { Outcome = ClaimOutcome.Failed, Message = "Страница ассета не открылась." };
         }
 
-        // Страница сама узнаёт, есть ли ассет в библиотеке, и рисует кнопку — ждём её.
-        var view = await ReadListingViewAsync(uid);
-        var sw = Stopwatch.StartNew();
-        while (view is not { AnyButton: true } && sw.Elapsed < ButtonWait)
+        // Страница сама узнаёт, есть ли ассет в библиотеке, и рисует кнопку — ждём её. Если вместо
+        // страницы проверка Cloudflare — со страницы не уходим, ждём человека.
+        var view = await ReadListingPageAsync(uid);
+        if (view is { Challenged: true })
         {
-            await Task.Delay(700);
-            view = await ReadListingViewAsync(uid) ?? view;
+            return new ClaimResult { Outcome = ClaimOutcome.Failed, Message = "Cloudflare не пропустил страницу: галочку «я человек» не отметили." };
         }
 
         if (view is null)
@@ -542,6 +619,17 @@ internal sealed partial class FabStore
             }
 
             listing = fetched.Listing;
+            if (fetched.Reply is { Challenged: true })
+            {
+                // Запрос Cloudflare не пустил — открываем страницу заново: проверку пройдут на ней.
+                _logger.Info("[Fab] Cloudflare проверяет запросы — открываем страницу заново.");
+                if (await OpenAsync(PageUrl(uid)) && await ReadListingPageAsync(uid) is { Challenged: false } again)
+                {
+                    view = again;
+                    listing = view.Listing;
+                }
+            }
+
             if (listing is null && !view.AnyButton)
             {
                 await SaveDiagnosticsAsync($"fab-unknown-{uid[..8]}");
@@ -568,7 +656,7 @@ internal sealed partial class FabStore
             return result;
         }
 
-        if (!view.Me && view.SignIn)
+        if (!view.Me && (view.SignIn || view.Anonymous))
         {
             result.Outcome = ClaimOutcome.NeedsLogin;
             result.Message = "Fab показывает кнопку «Sign in» — входа нет.";
@@ -626,6 +714,12 @@ internal sealed partial class FabStore
             return result;
         }
 
+        if (view.Eula == false)
+        {
+            // Лицензию Fab принимает человек, а не программа: первый ассет — кнопкой в окне.
+            return await AddByHandAsync(uid, result, "на аккаунте ещё не принята лицензия Fab EULA");
+        }
+
         ApiReply? add = null;
         foreach (var candidate in ordered.Take(2))
         {
@@ -667,7 +761,7 @@ internal sealed partial class FabStore
 
     private async Task<ClaimResult> AddByHandAsync(string uid, ClaimResult result, string reason)
     {
-        _logger.Info($"[Fab] Запросом добавить не получилось: {reason}");
+        _logger.Info($"[Fab] Нужен человек: {reason}.");
         await SaveDiagnosticsAsync($"fab-add-failed-{uid[..8]}");
 
         var byHand = await WaitForHumanAsync(
