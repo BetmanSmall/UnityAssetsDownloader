@@ -780,22 +780,6 @@ internal sealed class HumanBrowser : IAsyncDisposable
         }
     }
 
-    public async Task<string> UrlAsync() =>
-        (await TryEvaluateAsync("location.href"))?.GetString() ?? string.Empty;
-
-    /// <summary>Поднимает окно браузера наверх, когда нужен человек.</summary>
-    public async Task BringToFrontAsync()
-    {
-        try
-        {
-            await Tab.SendAsync("Page.bringToFront");
-        }
-        catch (CdpException ex) when (!ex.IsDisconnected)
-        {
-            // Не поднялось — не беда, человек найдёт окно сам.
-        }
-    }
-
     public async Task SaveScreenshotAsync(string path)
     {
         try

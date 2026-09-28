@@ -168,7 +168,7 @@ internal sealed class InteractiveMenu
         Console.WriteLine(" C) Проверить страницу входа Unity (быстро, ничего не меняет)");
         Console.WriteLine(" K) Каталог ассетов аккаунта: для ИИ-агента и страница для просмотра");
         Console.WriteLine(" F) Fab (fab.com): бесплатные ассеты на аккаунт Epic Games");
-        Console.WriteLine(" E) Fab: войти в Epic Games и проверить  <== для Fab начните с этого");
+        Console.WriteLine(" E) Fab: только войти в Epic Games (F при первом запуске попросит войти и сам)");
         Console.WriteLine(" P) Сменить профиль аккаунта (второй аккаунт на этом компьютере)");
         Console.WriteLine(" L) Собрать логи в архив для отправки");
         Console.WriteLine(" 0) Выход");

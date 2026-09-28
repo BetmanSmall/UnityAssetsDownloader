@@ -14,8 +14,9 @@ using System.Text.RegularExpressions;
 /// библиотеке, страница показывает кнопкой. Единственный запрос программы — добавление
 /// (<c>POST /i/listings/&lt;id&gt;/add-to-library</c>), ровно такой, как по кнопке «Add to My Library».
 ///
-/// Вход в Epic, проверка Cloudflare «я человек», капча — только руками человека:
-/// программа замечает их, поднимает окно и ждёт.
+/// Вход в Epic, проверка Cloudflare «я человек», капча, лицензия Fab EULA и раздача со скидкой
+/// 100 % (это покупка за 0) — только руками человека: программа замечает их, открывает тот же
+/// профиль обычным окном Chrome без программы (HumanBrowser.HandOverToHumanAsync) и ждёт.
 /// </summary>
 internal sealed partial class FabStore
 {
@@ -615,9 +616,9 @@ internal sealed partial class FabStore
     }
 
     /// <summary>
-    /// Добавляет ассет Fab в библиотеку, если он бесплатный (в том числе по раздаче со скидкой 100 %).
-    /// Деньги не тратятся никогда: платное не трогается, а «в библиотеку» Fab кладёт только
-    /// бесплатное — покупка идёт другой дорогой, через корзину и оплату, которых программа не касается.
+    /// Добавляет ассет Fab в библиотеку, если он бесплатный (базовая цена 0), и проверяет по
+    /// перезагруженной странице, что он там. Раздачу со скидкой 100 % отдаёт человеку: для Fab это
+    /// покупка за 0. Деньги не тратятся никогда: корзины и оплаты программа не касается.
     /// </summary>
     public async Task<ClaimResult> ClaimAsync(string listingUrl, bool dryRun)
     {
@@ -839,8 +840,8 @@ internal sealed partial class FabStore
 
     private async Task<ClaimResult> AddByHandAsync(string uid, ClaimResult result, string reason)
     {
+        // Скриншот не нужен: раздача и лицензия — обычный путь; не вышло — снимет AskHumanAsync.
         _logger.Info($"[Fab] Нужен человек: {reason}.");
-        await SaveDiagnosticsAsync($"fab-add-failed-{uid[..8]}");
 
         var byHand = await AskHumanAsync(
             "FAB: ДОБАВЬТЕ АССЕТ КНОПКОЙ",
@@ -951,6 +952,7 @@ internal sealed partial class FabStore
     private async Task<bool> AskHumanAsync(string title, string[] lines, string url, Func<Task<bool>> done,
         TimeSpan timeout, string shotPrefix, int attempts = 2)
     {
+        _lastHandOverClosedByHuman = false;
         if (!_interactive)
         {
             _logger.Warn($"[Fab] {title.ToLowerInvariant()} — но программа запущена без человека (--interactive false), ждать некого.");
@@ -958,7 +960,6 @@ internal sealed partial class FabStore
             return false;
         }
 
-        _lastHandOverClosedByHuman = false;
         for (var attempt = 1; attempt <= attempts; attempt++)
         {
             _logger.Info("============================================================");
