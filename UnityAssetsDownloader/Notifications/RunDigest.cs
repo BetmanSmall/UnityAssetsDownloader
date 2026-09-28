@@ -173,6 +173,12 @@ internal sealed class DailyDigest
             sb.AppendLine($"Не Asset Store, пропущены: {string.Join(", ", elsewhere)}");
         }
 
+        if (t.FabPosts > 0)
+        {
+            // Fab живёт за Cloudflare, на сервере без экрана его не открыть — забирает Deck или ПК.
+            sb.AppendLine("Fab на аккаунт Epic: на Deck или ПК пункт F в меню");
+        }
+
         if (t.Relogins > 0)
         {
             sb.AppendLine($"Входов в Unity заново: {t.Relogins}{(t.LoginFailed ? " (был неудачный)" : string.Empty)}");

@@ -118,6 +118,14 @@ internal sealed class InteractiveMenu
                     await RunAsync("каталог ассетов", [], "--build-catalog", "--headless", "false");
                     OfferToOpenCatalog();
                     break;
+                case "F":
+                    ExplainFab();
+                    await RunAsync("Fab: раздача Limited-Time Free и ссылки на Fab из Telegram", [], "--fab");
+                    break;
+                case "E":
+                    ExplainFab();
+                    await RunAsync("Fab: вход в Epic Games (аккаунт не меняется)", [], "--fab-login");
+                    break;
                 case "P":
                     await ChooseProfileAsync();
                     break;
@@ -159,9 +167,21 @@ internal sealed class InteractiveMenu
         Console.WriteLine(" B) Переключить браузер: своя папка <-> мой обычный Chrome");
         Console.WriteLine(" C) Проверить страницу входа Unity (быстро, ничего не меняет)");
         Console.WriteLine(" K) Каталог ассетов аккаунта: для ИИ-агента и страница для просмотра");
+        Console.WriteLine(" F) Fab (fab.com): бесплатные ассеты на аккаунт Epic Games");
+        Console.WriteLine(" E) Fab: войти в Epic Games и проверить  <== для Fab начните с этого");
         Console.WriteLine(" P) Сменить профиль аккаунта (второй аккаунт на этом компьютере)");
         Console.WriteLine(" L) Собрать логи в архив для отправки");
         Console.WriteLine(" 0) Выход");
+        Console.WriteLine();
+    }
+
+    private static void ExplainFab()
+    {
+        Console.WriteLine();
+        Console.WriteLine("Fab (fab.com) — магазин Epic Games. Ассеты кладутся на аккаунт Epic, не Unity.");
+        Console.WriteLine("Откроется обычное окно Chrome со своей папкой (ваш личный Chrome не трогается).");
+        Console.WriteLine("Если Fab попросит подтвердить, что вы человек, или войти в Epic Games —");
+        Console.WriteLine("сделайте это в окне: программа сама такие проверки не проходит и подождёт вас.");
         Console.WriteLine();
     }
 

@@ -243,7 +243,7 @@ async Task ReportCrashAsync(Exception ex, CliOptions crashOptions, string[]? use
     Environment.ExitCode = 1;
 }
 
-internal sealed class UnityAssetAutomationApp
+internal sealed partial class UnityAssetAutomationApp
 {
     private const string AssetStoreHomeUrl = "https://assetstore.unity.com/";
     public const string BaseTopFreeSource = "https://assetstore.unity.com/top-assets/top-free";
@@ -393,6 +393,13 @@ internal sealed class UnityAssetAutomationApp
             if (_options.RenderCatalog)
             {
                 RenderCatalogOnly();
+                return;
+            }
+
+            // Fab — свой браузер и свой аккаунт (Epic Games): вход в Unity для него не нужен.
+            if (_options.Fab || _options.FabLoginOnly)
+            {
+                await RunFabAsync();
                 return;
             }
 
@@ -1387,7 +1394,7 @@ internal sealed class UnityAssetAutomationApp
     /// wantAssets ассетов, подходящих под isWanted, или пока не кончатся посты.
     /// </summary>
     private async Task<TelegramParseResult> ParseTelegramChannelsAsync(
-        IBrowser mainBrowser,
+        IBrowser? mainBrowser,
         List<TelegramChannelCursor> cursors,
         int wantAssets,
         Func<string, bool> isWanted,
@@ -1396,7 +1403,8 @@ internal sealed class UnityAssetAutomationApp
     {
         _logger.Info($"Запуск парсинга Telegram каналов: {string.Join(", ", cursors.Select(c => c.Name))}");
 
-        IBrowser tgBrowser = mainBrowser;
+        // mainBrowser == null (прогон Fab): браузера Unity нет, запасной путь напрямую пропускается.
+        IBrowser? tgBrowser = mainBrowser;
         IBrowser? ownBrowser = null;
 
         try
@@ -1539,6 +1547,11 @@ internal sealed class UnityAssetAutomationApp
                     }
                     else if (string.IsNullOrWhiteSpace(candidate))
                     {
+                        if (mainBrowser is null)
+                        {
+                            continue;
+                        }
+
                         _logger.Info("Telegram открываем браузером напрямую, без прокси.");
                     }
                     else
@@ -1610,7 +1623,7 @@ internal sealed class UnityAssetAutomationApp
             return result;
 
             async Task<TelegramParseResult> RunParserAsync(
-                IBrowser browser,
+                IBrowser? browser,
                 List<TelegramChannelCursor> channels,
                 int want,
                 Func<string, Task<string?>>? fetchHtml)
@@ -8117,6 +8130,24 @@ internal sealed class CliOptions
     /// <summary>Присылать ли со сводкой бота страницу каталога файлом, если он изменился (BOT_CATALOG).</summary>
     public bool BotCatalog { get; init; } = true;
 
+    /// <summary>Fab: забрать бесплатные ассеты fab.com на аккаунт Epic Games (--fab).</summary>
+    public bool Fab { get; init; }
+
+    /// <summary>Fab: только войти в Epic и проверить, что Fab открывается (--fab-login).</summary>
+    public bool FabLoginOnly { get; init; }
+
+    /// <summary>Fab: проверить только эти ассеты (--fab-url, можно несколько раз).</summary>
+    public List<string> FabUrls { get; init; } = [];
+
+    /// <summary>Браузер для Fab (--fab-browser, FAB_BROWSER): путь к exe или flatpak:com.google.Chrome.</summary>
+    public string? FabBrowser { get; init; }
+
+    /// <summary>Адрес Fab — только для стенда на макетах (FAB_BASE_URL). Пусто — https://www.fab.com.</summary>
+    public string? FabBaseUrl { get; init; }
+
+    /// <summary>Есть ли где показать окно браузера. Нет — Docker, SSH, сервер.</summary>
+    public bool HasScreen { get; init; } = true;
+
     public string? NotifyBotToken { get; init; }
     public string? NotifyChatId { get; init; }
 
@@ -8244,6 +8275,10 @@ internal sealed class CliOptions
         var cliSources = new List<string>();
         var cliExtraSourceFiles = new List<string>();
         var cliTelegramChannels = new List<string>();
+        var cliFab = false;
+        var cliFabLogin = false;
+        var cliFabUrls = new List<string>();
+        string? cliFabBrowser = null;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -8359,6 +8394,19 @@ internal sealed class CliOptions
                     break;
                 case "--check-login-page":
                     cliCheckLoginPage = true;
+                    break;
+                case "--fab":
+                    cliFab = true;
+                    break;
+                case "--fab-login":
+                    cliFabLogin = true;
+                    break;
+                case "--fab-url" when i + 1 < args.Length:
+                    cliFab = true;
+                    cliFabUrls.Add(args[++i]);
+                    break;
+                case "--fab-browser" when i + 1 < args.Length:
+                    cliFabBrowser = args[++i];
                     break;
                 case "--list-profiles":
                     cliListProfiles = true;
@@ -8823,7 +8871,13 @@ internal sealed class CliOptions
             TelegramChannels = telegramChannels,
             TelegramPostLimit = telegramPostLimit,
             TelegramBatchSize = cliTelegramBatchSize ?? config?.Telegram?.BatchSize ?? 30,
-            TelegramScreenshotOnNoLinks = telegramScreenshotOnNoLinks
+            TelegramScreenshotOnNoLinks = telegramScreenshotOnNoLinks,
+            Fab = cliFab,
+            FabLoginOnly = cliFabLogin,
+            FabUrls = cliFabUrls,
+            FabBrowser = FirstNonEmpty(cliFabBrowser, Environment.GetEnvironmentVariable("FAB_BROWSER")),
+            FabBaseUrl = FirstNonEmpty(Environment.GetEnvironmentVariable("FAB_BASE_URL")),
+            HasScreen = !noScreen
         };
     }
 

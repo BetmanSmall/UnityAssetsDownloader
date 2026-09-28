@@ -4,7 +4,7 @@ using PuppeteerSharp;
 internal sealed class TelegramSourceParser
 {
     private const string TelegramWebBaseUrl = "https://t.me/s/";
-    private readonly IBrowser _browser;
+    private readonly IBrowser? _browser;
     private readonly AppLogger _logger;
     private readonly string _logsDirectory;
     private readonly int _navigationTimeoutMs;
@@ -45,7 +45,7 @@ internal sealed class TelegramSourceParser
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     public TelegramSourceParser(
-        IBrowser browser,
+        IBrowser? browser,
         AppLogger logger,
         string logsDirectory,
         int navigationTimeoutMs,
@@ -105,7 +105,8 @@ internal sealed class TelegramSourceParser
         {
             if (page is null)
             {
-                page = await _browser.NewPageAsync();
+                page = await (_browser ?? throw new InvalidOperationException(
+                    $"{NetworkFailureMarker}: браузера для запасного чтения нет")).NewPageAsync();
                 page.DefaultNavigationTimeout = _navigationTimeoutMs;
                 page.DefaultTimeout = _navigationTimeoutMs;
             }

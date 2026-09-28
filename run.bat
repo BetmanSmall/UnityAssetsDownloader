@@ -61,6 +61,8 @@ echo  T^) Проверить Telegram / задать свой прокси
 echo  B^) Переключить браузер: своя папка ^<-^> мой обычный Chrome
 echo  C^) Проверить страницу входа Unity (быстро, ничего не меняет^)
 echo  K^) Каталог ассетов аккаунта: для ИИ-агента и страница для просмотра
+echo  F^) Fab (fab.com^): бесплатные ассеты на аккаунт Epic Games
+echo  E^) Fab: войти в Epic Games и проверить  ^<== для Fab начните с этого
 echo  P^) Сменить профиль аккаунта (для второго аккаунта на этом компьютере^)
 echo  L^) Собрать логи в архив для отправки
 echo  0^) Выход
@@ -82,6 +84,8 @@ if /i "%opt%"=="T" goto telegram_proxy
 if /i "%opt%"=="B" goto toggle_chrome
 if /i "%opt%"=="C" goto check_login
 if /i "%opt%"=="K" goto build_catalog
+if /i "%opt%"=="F" goto run_fab
+if /i "%opt%"=="E" goto fab_login
 if /i "%opt%"=="P" goto choose_profile
 if /i "%opt%"=="L" goto collect_logs
 if /i "%opt%"=="0" goto end
@@ -241,6 +245,27 @@ echo Каталог всех ассетов аккаунта: для ИИ-аге
 echo Аккаунт не меняется. Первый раз - пара минут, дальше берутся только новые ассеты.
 dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %CHROME_ARG% --build-catalog --headless false
 goto after_run
+
+:run_fab
+call :fab_explain
+echo Запуск: Fab - раздача Limited-Time Free и ссылки на Fab из Telegram-каналов...
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% %TGPROXY_ARG% --fab
+goto after_run
+
+:fab_login
+call :fab_explain
+echo Запуск: вход в Epic Games для Fab. Аккаунт не меняется.
+dotnet run --project "%PROJECT%" --no-build -- %COMMON% %PROFILE_ARG% --fab-login
+goto after_run
+
+:fab_explain
+echo.
+echo Fab (fab.com^) - магазин Epic Games. Ассеты кладутся на аккаунт Epic, не Unity.
+echo Откроется обычное окно Chrome со своей папкой (ваш личный Chrome не трогается^).
+echo Если Fab попросит подтвердить, что вы человек, или войти в Epic Games -
+echo сделайте это в окне: программа сама такие проверки не проходит и подождёт вас.
+echo.
+goto :eof
 
 :check_login
 echo.

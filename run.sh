@@ -261,6 +261,29 @@ build_catalog() {
     after_run
 }
 
+fab_explain() {
+    echo
+    echo "Fab (fab.com) - магазин Epic Games. Ассеты кладутся на аккаунт Epic, не Unity."
+    echo "Откроется обычное окно Chrome со своей папкой (ваш личный Chrome не трогается)."
+    echo "Если Fab попросит подтвердить, что вы человек, или войти в Epic Games -"
+    echo "сделайте это в окне: программа сама такие проверки не проходит и подождёт вас."
+    echo
+}
+
+run_fab() {
+    fab_explain
+    echo "Запуск: Fab - раздача Limited-Time Free и ссылки на Fab из Telegram-каналов..."
+    run_app "${COMMON[@]}" "${PROFILE_ARG[@]}" "${TGPROXY_ARG[@]}" --fab
+    after_run
+}
+
+fab_login() {
+    fab_explain
+    echo "Запуск: вход в Epic Games для Fab. Аккаунт не меняется."
+    run_app "${COMMON[@]}" "${PROFILE_ARG[@]}" --fab-login
+    after_run
+}
+
 check_login() {
     echo
     echo "Проверка страницы входа Unity. Программа откроет её и посмотрит,"
@@ -344,6 +367,8 @@ while true; do
     echo " B) Переключить браузер: своя папка <-> мой обычный Chrome"
     echo " C) Проверить страницу входа Unity (быстро, ничего не меняет)"
     echo " K) Каталог ассетов аккаунта: для ИИ-агента и страница для просмотра"
+    echo " F) Fab (fab.com): бесплатные ассеты на аккаунт Epic Games"
+    echo " E) Fab: войти в Epic Games и проверить  <== для Fab начните с этого"
     echo " P) Сменить профиль аккаунта (для второго аккаунта на этом компьютере)"
     echo " L) Собрать логи в архив для отправки"
     echo " 0) Выход"
@@ -368,6 +393,8 @@ while true; do
         B) toggle_chrome ;;
         C) check_login ;;
         K) build_catalog ;;
+        F) run_fab ;;
+        E) fab_login ;;
         P) choose_profile ;;
         L) collect_logs ;;
         0) break ;;
