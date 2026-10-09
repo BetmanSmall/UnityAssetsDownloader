@@ -52,6 +52,12 @@ internal sealed partial class FabStore
     /// <summary>Имя аккаунта Epic, если Fab его показал.</summary>
     public string? AccountName { get; private set; }
 
+    /// <summary>
+    /// Сервер: как человеку открыть окно (SSH-туннель и адрес noVNC). Пусто — окно открывается на
+    /// том же компьютере, где запущена программа.
+    /// </summary>
+    public string? HumanWindowHint { get; init; }
+
     public FabStore(HumanBrowser browser, AppLogger logger, string logsDirectory, string? baseUrl,
         bool interactive, Func<string, Task>? notify, TimeSpan navigationTimeout)
     {
@@ -969,12 +975,18 @@ internal sealed partial class FabStore
                 _logger.Info($" {line}");
             }
 
+            if (!string.IsNullOrWhiteSpace(HumanWindowHint))
+            {
+                _logger.Info($" {HumanWindowHint}");
+            }
+
             _logger.Info($" Программа ждёт до {timeout.TotalMinutes:0} мин.");
             _logger.Info("============================================================");
 
             if (attempt == 1 && _notify is not null)
             {
-                await _notify($"⏳ Fab ждёт вас: {title.ToLowerInvariant()}. Окно Chrome открыто на компьютере.");
+                await _notify($"⏳ Fab ждёт вас: {title.ToLowerInvariant()}. " +
+                              (string.IsNullOrWhiteSpace(HumanWindowHint) ? "Окно Chrome открыто на компьютере." : HumanWindowHint));
             }
 
             _lastHandOverClosedByHuman = await _browser.HandOverToHumanAsync(url, timeout);

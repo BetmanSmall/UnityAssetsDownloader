@@ -8173,6 +8173,12 @@ internal sealed class CliOptions
     /// <summary>Адрес Fab — только для стенда на макетах (FAB_BASE_URL). Пусто — https://www.fab.com.</summary>
     public string? FabBaseUrl { get; init; }
 
+    /// <summary>
+    /// Сервер: пароль удалённого окна браузера для Fab (FAB_VNC_PASSWORD). Без него окно человеку
+    /// не показывается вовсе. VNC читает первые 8 знаков.
+    /// </summary>
+    public string? FabVncPassword { get; init; }
+
     /// <summary>Есть ли где показать окно браузера. Нет — Docker, SSH, сервер.</summary>
     public bool HasScreen { get; init; } = true;
 
@@ -8905,6 +8911,7 @@ internal sealed class CliOptions
             FabUrls = cliFabUrls,
             FabBrowser = FirstNonEmpty(cliFabBrowser, Environment.GetEnvironmentVariable("FAB_BROWSER")),
             FabBaseUrl = FirstNonEmpty(Environment.GetEnvironmentVariable("FAB_BASE_URL")),
+            FabVncPassword = FirstNonEmpty(Environment.GetEnvironmentVariable("FAB_VNC_PASSWORD")),
             HasScreen = !noScreen
         };
     }

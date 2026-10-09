@@ -16,8 +16,11 @@ RUN dotnet publish UnityAssetsDownloader/UnityAssetsDownloader.csproj -c Release
 FROM mcr.microsoft.com/dotnet/runtime:8.0
 # Chromium из Debian сам тянет все библиотеки, нужные браузеру без экрана.
 # Шрифты — чтобы скриншоты страниц при ошибках были читаемыми. tzdata — время в логах по TZ.
+# xvfb, x11vnc, novnc, websockify — Fab на сервере: виртуальный экран для окна браузера и
+# удалённое окно для человека (вход в Epic, галочка). Запускаются программой по требованию.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends chromium fonts-liberation fonts-noto-core tzdata ca-certificates \
+       xvfb x11vnc novnc websockify \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -45,6 +45,21 @@ internal sealed class HumanBrowser : IAsyncDisposable
         /// </summary>
         public Func<Task>? HumanStandIn { get; init; }
 
+        /// <summary>
+        /// Экран для окон браузера (значение DISPLAY), если в окружении его нет: виртуальный экран
+        /// сервера (RemoteWindow). Передаётся только процессу браузера.
+        /// </summary>
+        public string? Display { get; init; }
+
+        /// <summary>
+        /// Перед тем, как открыть окно человеку (сервер: включить удалённый доступ к экрану).
+        /// Бросило исключение — окно не открывается и человека не ждём: показать его некому.
+        /// </summary>
+        public Func<Task>? BeforeHumanWindow { get; init; }
+
+        /// <summary>После того, как окно человека закрылось (сервер: выключить удалённый доступ).</summary>
+        public Func<Task>? AfterHumanWindow { get; init; }
+
         public TimeSpan StartTimeout { get; init; } = TimeSpan.FromSeconds(60);
     }
 
@@ -164,6 +179,7 @@ internal sealed class HumanBrowser : IAsyncDisposable
             args.Add("--password-store=basic");
 
             if (candidate.FlatpakApp is null && !_settings.Headless &&
+                string.IsNullOrEmpty(_settings.Display) &&
                 string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY")) &&
                 !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY")))
             {
@@ -208,6 +224,11 @@ internal sealed class HumanBrowser : IAsyncDisposable
         foreach (var a in args)
         {
             psi.ArgumentList.Add(a);
+        }
+
+        if (!string.IsNullOrEmpty(_settings.Display))
+        {
+            psi.Environment["DISPLAY"] = _settings.Display;
         }
 
         var process = Process.Start(psi) ?? throw new InvalidOperationException("процесс не создан");
@@ -343,30 +364,62 @@ internal sealed class HumanBrowser : IAsyncDisposable
             ?? throw new CdpException("не найден браузер для окна человека", disconnected: true);
         var noSandbox = _candidate is null ? NeedsNoSandbox(candidate) : _noSandbox;
 
-        await CloseBrowserAsync();
-        TryDelete(Path.Combine(UserDataDir, "DevToolsActivePort"));
+        // Сервер: сначала включаем удалённый доступ к экрану. Не вышло — окно человеку не открываем
+        // (его всё равно никто не увидит) и окно программы не трогаем.
+        if (_settings.BeforeHumanWindow is { } before)
+        {
+            try
+            {
+                await before();
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"[Браузер] Окно для человека показать некому: {ex.Message}");
+                return false;
+            }
+        }
 
         bool closedByHuman;
-        var errorTail = new Queue<string>();
-        using (var human = StartProcess(candidate, BuildArgs(candidate, noSandbox, debug: false, url), errorTail))
+        try
         {
-            var opened = Stopwatch.StartNew();
-            if (_settings.HumanStandIn is { } standIn)
+            await CloseBrowserAsync();
+            TryDelete(Path.Combine(UserDataDir, "DevToolsActivePort"));
+
+            var errorTail = new Queue<string>();
+            using (var human = StartProcess(candidate, BuildArgs(candidate, noSandbox, debug: false, url), errorTail))
             {
-                await standIn();
-                closedByHuman = true;
-                await CloseGracefullyAsync(human, candidate);
-            }
-            else
-            {
-                closedByHuman = await WaitForExitAsync(human, timeout);
-                if (!closedByHuman)
+                var opened = Stopwatch.StartNew();
+                if (_settings.HumanStandIn is { } standIn)
                 {
+                    await standIn();
+                    closedByHuman = true;
                     await CloseGracefullyAsync(human, candidate);
                 }
-                else if (opened.Elapsed < TimeSpan.FromSeconds(3))
+                else
                 {
-                    _logger.Warn("[Браузер] Обычное окно закрылось сразу — возможно, Chrome с этой папкой ещё не закрылся.");
+                    closedByHuman = await WaitForExitAsync(human, timeout);
+                    if (!closedByHuman)
+                    {
+                        await CloseGracefullyAsync(human, candidate);
+                    }
+                    else if (opened.Elapsed < TimeSpan.FromSeconds(3))
+                    {
+                        _logger.Warn("[Браузер] Обычное окно закрылось сразу — возможно, Chrome с этой папкой ещё не закрылся.");
+                    }
+                }
+            }
+        }
+        finally
+        {
+            if (_settings.AfterHumanWindow is { } after)
+            {
+                try
+                {
+                    await after();
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn($"[Браузер] Удалённый доступ к окну не закрылся: {ex.Message}");
                 }
             }
         }

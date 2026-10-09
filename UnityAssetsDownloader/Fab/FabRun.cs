@@ -21,16 +21,51 @@ internal sealed partial class UnityAssetAutomationApp
         _logger.Info(loginOnly ? " FAB: ВХОД В АККАУНТ EPIC GAMES" : " FAB.COM: БЕСПЛАТНЫЕ АССЕТЫ НА АККАУНТ EPIC GAMES");
         _logger.Info("============================================================");
 
+        // Сервер без экрана: окно браузера живёт на виртуальном экране, а человеку (вход в Epic,
+        // галочка) его показывает удалённый доступ — только на время просьбы.
+        RemoteWindow? remote = null;
         if (!_options.HasScreen)
         {
-            _logger.Error("Fab работает только в видимом окне браузера, а здесь нет экрана (сервер, Docker, SSH).");
-            _logger.Error("Cloudflare на fab.com не пускает невидимые браузеры, а проверку «я человек» программа");
-            _logger.Error("за человека не проходит. Запускайте Fab на Deck или ПК: ./run.sh или run.bat → F.");
-            Environment.ExitCode = 2;
-            return;
+            if (!RemoteWindow.IsInstalled())
+            {
+                _logger.Error("Fab работает только в видимом окне браузера, а здесь нет экрана (сервер, Docker, SSH),");
+                _logger.Error("и виртуального экрана (Xvfb, x11vnc, noVNC) тоже нет — его ставит образ сервера (Dockerfile).");
+                _logger.Error("Cloudflare на fab.com не пускает невидимые браузеры, а проверку «я человек» программа");
+                _logger.Error("за человека не проходит. Запускайте Fab на Deck или ПК (./run.sh или run.bat → F) или в образе сервера.");
+                Environment.ExitCode = 2;
+                return;
+            }
+
+            try
+            {
+                remote = await RemoteWindow.StartAsync(_logger, new RemoteWindow.Settings { Password = _options.FabVncPassword });
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"[Fab] Виртуальный экран не запустился: {ex.Message}");
+                Environment.ExitCode = 2;
+                return;
+            }
+
+            _logger.Info("[Fab] Экрана нет — окно браузера на виртуальном экране; человеку его покажет удалённое окно (по SSH-туннелю).");
         }
 
-        if (_options.Headless)
+        try
+        {
+            await RunFabOnScreenAsync(loginOnly, remote);
+        }
+        finally
+        {
+            if (remote is not null)
+            {
+                await remote.DisposeAsync();
+            }
+        }
+    }
+
+    private async Task RunFabOnScreenAsync(bool loginOnly, RemoteWindow? remote)
+    {
+        if (_options.Headless && remote is null)
         {
             _logger.Info("[Fab] Невидимый режим для Fab не работает (Cloudflare) — окно браузера будет видно.");
         }
@@ -128,7 +163,10 @@ internal sealed partial class UnityAssetAutomationApp
                 UserDataDir = Path.Combine(fabDirectory, "browser"),
                 ExplicitBrowser = _options.FabBrowser,
                 DownloadDir = CliOptions.IsSingleFileApp ? Path.Combine(_options.DataDirectory, "browser") : null,
-                Window = window
+                Window = window,
+                Display = remote?.Display,
+                BeforeHumanWindow = remote is null ? null : remote.StartViewerAsync,
+                AfterHumanWindow = remote is null ? null : remote.StopViewerAsync
             }, _logger);
         }
         catch (Exception ex)
@@ -152,7 +190,10 @@ internal sealed partial class UnityAssetAutomationApp
         await using (browser)
         {
             var fab = new FabStore(browser, _logger, _logsDirectory, _options.FabBaseUrl, _options.Interactive,
-                _notifier is { Enabled: true } ? NotifyAsync : null, TimeSpan.FromMilliseconds(_options.NavigationTimeoutMs));
+                _notifier is { Enabled: true } ? NotifyAsync : null, TimeSpan.FromMilliseconds(_options.NavigationTimeoutMs))
+            {
+                HumanWindowHint = remote?.Hint
+            };
 
             try
             {

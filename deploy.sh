@@ -288,6 +288,18 @@ while :; do
     [[ "$INTERVAL" =~ ^([0-9]+[dhms])+$ || "$INTERVAL" =~ ^[0-9]+$ ]] && break
     fail "Не понял. Примеры: 30m — полчаса, 6h — 6 часов, 1d — раз в сутки."
 done
+bold "6. Fab (fab.com, аккаунт Epic Games): окно для входа"
+echo "  Чтобы войти в Epic на сервере, программа показывает окно браузера в вашем браузере"
+echo "  через SSH-туннель (порт слушает только localhost сервера). Пароль окна — чтобы им не"
+echo "  мог воспользоваться никто, кто окажется на сервере. VNC читает 8 знаков."
+FAB_VNC_PASSWORD=$(env_get FAB_VNC_PASSWORD)
+if [ -z "$FAB_VNC_PASSWORD" ]; then
+    FAB_VNC_PASSWORD=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8)
+    ok "Пароль окна создан: $FAB_VNC_PASSWORD (сохраню в .env; понадобится при входе в окно)"
+else
+    ok "Пароль окна уже сохранён в .env."
+fi
+
 DEFAULT_TZ=$(env_get TZ)
 [ -z "$DEFAULT_TZ" ] && DEFAULT_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true)
 ask TZ_VALUE "Часовой пояс для логов" "${DEFAULT_TZ:-Europe/Moscow}"
@@ -310,12 +322,13 @@ umask 077
     echo "TELEGRAM_CHANNELS=$(env_quote "$CHANNELS_VALUE")"
     echo "WATCH_INTERVAL=$INTERVAL"
     echo "SOURCES=$SOURCES_VALUE"
+    echo "FAB_VNC_PASSWORD=$(env_quote "$FAB_VNC_PASSWORD")"
     echo "PROFILE=$PROFILE"
     echo "TZ=$TZ_VALUE"
     # Настройки, о которых deploy.sh не спрашивает (TELEGRAM_PROXY, BOT_DIGEST и другие,
     # вписанные руками), переносим как есть — раньше они молча пропадали.
     if [ -f "$ENV_FILE" ]; then
-        grep -vE '^(#|[[:space:]]*$|(UNITY_EMAIL|UNITY_PASSWORD|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_CHANNELS|WATCH_INTERVAL|SOURCES|PROFILE|TZ)=)' "$ENV_FILE" || true
+        grep -vE '^(#|[[:space:]]*$|(UNITY_EMAIL|UNITY_PASSWORD|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_CHANNELS|WATCH_INTERVAL|SOURCES|FAB_VNC_PASSWORD|PROFILE|TZ)=)' "$ENV_FILE" || true
     fi
 } > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
@@ -436,4 +449,9 @@ cat <<EOF
     поменять настройки: ./deploy.sh
     обновить программу: git pull && ./deploy.sh
     остановить:         ${DC[*]} down
+
+  Войти в Fab (аккаунт Epic Games) — один раз, между прогонами (в логе «Следующий прогон»):
+    ${DC[*]} exec -it unity-assets dotnet UnityAssetsDownloader.dll --logs-dir /app/logs --data-dir /app/data --profile $PROFILE --fab-login
+    затем на своём компьютере: ssh -L 6085:localhost:6085 <ваш сервер>
+    и в браузере: http://localhost:6085/vnc.html?autoconnect=true&resize=scale  (пароль окна — FAB_VNC_PASSWORD в .env)
 EOF
