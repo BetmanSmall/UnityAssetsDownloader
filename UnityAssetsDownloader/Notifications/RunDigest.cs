@@ -28,6 +28,47 @@ internal sealed class RunStats
     public int Relogins { get; set; }
     public bool LoginFailed { get; set; }
 
+    // --- Fab на сервере (FAB=on): что делал этап после прогона Unity.
+
+    /// <summary>Сколько раз этап Fab запускался (в «тихих» прогонах он ничего не открывает).</summary>
+    public int FabStages { get; set; }
+
+    /// <summary>Сколько раз ради него открывался браузер.</summary>
+    public int FabSessions { get; set; }
+
+    public int FabAdded { get; set; }
+
+    /// <summary>Ассеты, которые получает только человек (раздача −100 %).</summary>
+    public int FabNeedsHuman { get; set; }
+
+    public int FabFailed { get; set; }
+    public int FabCloudflareByHuman { get; set; }
+    public int FabCloudflareSelf { get; set; }
+
+    /// <summary>Сколько раз звали человека к окну и сколько из этих просьб остались без результата.</summary>
+    public int FabHumanCalls { get; set; }
+
+    public int FabHumanUnresolved { get; set; }
+
+    /// <summary>Зачем звали человека: «галочка Cloudflare», «вход в Epic», «лицензия или кнопка» → сколько раз.</summary>
+    public Dictionary<string, int> FabHumanReasons { get; set; } = new();
+
+    /// <summary>Учитывает вызов человека; причина берётся из заголовка просьбы.</summary>
+    public void AddFabHumanCall(string title)
+    {
+        FabHumanCalls++;
+        var reason = ClassifyFabHumanCall(title);
+        FabHumanReasons[reason] = FabHumanReasons.GetValueOrDefault(reason) + 1;
+    }
+
+    public static string ClassifyFabHumanCall(string title)
+    {
+        var t = title.ToLowerInvariant();
+        return t.Contains("человек") ? "галочка Cloudflare"
+            : t.Contains("войдите") ? "вход в Epic"
+            : "лицензия или кнопка";
+    }
+
     /// <summary>Учитывает одно чтение каналов. Посты без Asset Store раскладывает по сайтам.</summary>
     public void AddTelegram(TelegramParseResult result)
     {
@@ -73,6 +114,14 @@ internal sealed class DailyDigest
     public int Runs { get; set; }
     public int Crashes { get; set; }
     public RunStats Total { get; set; } = new();
+
+    /// <summary>Включён ли этап Fab на сервере: от этого зависит, что писать про Fab. В файл не пишется.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool FabOnServer { get; set; }
+
+    /// <summary>Что сказать о Fab отдельной строкой (например «ждёт вас»). В файл не пишется.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? FabNote { get; set; }
 
     public static DailyDigest Load(string path)
     {
@@ -132,6 +181,20 @@ internal sealed class DailyDigest
         Total.PromoFailed += run.PromoFailed;
         Total.Failed += run.Failed;
         Total.Relogins += run.Relogins;
+        Total.FabStages += run.FabStages;
+        Total.FabSessions += run.FabSessions;
+        Total.FabAdded += run.FabAdded;
+        Total.FabNeedsHuman += run.FabNeedsHuman;
+        Total.FabFailed += run.FabFailed;
+        Total.FabCloudflareByHuman += run.FabCloudflareByHuman;
+        Total.FabCloudflareSelf += run.FabCloudflareSelf;
+        Total.FabHumanCalls += run.FabHumanCalls;
+        Total.FabHumanUnresolved += run.FabHumanUnresolved;
+        foreach (var (reason, count) in run.FabHumanReasons)
+        {
+            Total.FabHumanReasons[reason] = Total.FabHumanReasons.GetValueOrDefault(reason) + count;
+        }
+
         if (run.LoginFailed)
         {
             Total.LoginFailed = true;
@@ -143,7 +206,8 @@ internal sealed class DailyDigest
     public string Describe(string profile, TimeSpan period, DateTime nowUtc)
     {
         var t = Total;
-        var problems = Crashes > 0 || t.LoginFailed || t.ChannelsFailed > 0 || t.Failed > 0;
+        var problems = Crashes > 0 || t.LoginFailed || t.ChannelsFailed > 0 || t.Failed > 0 ||
+                       (FabOnServer && (t.FabFailed > 0 || t.FabHumanUnresolved > 0));
         var sb = new StringBuilder();
 
         sb.AppendLine($"{(problems ? "🟡" : "🟢")} Сводка за {DescribePeriod(nowUtc - SinceUtc, period)} — профиль {profile}");
@@ -173,10 +237,28 @@ internal sealed class DailyDigest
             sb.AppendLine($"Не Asset Store, пропущены: {string.Join(", ", elsewhere)}");
         }
 
-        if (t.FabPosts > 0)
+        if (FabOnServer)
         {
-            // Fab живёт за Cloudflare, на сервере без экрана его не открыть — забирает Deck или ПК.
+            sb.AppendLine(DescribeFab(t));
+            if (t.FabCloudflareByHuman + t.FabCloudflareSelf + t.FabHumanCalls > 0)
+            {
+                var human = t.FabHumanCalls == 0
+                    ? "человека не звали"
+                    : $"человека звали {t.FabHumanCalls} раз" +
+                      (t.FabHumanReasons.Count > 0 ? $" ({string.Join(", ", t.FabHumanReasons.Select(r => $"{r.Key} — {r.Value}"))})" : string.Empty) +
+                      (t.FabHumanUnresolved > 0 ? $", без результата: {t.FabHumanUnresolved}" : string.Empty);
+                sb.AppendLine($"Cloudflare: галочек вами {t.FabCloudflareByHuman}, прошли сами {t.FabCloudflareSelf}; {human}");
+            }
+        }
+        else if (t.FabPosts > 0)
+        {
+            // Без FAB=on сервер Fab не открывает — ассеты забирает Deck или ПК.
             sb.AppendLine("Fab на аккаунт Epic: на Deck или ПК пункт F в меню");
+        }
+
+        if (!string.IsNullOrWhiteSpace(FabNote))
+        {
+            sb.AppendLine(FabNote);
         }
 
         if (t.Relogins > 0)
@@ -190,6 +272,15 @@ internal sealed class DailyDigest
         }
 
         return sb.ToString().TrimEnd();
+    }
+
+    private static string DescribeFab(RunStats t)
+    {
+        var parts = new List<string> { $"этап {t.FabStages}×, браузер открывали {t.FabSessions}" };
+        if (t.FabAdded > 0) parts.Add($"добавлено {t.FabAdded}");
+        if (t.FabNeedsHuman > 0) parts.Add($"ждут вас (раздача) {t.FabNeedsHuman}");
+        if (t.FabFailed > 0) parts.Add($"ошибок {t.FabFailed}");
+        return "Fab (Epic): " + string.Join(", ", parts);
     }
 
     public void Reset(DateTime nowUtc)

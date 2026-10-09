@@ -194,6 +194,8 @@ async Task SendDigestIfDueAsync(CliOptions cycleOptions, UnityAssetAutomationApp
     var now = DateTime.UtcNow;
     if (app is not null && digest.IsDue(period, now))
     {
+        digest.FabOnServer = cycleOptions.FabOnServer;
+        digest.FabNote = app.FabPendingNote();
         var text = digest.Describe(app.ProfileName, period, now);
         Console.WriteLine($"[Сервер] Сводка боту:{Environment.NewLine}{text}");
         await app.NotifyAsync(text);

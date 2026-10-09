@@ -47,6 +47,7 @@ internal sealed partial class UnityAssetAutomationApp
             return;
         }
 
+        Stats.FabStages++;
         try
         {
             await RunFabAsync(server: true);
@@ -288,6 +289,11 @@ internal sealed partial class UnityAssetAutomationApp
         List<string>? ltfLinks = null;
         string? giveawayUntil = null;
 
+        if (server)
+        {
+            Stats.FabSessions++;
+        }
+
         await using (browser)
         {
             var fab = new FabStore(browser, _logger, _logsDirectory, _options.FabBaseUrl, _options.Interactive || server || reconUid is not null || giveaway,
@@ -299,7 +305,11 @@ internal sealed partial class UnityAssetAutomationApp
                 ChallengeWait = server ? FabServerHumanWait : FabStore.DefaultChallengeWait,
                 ManualAddWait = server ? FabServerHumanWait : FabStore.DefaultManualAddWait,
                 CanAskHuman = serverState is null ? null : () => serverState.CanAskHuman(DateTime.UtcNow, FabHumanQuietPeriod),
-                OnHumanAsked = serverState is null ? null : reason => serverState.MarkAsked(DateTime.UtcNow, reason)
+                OnHumanAsked = serverState is null ? null : reason =>
+                {
+                    serverState.MarkAsked(DateTime.UtcNow, reason);
+                    Stats.AddFabHumanCall(reason);
+                }
             };
 
             try
@@ -564,6 +574,13 @@ internal sealed partial class UnityAssetAutomationApp
                 owned.Save();
                 removed.Save();
                 needsManual.Save();
+                if (server)
+                {
+                    Stats.FabCloudflareByHuman += fab.ChallengesByHuman;
+                    Stats.FabCloudflareSelf += fab.ChallengesSelfPassed;
+                    Stats.FabHumanUnresolved += fab.HumanUnresolved;
+                }
+
                 if (serverState is not null)
                 {
                     // Всё, что требовало человека, сделано (или не требовалось) — снова можно звать, когда понадобится.
@@ -588,6 +605,13 @@ internal sealed partial class UnityAssetAutomationApp
         var telegramUnfinished = report.Items.Any(i => fromTelegram.Contains(i.Url) &&
             i.Status is AssetProcessStatus.Failed or AssetProcessStatus.UnknownAfterClick);
         AdvanceFabCursors(cursors, telegramState, telegramUnfinished, stoppedEarly);
+
+        if (server)
+        {
+            Stats.FabAdded += report.Items.Count(i => i.Status == AssetProcessStatus.Added);
+            Stats.FabNeedsHuman += newlyManual.Count;
+            Stats.FabFailed += report.Items.Count(i => i.Status is AssetProcessStatus.Failed or AssetProcessStatus.UnknownAfterClick);
+        }
 
         report.FinishedAtUtc = DateTime.UtcNow;
         try
@@ -630,6 +654,34 @@ internal sealed partial class UnityAssetAutomationApp
             await NotifyAsync($"⏰ Fab: раздача заканчивается{(giveawayUntil is null ? string.Empty : $" ({giveawayUntil})")}. Ещё не у вас:\n" +
                               string.Join("\n", lines) + GiveawayWaysText());
         }
+    }
+
+    /// <summary>
+    /// Строка для суточной сводки: если человека звали и он не пришёл, сервер на Fab не заходит — это надо видеть
+    /// и без чтения логов. null — всё в порядке или Fab на сервере выключен.
+    /// </summary>
+    public string? FabPendingNote()
+    {
+        if (!_options.FabOnServer)
+        {
+            return null;
+        }
+
+        try
+        {
+            var state = FabServerState.Load(Path.Combine(_profileStore.GetProfileDirectory(_profileName), "fab"));
+            if (state.HumanAskedUtc is { } at)
+            {
+                return $"⏳ Fab ждёт вас с {at.ToLocalTime():dd.MM HH:mm} ({state.HumanReason}); пока вы не вошли, сервер на Fab не заходит. " +
+                       "Вход вручную — команда --fab-login (в конце вывода ./deploy.sh).";
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"[Fab] Состояние для сводки не прочиталось: {ex.Message}");
+        }
+
+        return null;
     }
 
     /// <summary>Как забрать раздачу: два способа — на ПК или Deck и в окне сервера. Текст для бота.</summary>
