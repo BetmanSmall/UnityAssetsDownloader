@@ -6087,14 +6087,11 @@ internal sealed partial class UnityAssetAutomationApp
             return null;
         }
 
-        var match = Regex.Match(url, @"/packages/[^?#]*?-(\d+)/?(?:[?#]|$)");
-        if (match.Success)
-        {
-            return match.Groups[1].Value;
-        }
-
-        // Короткая ссылка /packages/package/154271: магазин открывает её как есть, без переадресации.
-        match = Regex.Match(url, @"/packages/package/(\d+)/?(?:[?#]|$)");
+        // Номер стоит в конце адреса: после дефиса (…/tools/gui/uitweenkit-394964), после слэша
+        // (…/packages/2d-icons---reward-chest-pack/365528 — так ссылки пишут в канале UnityAssets2D;
+        // магазин такие адреса открывает и сам переводит на обычные) и в короткой ссылке
+        // /packages/package/154271, которую магазин открывает как есть.
+        var match = Regex.Match(url, @"/packages/[^?#]*?[-/](\d+)/?(?:[?#]|$)");
         return match.Success ? match.Groups[1].Value : null;
     }
 

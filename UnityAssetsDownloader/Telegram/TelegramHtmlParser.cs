@@ -1,5 +1,9 @@
+using System.Globalization;
 using System.Net;
 using System.Text.RegularExpressions;
+
+/// <summary>Пост страницы канала: текст и ссылки из него по отдельности, время публикации (UTC).</summary>
+internal sealed record TelegramRawPost(string PostId, DateTime? PostedUtc, string Text, IReadOnlyList<string> Links);
 
 /// <summary>
 /// Достаёт посты из готовой страницы t.me/s/&lt;канал&gt; без браузера.
@@ -29,6 +33,10 @@ internal static class TelegramHtmlParser
         """<a\b[^>]*\shref=["']([^"']*)["']""",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    private static readonly Regex TimeRegex = new(
+        """<time\b[^>]*\sdatetime=["']([^"']+)["']""",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     private static readonly Regex DivTagRegex = new(
         """<\s*(/?)div\b""",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -43,12 +51,36 @@ internal static class TelegramHtmlParser
     /// Посты страницы в том же порядке, в каком они идут в HTML.
     /// Пустой список значит, что разобрать не вышло — это повод открыть канал браузером.
     /// </summary>
-    public static List<(string Text, string PostId)> ExtractPosts(string? html)
+    public static List<(string Text, string PostId)> ExtractPosts(string? html) =>
+        SplitPostBlocks(html)
+            .Select(b => (BuildPostText(b.Block), b.PostId))
+            .ToList();
+
+    /// <summary>
+    /// Посты страницы по отдельности: текст без дописанных ссылок, ссылки из самого текста
+    /// и время публикации. Для разбора карточек ассетов (<see cref="ChannelCardParser"/>), где
+    /// важно, какие ссылки стоят в тексте, а не на странице вокруг него.
+    /// </summary>
+    public static List<TelegramRawPost> ExtractRawPosts(string? html) =>
+        SplitPostBlocks(html)
+            .Select(b =>
+            {
+                var textBlock = ExtractTextBlock(b.Block);
+                var links = LinkRegex.Matches(textBlock)
+                    .Select(m => DecodeHref(m.Groups[1].Value))
+                    .Where(h => h.Length > 0)
+                    .ToList();
+                return new TelegramRawPost(b.PostId, PostedAt(b.Block), HtmlToText(textBlock), links);
+            })
+            .ToList();
+
+    // Кусок страницы на каждый пост, в порядке страницы.
+    private static List<(string PostId, string Block)> SplitPostBlocks(string? html)
     {
-        var posts = new List<(string Text, string PostId)>();
+        var blocks = new List<(string PostId, string Block)>();
         if (string.IsNullOrWhiteSpace(html))
         {
-            return posts;
+            return blocks;
         }
 
         // Ответ на другой пост тоже носит data-post, но постом канала не является.
@@ -60,13 +92,40 @@ internal static class TelegramHtmlParser
         {
             var start = starts[i];
             var blockEnd = i + 1 < starts.Count ? starts[i + 1].Index : html.Length;
-            var block = html[start.Index..blockEnd];
             var postId = WebUtility.HtmlDecode(start.Groups[1].Value).Trim();
 
-            posts.Add((BuildPostText(block), string.IsNullOrEmpty(postId) ? "unknown" : postId));
+            blocks.Add((string.IsNullOrEmpty(postId) ? "unknown" : postId, html[start.Index..blockEnd]));
         }
 
-        return posts;
+        return blocks;
+    }
+
+    private static DateTime? PostedAt(string block)
+    {
+        var match = TimeRegex.Match(block);
+        return match.Success && DateTime.TryParse(match.Groups[1].Value, CultureInfo.InvariantCulture,
+            DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var when)
+            ? when
+            : null;
+    }
+
+    // Telegram иногда кодирует адрес в атрибуте дважды (…pack&amp;#33;/328345 вместо …pack!/328345):
+    // после первого разбора остаётся &#33;. Разбираем, пока адрес меняется.
+    private static string DecodeHref(string href)
+    {
+        var value = href.Trim();
+        for (var i = 0; i < 3; i++)
+        {
+            var decoded = WebUtility.HtmlDecode(value);
+            if (decoded == value)
+            {
+                break;
+            }
+
+            value = decoded;
+        }
+
+        return value;
     }
 
     /// <summary>
