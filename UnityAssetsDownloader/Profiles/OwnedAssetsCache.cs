@@ -51,6 +51,16 @@ internal sealed class OwnedAssetsCache
 
     public bool Contains(string url) => _urls.Contains(url);
 
+    /// <summary>Забыть всё (например, началась новая раздача). Сохраняется при следующем Save().</summary>
+    public void Clear()
+    {
+        if (_urls.Count > 0)
+        {
+            _urls.Clear();
+            _changed = true;
+        }
+    }
+
     public void Add(string url)
     {
         if (!string.IsNullOrWhiteSpace(url) && _urls.Add(url.Trim()))

@@ -77,6 +77,48 @@ internal sealed class RemoteWindow : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Убирает то, что осталось от запуска, которого уже нет (команду из `docker compose exec` оборвали, SSH
+    /// отвалился): виртуальный экран, x11vnc, websockify и Chromium этой папки профиля. Звать только после того,
+    /// как взят замок Fab-запуска: тогда живых «чужих» процессов Fab в контейнере быть не может. Без этого новый
+    /// x11vnc не смог бы занять порт, а человеку показали бы старый экран.
+    /// </summary>
+    public static int KillStaleProcesses(string? browserProfileMarker)
+    {
+        if (!OperatingSystem.IsLinux() || !Directory.Exists("/proc"))
+        {
+            return 0;
+        }
+
+        var killed = 0;
+        foreach (var dir in Directory.EnumerateDirectories("/proc"))
+        {
+            if (!int.TryParse(Path.GetFileName(dir), out var pid) || pid == Environment.ProcessId)
+            {
+                continue;
+            }
+
+            try
+            {
+                var comm = File.ReadAllText(Path.Combine(dir, "comm")).Trim();
+                var cmd = File.ReadAllText(Path.Combine(dir, "cmdline")).Replace('\0', ' ');
+                var stale = comm is "Xvfb" or "x11vnc" ||
+                            cmd.Contains("/usr/bin/websockify", StringComparison.Ordinal) ||
+                            (!string.IsNullOrEmpty(browserProfileMarker) && cmd.Contains(browserProfileMarker, StringComparison.Ordinal));
+                if (stale && SysKill(pid, 9) == 0)
+                {
+                    killed++;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Процесс уже ушёл или чужой — пропускаем.
+            }
+        }
+
+        return killed;
+    }
+
     /// <summary>Есть ли на машине всё для виртуального экрана и удалённого окна (образ сервера).</summary>
     public static bool IsInstalled(Settings? settings = null)
     {
@@ -255,6 +297,8 @@ internal sealed class RemoteWindow : IAsyncDisposable
             throw new InvalidOperationException($"не запустился {Path.GetFileName(file)}: {ex.Message}");
         }
 
+        ChildReaper.Register(process);
+
         // Служебные сообщения этих программ читаем, чтобы они не упёрлись в полный буфер.
         process.ErrorDataReceived += (_, e) =>
         {
@@ -312,7 +356,7 @@ internal sealed class RemoteWindow : IAsyncDisposable
     }
 
     [DllImport("libc", EntryPoint = "kill", SetLastError = true)]
-    private static extern int SysKill(int pid, int signal);
+    internal static extern int SysKill(int pid, int signal);
 
     /// <summary>Просит процесс закрыться (SIGTERM), через пару секунд — принудительно.</summary>
     private static async Task StopAsync(Process? process)
@@ -350,6 +394,77 @@ internal sealed class RemoteWindow : IAsyncDisposable
         catch (InvalidOperationException)
         {
             // Процесс уже ушёл.
+        }
+    }
+}
+
+/// <summary>
+/// Если процесс программы убит сигналом (Ctrl+C в `docker compose exec -it`, обрыв SSH — SIGHUP, SIGTERM), блоки
+/// `finally` не выполняются, и в контейнере остаются Xvfb, x11vnc, websockify и Chromium — сотни мегабайт на
+/// тесном сервере до следующего прогона. Здесь запоминаем дочерние процессы Fab и по сигналу сразу их убиваем;
+/// действие по умолчанию (выход) после этого выполняется как обычно. Только Linux и macOS.
+/// </summary>
+internal static class ChildReaper
+{
+    private static readonly List<Process> Children = [];
+    private static readonly object Sync = new();
+    private static readonly List<PosixSignalRegistration> Registrations = [];
+
+    public static void Register(Process process)
+    {
+        lock (Sync)
+        {
+            Children.RemoveAll(Gone);
+            Children.Add(process);
+            if (Registrations.Count > 0 || OperatingSystem.IsWindows())
+            {
+                return;
+            }
+
+            try
+            {
+                foreach (var signal in new[] { PosixSignal.SIGHUP, PosixSignal.SIGINT, PosixSignal.SIGTERM })
+                {
+                    Registrations.Add(PosixSignalRegistration.Create(signal, _ => KillAll()));
+                }
+            }
+            catch (Exception ex) when (ex is PlatformNotSupportedException or ArgumentException)
+            {
+                // Нет такой возможности — остаётся очистка при следующем запуске (KillStaleProcesses).
+            }
+        }
+    }
+
+    /// <summary>Процесс уже ушёл или его объект освобождён (тогда HasExited бросает исключение).</summary>
+    private static bool Gone(Process process)
+    {
+        try
+        {
+            return process.HasExited;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
+    }
+
+    public static void KillAll()
+    {
+        lock (Sync)
+        {
+            foreach (var process in Children)
+            {
+                try
+                {
+                    if (!Gone(process))
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
+                {
+                }
+            }
         }
     }
 }

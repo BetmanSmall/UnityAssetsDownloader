@@ -232,6 +232,12 @@ internal sealed class HumanBrowser : IAsyncDisposable
         }
 
         var process = Process.Start(psi) ?? throw new InvalidOperationException("процесс не создан");
+        if (!string.IsNullOrEmpty(_settings.Display))
+        {
+            // Сервер: оборвали команду (Ctrl+C, обрыв SSH) — браузер не должен остаться висеть в контейнере.
+            ChildReaper.Register(process);
+        }
+
         // Chrome много пишет в консоль; не читать — значит однажды повиснуть на полном буфере.
         process.OutputDataReceived += (_, _) => { };
         process.ErrorDataReceived += (_, e) =>

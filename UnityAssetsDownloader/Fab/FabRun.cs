@@ -26,6 +26,9 @@ internal sealed partial class UnityAssetAutomationApp
     /// </summary>
     private const int FabServerFirstPosts = 100;
 
+    /// <summary>Сервер: после стольких прогонов подряд, в которых ассет не получилось проверить, перестаём его трогать и сообщаем боту.</summary>
+    private const int FabGiveUpAfter = 3;
+
     /// <summary>Сервер: за сколько до конца раздачи напомнить, что остались неполученные ассеты.</summary>
     private static readonly TimeSpan FabGiveawayReminderLead = TimeSpan.FromDays(3);
 
@@ -69,9 +72,28 @@ internal sealed partial class UnityAssetAutomationApp
             : loginOnly ? " FAB: ВХОД В АККАУНТ EPIC GAMES" : " FAB.COM: БЕСПЛАТНЫЕ АССЕТЫ НА АККАУНТ EPIC GAMES");
         _logger.Info("============================================================");
 
+        // Один запуск Fab за раз: служба и команда из `docker compose exec` делят один браузер и одни файлы памяти.
+        var fabDirectory0 = Path.Combine(_profileStore.GetProfileDirectory(_profileName), "fab");
+        using var runLock = FabRunLock.TryAcquire(fabDirectory0);
+        if (runLock is null)
+        {
+            if (server)
+            {
+                _logger.Info("[Fab] Сервер: другой запуск Fab уже идёт (команда в окне?) — этап пропускаем до следующего прогона.");
+            }
+            else
+            {
+                _logger.Error("[Fab] Другой запуск Fab уже идёт (служба или другая команда). Дождитесь его конца и запустите снова.");
+                Environment.ExitCode = 2;
+            }
+
+            return;
+        }
+
         // Сервер без экрана: окно браузера живёт на виртуальном экране, а человеку (вход в Epic,
         // галочка) его показывает удалённый доступ — только на время просьбы.
         RemoteWindow? remote = null;
+        Func<Task<RemoteWindow?>>? startRemote = null;
         if (!_options.HasScreen)
         {
             if (!RemoteWindow.IsInstalled())
@@ -84,23 +106,38 @@ internal sealed partial class UnityAssetAutomationApp
                 return;
             }
 
-            try
+            // Остатки оборванного запуска (команду exec прервали, SSH отвалился): без уборки новый x11vnc не займёт
+            // порт, а человеку показали бы старый экран. Замок взят — живых «чужих» процессов Fab здесь быть не может.
+            var stale = RemoteWindow.KillStaleProcesses("--user-data-dir=" + Path.GetFullPath(Path.Combine(fabDirectory0, "browser")));
+            if (stale > 0)
             {
-                remote = await RemoteWindow.StartAsync(_logger, new RemoteWindow.Settings { Password = _options.FabVncPassword });
-            }
-            catch (Exception ex)
-            {
-                _logger.Error($"[Fab] Виртуальный экран не запустился: {ex.Message}");
-                Environment.ExitCode = 2;
-                return;
+                _logger.Warn($"[Fab] Убрал процессов от оборванного прошлого запуска: {stale} (браузер, экран, окно).");
             }
 
-            _logger.Info("[Fab] Экрана нет — окно браузера на виртуальном экране; человеку его покажет удалённое окно (по SSH-туннелю).");
+            // Экран поднимаем, только когда он понадобится: тихий прогон без браузера его не трогает.
+            startRemote = async () =>
+            {
+                try
+                {
+                    remote = await RemoteWindow.StartAsync(_logger, new RemoteWindow.Settings { Password = _options.FabVncPassword });
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error($"[Fab] Виртуальный экран не запустился: {ex.Message}");
+                    Environment.ExitCode = 2;
+                    return null;
+                }
+
+                _logger.Info("[Fab] Экрана нет — окно браузера на виртуальном экране; человеку его покажет удалённое окно (по SSH-туннелю).");
+                return remote;
+            };
         }
 
+        var sessionsBefore = Stats.FabSessions;
+        using var memory = MemorySampler.Start();
         try
         {
-            await RunFabOnScreenAsync(loginOnly, remote, server);
+            await RunFabOnScreenAsync(loginOnly, startRemote, server);
         }
         finally
         {
@@ -108,12 +145,23 @@ internal sealed partial class UnityAssetAutomationApp
             {
                 await remote.DisposeAsync();
             }
+
+            // Память за сеанс Fab. Тихий прогон без браузера не в счёт: там нечего мерить.
+            memory.Stop();
+            if (memory.HasData && (!server || Stats.FabSessions > sessionsBefore))
+            {
+                _logger.Info($"[Память] сеанс Fab: {memory.Describe()}.");
+                if (server)
+                {
+                    Stats.AddMemory(memory, fab: true);
+                }
+            }
         }
     }
 
-    private async Task RunFabOnScreenAsync(bool loginOnly, RemoteWindow? remote, bool server)
+    private async Task RunFabOnScreenAsync(bool loginOnly, Func<Task<RemoteWindow?>>? startRemote, bool server)
     {
-        if (_options.Headless && remote is null)
+        if (_options.Headless && startRemote is null)
         {
             _logger.Info("[Fab] Невидимый режим для Fab не работает (Cloudflare) — окно браузера будет видно.");
         }
@@ -138,6 +186,8 @@ internal sealed partial class UnityAssetAutomationApp
         // Сервер: что программа сама не получает (раздача −100 %): бот о таком сообщает один раз.
         var needsManual = new OwnedAssetsCache(fabDirectory, "needs_manual.txt",
             "Ассеты Fab, которые программа сама не получает (раздача −100 % — покупка за 0): бот о них сообщил.");
+        var gaveUp = new OwnedAssetsCache(fabDirectory, "gave_up.txt",
+            $"Ассеты Fab, которые не получилось проверить {FabGiveUpAfter} прогона подряд: бот сообщил, сервер их больше не трогает.");
         var serverState = server ? FabServerState.Load(fabDirectory) : null;
         // Человека недавно звали и он не пришёл: на Fab не заходим (Cloudflare, память) до конца суток
         // или до его ручного входа (--fab-login сбрасывает эту отметку).
@@ -149,7 +199,7 @@ internal sealed partial class UnityAssetAutomationApp
         }
 
         bool IsKnown(string url) => !_options.RecheckOwned &&
-                                    (owned.Contains(url) || removed.Contains(url) || (server && needsManual.Contains(url)));
+                                    (owned.Contains(url) || removed.Contains(url) || (server && (needsManual.Contains(url) || gaveUp.Contains(url))));
 
         // Что проверять. Каналы читаются до браузера: без него, за секунды.
         var queue = new List<(string Url, string From)>();
@@ -245,6 +295,16 @@ internal sealed partial class UnityAssetAutomationApp
                          (ltfDue ? "пора посмотреть" : reminderDue ? "скоро кончится — проверим, всё ли забрано" : "смотрели недавно") + ".");
         }
 
+        RemoteWindow? remote = null;
+        if (startRemote is not null)
+        {
+            remote = await startRemote();
+            if (remote is null)
+            {
+                return;
+            }
+        }
+
         var window = default((int, int, int, int)?);
         if (_options.SplitScreen && ScreenLayout.RightHalf() is { } right)
         {
@@ -286,6 +346,9 @@ internal sealed partial class UnityAssetAutomationApp
         var challenges = string.Empty;
         var newlyManual = new List<(string Title, string Url)>();
         var reminderMissing = new List<(string Title, string Url)>();
+        var reminderChecked = false;
+        var newlyGaveUp = new List<(string Title, string Url, string Why)>();
+        var unresolvedTotal = 0;
         List<string>? ltfLinks = null;
         string? giveawayUntil = null;
 
@@ -304,10 +367,13 @@ internal sealed partial class UnityAssetAutomationApp
                 LoginWait = server ? FabServerHumanWait : FabStore.DefaultLoginWait,
                 ChallengeWait = server ? FabServerHumanWait : FabStore.DefaultChallengeWait,
                 ManualAddWait = server ? FabServerHumanWait : FabStore.DefaultManualAddWait,
+                EnsureHumanWindow = remote is null ? null : remote.StartViewerAsync,
                 CanAskHuman = serverState is null ? null : () => serverState.CanAskHuman(DateTime.UtcNow, FabHumanQuietPeriod),
                 OnHumanAsked = serverState is null ? null : reason =>
                 {
+                    // Сразу на диск: если процесс убьют посреди ожидания (перезапуск службы), человека не позовут снова в тот же час.
                     serverState.MarkAsked(DateTime.UtcNow, reason);
+                    serverState.Save();
                     Stats.AddFabHumanCall(reason);
                 }
             };
@@ -412,8 +478,24 @@ internal sealed partial class UnityAssetAutomationApp
                     else
                     {
                         var ltf = await fab.ReadLimitedTimeFreeAsync();
-                        serverState?.MarkLimitedTimeFreeChecked(DateTime.UtcNow);
-                        serverState?.NoteGiveaway(ltf.Until, FabStore.ParseGiveawayEnd(ltf.Until, DateTime.UtcNow));
+                        if (serverState is not null)
+                        {
+                            var endUtc = FabStore.ParseGiveawayEnd(ltf.Until, DateTime.UtcNow);
+                            serverState.MarkLimitedTimeFreeChecked(DateTime.UtcNow);
+                            if (serverState.NoteGiveaway(ltf.Until, endUtc))
+                            {
+                                // Началась другая раздача: ассеты прошлой больше не «уже известные» — вдруг те же вернулись.
+                                needsManual.Clear();
+                                needsManual.Save();
+                                _logger.Info("[Fab] Началась новая раздача — список «получает только человек» начат заново.");
+                            }
+
+                            if (!string.IsNullOrWhiteSpace(ltf.Until) && endUtc is null)
+                            {
+                                _logger.Warn($"[Fab] Не получилось разобрать конец раздачи «{ltf.Until}» — напоминание о конце не сработает.");
+                            }
+                        }
+
                         giveawayUntil = ltf.Until;
                         ltfLinks = ltf.Links.ToList();
                         _logger.Info($"[Fab] Раздача «Limited-Time Free»{(ltf.Until is null ? string.Empty : $" ({ltf.Until})")}: {ltf.Links.Count} ассетов" +
@@ -442,15 +524,19 @@ internal sealed partial class UnityAssetAutomationApp
                     if (IsKnown(url))
                     {
                         var isOwned = owned.Contains(url);
-                        var isManual = !isOwned && !removed.Contains(url);
+                        var isRemoved = !isOwned && removed.Contains(url);
+                        var isGaveUp = !isOwned && !isRemoved && gaveUp.Contains(url);
+                        var isManual = !isOwned && !isRemoved && !isGaveUp;
                         report.Items.Add(new ProcessResult
                         {
                             Url = url,
                             TimestampUtc = DateTime.UtcNow,
-                            Status = isOwned ? AssetProcessStatus.AlreadyOwned : isManual ? AssetProcessStatus.NeedsHuman : AssetProcessStatus.Deprecated,
+                            Status = isOwned ? AssetProcessStatus.AlreadyOwned : isManual ? AssetProcessStatus.NeedsHuman
+                                : isGaveUp ? AssetProcessStatus.Failed : AssetProcessStatus.Deprecated,
                             Message = isOwned
                                 ? "Уже в библиотеке Fab (известно с прошлых запусков, страница не открывалась)."
                                 : isManual ? "Получает только человек (бот об этом уже сообщал, страница не открывалась)."
+                                : isGaveUp ? "Не получилось проверить несколько прогонов подряд — сервер больше не трогает (бот сообщил)."
                                 : "Нет на Fab (известно с прошлых запусков)."
                         });
                         continue;
@@ -466,6 +552,7 @@ internal sealed partial class UnityAssetAutomationApp
 
                     index++;
                     _logger.Info($"[Fab {index}/{toCheck}] {url} ({from})");
+                    var unresolvedBefore = fab.HumanUnresolved;
                     var claim = await fab.ClaimAsync(url, _options.DryRun);
                     if (claim.Outcome == FabStore.ClaimOutcome.NeedsLogin && await fab.EnsureSignedInAsync(new Uri(url).AbsolutePath, reload: true))
                     {
@@ -516,8 +603,27 @@ internal sealed partial class UnityAssetAutomationApp
                     }
                     else if (status == AssetProcessStatus.NeedsHuman && server)
                     {
-                        needsManual.Add(url);
+                        // В needs_manual.txt запишем только после того, как бот получил сообщение (хвост метода): иначе
+                        // при сбое Telegram о раздаче не узнали бы никогда.
                         newlyManual.Add((claim.Title ?? url, url));
+                    }
+
+                    // Не получилось проверить несколько прогонов подряд — не мучаем Fab и не держим курсор каналов вечно.
+                    if (serverState is not null)
+                    {
+                        if (status is AssetProcessStatus.Failed or AssetProcessStatus.UnknownAfterClick)
+                        {
+                            // Если не вышло из-за того, что человек не пришёл, это не вина ассета.
+                            if (fab.HumanUnresolved == unresolvedBefore && serverState.NoteFailure(url) >= FabGiveUpAfter)
+                            {
+                                gaveUp.Add(url);
+                                newlyGaveUp.Add((claim.Title ?? url, url, claim.Message));
+                            }
+                        }
+                        else
+                        {
+                            serverState.ClearFailure(url);
+                        }
                     }
 
                     if (status == AssetProcessStatus.Added || (_options.DryRun && status == AssetProcessStatus.WouldAddInDryRun))
@@ -531,6 +637,15 @@ internal sealed partial class UnityAssetAutomationApp
                         removed.Save();
                     }
 
+                    // Человек не пришёл (или звать его нельзя): остальное сделает следующий прогон. Иначе каждый
+                    // следующий ассет упирался бы в то же самое, а страницы открывались бы впустую.
+                    if (server && fab.HumanUnresolved > 0)
+                    {
+                        _logger.Warn("[Fab] Человек не пришёл — остальное в следующий раз (снова позовём не раньше чем через сутки).");
+                        stoppedEarly = true;
+                        break;
+                    }
+
                     // Не торопимся: человек тоже не открывает десять страниц в секунду, а Epic
                     // режет слишком частые добавления.
                     await Task.Delay(pace);
@@ -538,7 +653,7 @@ internal sealed partial class UnityAssetAutomationApp
 
                 // Раздача скоро кончится: смотрим, остались ли ассеты, которых нет в библиотеке (страницы
                 // открываем только сейчас, не при каждом прогоне).
-                if (serverState is not null && reminderDue && ltfLinks is { Count: > 0 })
+                if (serverState is not null && reminderDue && ltfLinks is not null)
                 {
                     foreach (var link in ltfLinks)
                     {
@@ -560,7 +675,7 @@ internal sealed partial class UnityAssetAutomationApp
                         await Task.Delay(pace);
                     }
 
-                    serverState.MarkGiveawayReminded();
+                    reminderChecked = true;
                 }
             }
             catch (CdpException ex) when (ex.IsDisconnected)
@@ -569,22 +684,33 @@ internal sealed partial class UnityAssetAutomationApp
                 stoppedEarly = true;
                 _logger.Warn($"[Fab] Окно браузера закрыто ({ex.Message}) — останавливаемся. Что успели узнать, сохранено.");
             }
+            catch (Exception ex) when (server)
+            {
+                // Сервер: любая неожиданность не должна терять найденное и ронять службу — позиция каналов не двигается.
+                stoppedEarly = true;
+                _logger.Error($"[Fab] Этап прервался: {ex.Message}. Найденное сохранено, остальное — в следующий раз.");
+                _logger.Debug(ex.ToString());
+            }
             finally
             {
                 owned.Save();
                 removed.Save();
                 needsManual.Save();
+                gaveUp.Save();
                 if (server)
                 {
+                    // Просьбы к человеку, которые оборвались исключением, тоже «без результата»: отметку не стираем.
+                    var interrupted = Math.Max(0, fab.HumanAsks - fab.HumanResolved - fab.HumanFailedAsks);
+                    unresolvedTotal = fab.HumanUnresolved + interrupted;
                     Stats.FabCloudflareByHuman += fab.ChallengesByHuman;
                     Stats.FabCloudflareSelf += fab.ChallengesSelfPassed;
-                    Stats.FabHumanUnresolved += fab.HumanUnresolved;
+                    Stats.FabHumanUnresolved += unresolvedTotal;
                 }
 
                 if (serverState is not null)
                 {
                     // Всё, что требовало человека, сделано (или не требовалось) — снова можно звать, когда понадобится.
-                    if (fab.HumanUnresolved == 0)
+                    if (unresolvedTotal == 0)
                     {
                         serverState.ClearAsked();
                     }
@@ -602,7 +728,7 @@ internal sealed partial class UnityAssetAutomationApp
 
         // Где остановились в каналах — только если все ассеты из них проверены до конца:
         // иначе в следующий раз их не прочитать заново.
-        var telegramUnfinished = report.Items.Any(i => fromTelegram.Contains(i.Url) &&
+        var telegramUnfinished = report.Items.Any(i => fromTelegram.Contains(i.Url) && !gaveUp.Contains(i.Url) &&
             i.Status is AssetProcessStatus.Failed or AssetProcessStatus.UnknownAfterClick);
         AdvanceFabCursors(cursors, telegramState, telegramUnfinished, stoppedEarly);
 
@@ -639,21 +765,51 @@ internal sealed partial class UnityAssetAutomationApp
                               string.Join("\n", lines) + (addedItems.Count > 15 ? $"\n… и ещё {addedItems.Count - 15}" : string.Empty));
         }
 
+        // Запоминаем «бот сообщил» только после того, как сообщение дошло: не дошло — в следующий раз скажем снова.
         if (newlyManual.Count > 0)
         {
             var lines = newlyManual.Take(15).Select(m => $"• {m.Title}\n  {m.Url}");
-            await NotifyAsync($"🧩 Fab: раздача −100 %{(giveawayUntil is null ? string.Empty : $" ({giveawayUntil})")} — эти ассеты получает только человек " +
-                              "(покупка за 0, Epic просит капчу), сама я их не беру:\n" +
-                              string.Join("\n", lines) + (newlyManual.Count > 15 ? $"\n… и ещё {newlyManual.Count - 15}" : string.Empty) +
-                              GiveawayWaysText());
+            var delivered = await NotifyDeliveredAsync($"🧩 Fab: раздача −100 %{(giveawayUntil is null ? string.Empty : $" ({giveawayUntil})")} — эти ассеты получает только человек " +
+                                                       "(покупка за 0, Epic просит капчу), сама я их не беру:\n" +
+                                                       string.Join("\n", lines) + (newlyManual.Count > 15 ? $"\n… и ещё {newlyManual.Count - 15}" : string.Empty) +
+                                                       GiveawayWaysText());
+            if (delivered)
+            {
+                foreach (var m in newlyManual)
+                {
+                    needsManual.Add(m.Url);
+                }
+
+                needsManual.Save();
+            }
+            else
+            {
+                _logger.Warn("[Fab] Сообщение про раздачу не дошло до бота — ассеты запомню после следующей удачной отправки.");
+            }
         }
 
         if (reminderMissing.Count > 0)
         {
             var lines = reminderMissing.Take(15).Select(m => $"• {m.Title}\n  {m.Url}");
-            await NotifyAsync($"⏰ Fab: раздача заканчивается{(giveawayUntil is null ? string.Empty : $" ({giveawayUntil})")}. Ещё не у вас:\n" +
-                              string.Join("\n", lines) + GiveawayWaysText());
+            if (await NotifyDeliveredAsync($"⏰ Fab: раздача заканчивается{(giveawayUntil is null ? string.Empty : $" ({giveawayUntil})")}. Ещё не у вас:\n" +
+                                           string.Join("\n", lines) + GiveawayWaysText()))
+            {
+                serverState?.MarkGiveawayReminded();
+            }
         }
+        else if (reminderChecked)
+        {
+            serverState?.MarkGiveawayReminded(); // проверили — всё у вас, напоминать не о чем
+        }
+
+        if (newlyGaveUp.Count > 0)
+        {
+            var lines = newlyGaveUp.Take(10).Select(g => $"• {g.Title}\n  {g.Url}\n  {g.Why}");
+            await NotifyAsync($"⚠ Fab: не получилось проверить {FabGiveUpAfter} прогона подряд — сервер больше эти ассеты не трогает:\n" +
+                              string.Join("\n", lines) + "\nПосмотрите их руками на сайте Fab (или удалите fab/gave_up.txt, чтобы проверить заново).");
+        }
+
+        serverState?.Save();
     }
 
     /// <summary>
@@ -665,6 +821,12 @@ internal sealed partial class UnityAssetAutomationApp
         if (!_options.FabOnServer)
         {
             return null;
+        }
+
+        // Без пароля окно для человека не открыть — это поломка настройки, а не «человек не пришёл».
+        if (!_options.HasScreen && string.IsNullOrEmpty(_options.FabVncPassword))
+        {
+            return "⚠ FAB=on, но FAB_VNC_PASSWORD не задан: окно для входа в Epic открыть нельзя. Запустите ./deploy.sh — он создаст пароль.";
         }
 
         try

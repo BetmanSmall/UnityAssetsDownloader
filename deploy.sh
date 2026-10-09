@@ -302,7 +302,11 @@ fi
 echo "  Когда вы вошли в Epic (команда в конце вывода), сервер может сам, после каждого прогона,"
 echo "  забирать новые бесплатные ассеты Fab из каналов. Человека он зовёт только за входом и"
 echo "  галочкой Cloudflare — не чаще раза в сутки. Раздачи −100 % пока забираете вы."
-if [ "$(env_get FAB)" = on ]; then FAB_DEFAULT=Y; else FAB_DEFAULT=N; fi
+# Программа понимает on/true/1/yes/да в любом регистре — не сбрасываем рабочую настройку в off только из-за написания.
+case "$(env_get FAB | tr '[:upper:]' '[:lower:]')" in
+    on|true|1|yes|y|да|д|ДА|Д) FAB_DEFAULT=Y ;;
+    *) FAB_DEFAULT=N ;;
+esac
 if ask_yes "Забирать ассеты Fab на сервере сам (FAB=on)?" "$FAB_DEFAULT"; then FAB_VALUE=on; else FAB_VALUE=off; fi
 ok "Fab на сервере: $FAB_VALUE"
 
@@ -439,13 +443,21 @@ elif [ "$SERVICE_RUNNING" = 0 ]; then
 fi
 
 bold "Служба"
+# Порт окна для Fab публикуется всегда (только на 127.0.0.1): если он занят чужим, служба целиком не запустится.
+FAB_PORT=$(env_get FAB_VNC_PORT); FAB_PORT=${FAB_PORT:-6085}
+if [ "$SERVICE_RUNNING" = 0 ] && command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -qE "127\.0\.0\.1:${FAB_PORT}[[:space:]]"; then
+    warn "Порт $FAB_PORT на 127.0.0.1 уже занят — служба не запустится. Задайте другой: строка FAB_VNC_PORT=… в .env, потом ./deploy.sh снова."
+fi
 if [ "$SERVICE_RUNNING" = 1 ]; then
     QUESTION="Перезапустить службу с новыми настройками?"
 else
     QUESTION="Запустить службу? Дальше она сама проверяет каналы раз в $INTERVAL."
 fi
 if ask_yes "$QUESTION" Y; then
-    "${DC[@]}" up -d --build || { fail "Служба не запустилась."; exit 1; }
+    "${DC[@]}" up -d --build || {
+        fail "Служба не запустилась. Если в выводе выше «port is already allocated» — порт $FAB_PORT занят: задайте другой (FAB_VNC_PORT=… в .env) и запустите ./deploy.sh снова."
+        exit 1
+    }
     ok "Служба работает."
 fi
 
@@ -459,8 +471,8 @@ cat <<EOF
 
   Войти в Fab (аккаунт Epic Games) — один раз, между прогонами (в логе «Следующий прогон»):
     ${DC[*]} exec -it unity-assets dotnet UnityAssetsDownloader.dll --logs-dir /app/logs --data-dir /app/data --profile $PROFILE --fab-login
-    затем на своём компьютере: ssh -L 127.0.0.1:6085:127.0.0.1:6085 <ваш сервер>
-    и в браузере: http://127.0.0.1:6085/vnc.html?autoconnect=true&resize=scale  (пароль окна — FAB_VNC_PASSWORD в .env)
+    затем на своём компьютере: ssh -L 127.0.0.1:${FAB_PORT}:127.0.0.1:${FAB_PORT} <ваш сервер>
+    и в браузере: http://127.0.0.1:${FAB_PORT}/vnc.html?autoconnect=true&resize=scale  (пароль окна — FAB_VNC_PASSWORD в .env)
 
   Раздачу Fab «Limited-Time Free» (−100 %) сервер сам не берёт: на оформлении Epic просит капчу. Два способа:
     на ПК или Deck:     ./run.sh → F (с домашнего адреса капча проходит надёжнее)

@@ -18,11 +18,19 @@ internal sealed class FabServerState
         public DateTime? GiveawayEndUtc { get; set; }
         public string? GiveawayUntilText { get; set; }
         public string? GiveawayRemindedFor { get; set; }
+        public Dictionary<string, int>? Failures { get; set; }
     }
+
+    /// <summary>
+    /// Прогоны идут «раз в N часов от начала предыдущего», а этап Fab внутри прогона занимает разное время.
+    /// Без запаса «прошло ровно 24 часа» то выполнялось, то нет, и весь цикл пропускался случайно.
+    /// </summary>
+    private static readonly TimeSpan Slack = TimeSpan.FromMinutes(30);
 
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
 
     private readonly string _path;
+    private readonly Dictionary<string, int> _failures;
     private readonly DateTime? _askedBefore;
     private bool _askedThisRun;
     private bool _changed;
@@ -36,6 +44,7 @@ internal sealed class FabServerState
         GiveawayEndUtc = saved.GiveawayEndUtc;
         GiveawayUntilText = saved.GiveawayUntilText;
         GiveawayRemindedFor = saved.GiveawayRemindedFor;
+        _failures = saved.Failures ?? new Dictionary<string, int>();
         _askedBefore = saved.HumanAskedUtc;
     }
 
@@ -76,7 +85,7 @@ internal sealed class FabServerState
 
     /// <summary>Пора ли снова открыть раздачу: ещё не смотрели или прошло не меньше every.</summary>
     public bool LimitedTimeFreeDue(DateTime nowUtc, TimeSpan every) =>
-        LimitedTimeFreeCheckedUtc is not { } last || nowUtc - last >= every;
+        LimitedTimeFreeCheckedUtc is not { } last || nowUtc - last >= every - Slack;
 
     public void MarkLimitedTimeFreeChecked(DateTime nowUtc)
     {
@@ -84,17 +93,38 @@ internal sealed class FabServerState
         _changed = true;
     }
 
-    /// <summary>Запоминает, когда кончается раздача. Новая раздача (другой текст) сбрасывает отметку «напомнили».</summary>
-    public void NoteGiveaway(string? untilText, DateTime? endUtc)
+    /// <summary>
+    /// Запоминает, когда кончается раздача. Новая раздача (другой текст) сбрасывает отметку «напомнили».
+    /// true — это новая раздача, а до неё была другая (значит, ассеты прошлой больше не «известные»).
+    /// </summary>
+    public bool NoteGiveaway(string? untilText, DateTime? endUtc)
     {
         if (string.IsNullOrWhiteSpace(untilText) || (GiveawayUntilText == untilText && GiveawayEndUtc == endUtc))
         {
-            return;
+            return false;
         }
 
+        var replaced = GiveawayUntilText is not null && GiveawayUntilText != untilText;
         GiveawayUntilText = untilText;
         GiveawayEndUtc = endUtc;
         _changed = true;
+        return replaced;
+    }
+
+    /// <summary>Сколько прогонов подряд ассет не удалось проверить (после этой отметки).</summary>
+    public int NoteFailure(string url)
+    {
+        _failures[url] = _failures.GetValueOrDefault(url) + 1;
+        _changed = true;
+        return _failures[url];
+    }
+
+    public void ClearFailure(string url)
+    {
+        if (_failures.Remove(url))
+        {
+            _changed = true;
+        }
     }
 
     /// <summary>Пора напомнить: до конца раздачи осталось не больше lead, она ещё идёт, и об этой раздаче ещё не напоминали.</summary>
@@ -112,7 +142,7 @@ internal sealed class FabServerState
     /// раз звали не меньше quiet назад (или никогда). Иначе человек уже в курсе и пока не пришёл.
     /// </summary>
     public bool CanAskHuman(DateTime nowUtc, TimeSpan quiet) =>
-        _askedThisRun || _askedBefore is not { } before || nowUtc - before >= quiet;
+        _askedThisRun || _askedBefore is not { } before || nowUtc - before >= quiet - Slack;
 
     /// <summary>Отмечает, что человека позвали сейчас.</summary>
     public void MarkAsked(DateTime nowUtc, string reason)
@@ -153,7 +183,8 @@ internal sealed class FabServerState
                 HumanReason = HumanReason,
                 GiveawayEndUtc = GiveawayEndUtc,
                 GiveawayUntilText = GiveawayUntilText,
-                GiveawayRemindedFor = GiveawayRemindedFor
+                GiveawayRemindedFor = GiveawayRemindedFor,
+                Failures = _failures.Count > 0 ? _failures : null
             }, Json));
             _changed = false;
         }

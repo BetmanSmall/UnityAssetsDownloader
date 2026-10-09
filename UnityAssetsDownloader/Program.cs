@@ -357,6 +357,9 @@ internal sealed partial class UnityAssetAutomationApp
 
     private bool _runCrashed;
 
+    /// <summary>Замер памяти за весь прогон (сервер, --watch). null — не запущен.</summary>
+    private MemorySampler? _memory;
+
     private bool MarkRunCrashed()
     {
         _runCrashed = true;
@@ -369,6 +372,12 @@ internal sealed partial class UnityAssetAutomationApp
         {
             Directory.CreateDirectory(_dataDirectory);
             Directory.CreateDirectory(_logsDirectory);
+
+            // Сервер: следим за памятью весь прогон — на тесной общей машине это главный вопрос.
+            if (_options.Watch)
+            {
+                _memory = MemorySampler.Start();
+            }
 
             // Ctrl+C не должен стирать то, что программа уже успела выяснить.
             Console.CancelKeyPress += OnCancelRequested;
@@ -1092,7 +1101,6 @@ internal sealed partial class UnityAssetAutomationApp
         {
             Console.CancelKeyPress -= OnCancelRequested;
             SaveCaches();
-            FinalizeProfileName();
 
             // Сервер: Fab после Unity. Браузер Unity уже закрыт, память свободна; лог прогона ещё открыт.
             // После падения прогона Fab не запускаем — сначала разберёмся с падением. Ничего не бросает.
@@ -1101,6 +1109,22 @@ internal sealed partial class UnityAssetAutomationApp
                 await RunFabServerStageAsync();
             }
 
+            if (_memory is not null)
+            {
+                _memory.Stop();
+                Stats.AddMemory(_memory, fab: false);
+                if (_memory.HasData)
+                {
+                    _logger.Info($"[Память] за прогон: {_memory.Describe()}.");
+                }
+
+                _memory.Dispose();
+                _memory = null;
+            }
+
+            // Переименование профиля — после этапа Fab: он работает с папкой по старому имени, и если бы папку
+            // переименовали раньше, этап создал бы рядом новую пустую.
+            FinalizeProfileName();
             DisposeTelegramClients();
 
             var problemsPath = Path.Combine(_logsDirectory, CliOptions.ProblemsFileName);
@@ -1407,8 +1431,10 @@ internal sealed partial class UnityAssetAutomationApp
     /// </summary>
     private async Task AnnounceNewFabAsync(TelegramParseResult tgResult)
     {
-        // С FAB=on эти ссылки забирает сам этап Fab: объявлять их заранее — лишний шум.
-        if (!_options.Watch || _options.FabOnServer || _notifier is not { Enabled: true })
+        // С FAB=on эти ссылки забирает сам этап Fab: объявлять их заранее — лишний шум. Но только если этап может
+        // работать: нет экрана и нет Xvfb/noVNC в образе — тогда сообщения бота остаются единственным способом узнать.
+        var stageWorks = _options.FabOnServer && (_options.HasScreen || RemoteWindow.IsInstalled());
+        if (!_options.Watch || stageWorks || _notifier is not { Enabled: true })
         {
             return;
         }
@@ -2484,6 +2510,10 @@ internal sealed partial class UnityAssetAutomationApp
             await _notifier.SendAsync(text);
         }
     }
+
+    /// <summary>Отправляет сообщение и говорит, дошло ли оно. Бот не настроен — true: сообщать некому, терять нечего.</summary>
+    public async Task<bool> NotifyDeliveredAsync(string text) =>
+        _notifier is not { Enabled: true } || await _notifier.SendAsync(text);
 
     private string CatalogProfileDirectory => _profileStore.GetProfileDirectory(_profileName);
 

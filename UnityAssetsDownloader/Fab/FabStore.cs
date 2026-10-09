@@ -79,6 +79,18 @@ internal sealed partial class FabStore
     /// <summary>Сколько раз человек был нужен, а дело не сделано (не пришёл, не успел, звать нельзя).</summary>
     public int HumanUnresolved { get; private set; }
 
+    /// <summary>Сколько раз человека действительно позвали (прошли проверки и открыли окно), и чем кончилось.</summary>
+    public int HumanAsks { get; private set; }
+
+    public int HumanResolved { get; private set; }
+    public int HumanFailedAsks { get; private set; }
+
+    /// <summary>
+    /// Сервер: подготовить окно для человека (включить удалённый доступ) ДО сообщения боту. Не вышло (нет пароля,
+    /// x11vnc не поднялся) — человека не зовём, сутки ожидания не тратим, бот не пишет про окно, которого нет.
+    /// </summary>
+    public Func<Task>? EnsureHumanWindow { get; init; }
+
     public FabStore(HumanBrowser browser, AppLogger logger, string logsDirectory, string? baseUrl,
         bool interactive, Func<string, Task>? notify, TimeSpan navigationTimeout)
     {
@@ -262,7 +274,6 @@ internal sealed partial class FabStore
             await Task.Delay(1000);
         }
 
-        ChallengesByHuman++;
         var url = (await ProbeAsync())?.Url is { Length: > 0 } now && !now.StartsWith("about:", StringComparison.Ordinal) ? now : LimitedTimeFreeUrl;
         var passed = await AskHumanAsync(
             "FAB ПРОСИТ ПОДТВЕРДИТЬ, ЧТО ВЫ ЧЕЛОВЕК",
@@ -277,6 +288,11 @@ internal sealed partial class FabStore
             async () => (await ProbeAsync()) is { Challenge: false },
             ChallengeWait,
             "fab-challenge");
+
+        if (passed)
+        {
+            ChallengesByHuman++;
+        }
 
         if (!passed && _lastHandOverClosedByHuman)
         {
@@ -774,7 +790,7 @@ internal sealed partial class FabStore
                 return result;
             }
 
-            return await AddByHandAsync(uid, result, "на странице нет данных о лицензиях", HumanKind.Deferrable);
+            return await AddByHandAsync(uid, result, "на странице нет данных о лицензиях", HumanKind.Transient);
         }
 
         // «В библиотеку» Fab кладёт только то, что бесплатно само по себе (базовая цена 0) — так
@@ -796,7 +812,7 @@ internal sealed partial class FabStore
 
             return await AddByHandAsync(uid, result,
                 "раздача со скидкой 100 % оформляется как покупка за 0 — покупки программа сама не делает, получает человек",
-                HumanKind.Deferrable);
+                HumanKind.Gift);
         }
 
         // Бесплатная профессиональная лицензия шире личной: берём её, если отдают даром.
@@ -870,9 +886,7 @@ internal sealed partial class FabStore
         // Не вышло запросом (например, Fab хочет, чтобы один раз приняли лицензию Fab EULA) —
         // человек нажимает кнопку на открытой странице сам. Сбой сети, лимит запросов и ошибка
         // самого Fab (нет ответа, 403, 429, 5xx) человека не требуют: на сервере повторим в следующий раз.
-        var transient = add is null || add.Status is 0 or 403 or 429 || !(add.Status is >= 400 and < 500);
-        return await AddByHandAsync(uid, result, add?.Describe() ?? "нет ответа",
-            transient ? HumanKind.Transient : HumanKind.Deferrable);
+        return await AddByHandAsync(uid, result, add?.Describe() ?? "нет ответа", HumanKind.Transient);
     }
 
     /// <summary>
@@ -994,9 +1008,17 @@ internal sealed partial class FabStore
         var m = System.Text.RegularExpressions.Regex.Match(until,
             @"(?<mon>[A-Za-z]+)\s+(?<day>\d{1,2})\s+at\s+(?<h>\d{1,2}):(?<min>\d{2})\s*(?<ap>AM|PM)",
             System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var dateOnly = false;
         if (!m.Success)
         {
-            return null;
+            // Надпись без времени («Until October 6») — считаем концом дня: напоминание сработает не позже, чем нужно.
+            m = System.Text.RegularExpressions.Regex.Match(until, @"(?<mon>[A-Za-z]+)\s+(?<day>\d{1,2})\b",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            dateOnly = m.Success;
+            if (!m.Success)
+            {
+                return null;
+            }
         }
 
         var month = DateTime.TryParseExact(m.Groups["mon"].Value, ["MMMM", "MMM"], System.Globalization.CultureInfo.InvariantCulture,
@@ -1006,7 +1028,8 @@ internal sealed partial class FabStore
             return null;
         }
 
-        var hour = int.Parse(m.Groups["h"].Value) % 12 + (m.Groups["ap"].Value.Equals("PM", StringComparison.OrdinalIgnoreCase) ? 12 : 0);
+        var hour = dateOnly ? 23 : int.Parse(m.Groups["h"].Value) % 12 + (m.Groups["ap"].Value.Equals("PM", StringComparison.OrdinalIgnoreCase) ? 12 : 0);
+        var minute = dateOnly ? 59 : int.Parse(m.Groups["min"].Value);
         TimeZoneInfo? eastern = null;
         foreach (var id in new[] { "America/New_York", "Eastern Standard Time" })
         {
@@ -1033,7 +1056,7 @@ internal sealed partial class FabStore
             // Год в надписи нет: берём ближайшую дату, которая не ушла в прошлое больше чем на полгода.
             for (var year = nowUtc.Year; year <= nowUtc.Year + 1; year++)
             {
-                var local = new DateTime(year, month, int.Parse(m.Groups["day"].Value), hour, int.Parse(m.Groups["min"].Value), 0, DateTimeKind.Unspecified);
+                var local = new DateTime(year, month, int.Parse(m.Groups["day"].Value), hour, minute, 0, DateTimeKind.Unspecified);
                 var utc = TimeZoneInfo.ConvertTimeToUtc(local, eastern);
                 if (utc > nowUtc - TimeSpan.FromDays(180))
                 {
@@ -1055,8 +1078,8 @@ internal sealed partial class FabStore
         /// <summary>Лицензия Fab EULA: без неё не добавится ничего — звать человека в окно, один раз на аккаунт.</summary>
         Eula,
 
-        /// <summary>Раздача −100 % и подобное: добавляет только человек; сервер отмечает и идёт дальше.</summary>
-        Deferrable,
+        /// <summary>Раздача −100 % (покупка за 0 с капчей): добавляет только человек; сервер отмечает и идёт дальше.</summary>
+        Gift,
 
         /// <summary>Сбой, который может пройти сам: человек не нужен, повторим в следующий прогон.</summary>
         Transient
@@ -1068,7 +1091,7 @@ internal sealed partial class FabStore
         // подобное — «нужен человек» (программа сообщит и пойдёт дальше), сбой — «не вышло, повторим».
         if (DeferManualAdds && kind != HumanKind.Eula)
         {
-            if (kind == HumanKind.Transient)
+            if (kind != HumanKind.Gift)
             {
                 result.Outcome = ClaimOutcome.Failed;
                 result.Message = $"Не добавился (повторим в следующий прогон): {reason}";
@@ -1204,6 +1227,15 @@ internal sealed partial class FabStore
             return false;
         }
 
+        // Сервер: человек уже не пришёл в этом прогоне — не зовём его снова на каждом следующем ассете
+        // (иначе по 30 минут ожидания и по сообщению на каждый, часами).
+        if (CanAskHuman is not null && HumanUnresolved > 0)
+        {
+            _logger.Warn($"[Fab] {title.ToLowerInvariant()} — но человек в этом прогоне уже не пришёл; больше не зовём.");
+            HumanUnresolved++;
+            return false;
+        }
+
         // Сервер: человека недавно уже звали и он не пришёл — окно не открываем и не пишем снова.
         if (CanAskHuman is { } canAsk && !canAsk())
         {
@@ -1212,6 +1244,21 @@ internal sealed partial class FabStore
             return false;
         }
 
+        if (EnsureHumanWindow is { } ensureWindow)
+        {
+            try
+            {
+                await ensureWindow();
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"[Fab] Окно для человека не открылось: {ex.Message}. Человека не зовём, сутки ожидания не тратим.");
+                HumanUnresolved++;
+                return false;
+            }
+        }
+
+        HumanAsks++;
         OnHumanAsked?.Invoke(title);
 
         for (var attempt = 1; attempt <= attempts; attempt++)
@@ -1262,6 +1309,7 @@ internal sealed partial class FabStore
                 if (await done())
                 {
                     _logger.Info("[Fab] Готово, спасибо.");
+                    HumanResolved++;
                     return true;
                 }
 
@@ -1276,6 +1324,7 @@ internal sealed partial class FabStore
 
         _logger.Warn($"[Fab] Не получилось: {title.ToLowerInvariant()}.");
         HumanUnresolved++;
+        HumanFailedAsks++;
         await SaveDiagnosticsAsync(shotPrefix);
         return false;
     }

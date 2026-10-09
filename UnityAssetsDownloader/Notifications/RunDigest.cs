@@ -53,6 +53,46 @@ internal sealed class RunStats
     /// <summary>Зачем звали человека: «галочка Cloudflare», «вход в Epic», «лицензия или кнопка» → сколько раз.</summary>
     public Dictionary<string, int> FabHumanReasons { get; set; } = new();
 
+    // --- Память (только Linux): по этим числам видно, хватает ли её на общем сервере и нужен ли `mem_limit`.
+
+    /// <summary>Пик памяти контейнера за прогон, МБ (0 — не читалась). Без кэша файлов.</summary>
+    public int MemPeakMb { get; set; }
+
+    /// <summary>Пик памяти контейнера за сеанс Fab (пока открыт браузер), МБ.</summary>
+    public int MemFabPeakMb { get; set; }
+
+    /// <summary>Меньше всего было доступно в системе, МБ (0 — не читалась).</summary>
+    public int MemMinAvailMb { get; set; }
+
+    public int MemSwapUsedMaxMb { get; set; }
+    public int MemSwapTotalMb { get; set; }
+
+    /// <summary>Добавляет итог замера: за весь прогон или (fab) только за сеанс Fab.</summary>
+    public void AddMemory(MemorySampler sampler, bool fab)
+    {
+        if (!sampler.HasData)
+        {
+            return;
+        }
+
+        if (fab)
+        {
+            MemFabPeakMb = Math.Max(MemFabPeakMb, sampler.PeakContainerMb);
+        }
+        else
+        {
+            MemPeakMb = Math.Max(MemPeakMb, sampler.PeakContainerMb);
+        }
+
+        if (sampler.MinAvailableMb is { } a)
+        {
+            MemMinAvailMb = MemMinAvailMb == 0 ? a : Math.Min(MemMinAvailMb, a);
+        }
+
+        MemSwapUsedMaxMb = Math.Max(MemSwapUsedMaxMb, sampler.MaxSwapUsedMb);
+        MemSwapTotalMb = Math.Max(MemSwapTotalMb, sampler.SwapTotalMb);
+    }
+
     /// <summary>Учитывает вызов человека; причина берётся из заголовка просьбы.</summary>
     public void AddFabHumanCall(string title)
     {
@@ -190,6 +230,15 @@ internal sealed class DailyDigest
         Total.FabCloudflareSelf += run.FabCloudflareSelf;
         Total.FabHumanCalls += run.FabHumanCalls;
         Total.FabHumanUnresolved += run.FabHumanUnresolved;
+        Total.MemPeakMb = Math.Max(Total.MemPeakMb, run.MemPeakMb);
+        Total.MemFabPeakMb = Math.Max(Total.MemFabPeakMb, run.MemFabPeakMb);
+        if (run.MemMinAvailMb > 0)
+        {
+            Total.MemMinAvailMb = Total.MemMinAvailMb == 0 ? run.MemMinAvailMb : Math.Min(Total.MemMinAvailMb, run.MemMinAvailMb);
+        }
+
+        Total.MemSwapUsedMaxMb = Math.Max(Total.MemSwapUsedMaxMb, run.MemSwapUsedMaxMb);
+        Total.MemSwapTotalMb = Math.Max(Total.MemSwapTotalMb, run.MemSwapTotalMb);
         foreach (var (reason, count) in run.FabHumanReasons)
         {
             Total.FabHumanReasons[reason] = Total.FabHumanReasons.GetValueOrDefault(reason) + count;
@@ -261,6 +310,19 @@ internal sealed class DailyDigest
             sb.AppendLine(FabNote);
         }
 
+        if (t.MemPeakMb > 0 || t.MemFabPeakMb > 0)
+        {
+            var parts = new List<string> { $"контейнер до {Math.Max(t.MemPeakMb, t.MemFabPeakMb)} МБ" };
+            if (t.MemFabPeakMb > 0) parts.Add($"в сеансе Fab до {t.MemFabPeakMb}");
+            if (t.MemMinAvailMb > 0) parts.Add($"в системе доступно не меньше {t.MemMinAvailMb} МБ");
+            if (t.MemSwapTotalMb > 0) parts.Add($"подкачка до {t.MemSwapUsedMaxMb} из {t.MemSwapTotalMb} МБ");
+            sb.AppendLine("Память: " + string.Join(", ", parts));
+            if (FabOnServer && t.FabSessions > 0)
+            {
+                sb.AppendLine(DescribeMemLimit(t));
+            }
+        }
+
         if (t.Relogins > 0)
         {
             sb.AppendLine($"Входов в Unity заново: {t.Relogins}{(t.LoginFailed ? " (был неудачный)" : string.Empty)}");
@@ -272,6 +334,24 @@ internal sealed class DailyDigest
         }
 
         return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>
+    /// Нужен ли контейнеру `mem_limit` и какой. Соседей на общем сервере уже защищают подкачка и `oom_score_adj`,
+    /// поэтому лимит — необязательная страховка; совет считается от пика с запасом в полтора раза.
+    /// </summary>
+    internal static string DescribeMemLimit(RunStats t)
+    {
+        var peak = Math.Max(t.MemPeakMb, t.MemFabPeakMb);
+        var advised = Math.Max(400, (int)Math.Ceiling(peak * 1.5 / 50) * 50);
+        var text = $"Лимит памяти контейнеру (`mem_limit` в docker-compose.yml) не обязателен: соседей защищают подкачка и oom_score_adj. " +
+                   $"Если захотите — не ниже {advised} МБ (пик {peak} МБ × 1,5).";
+        if (t.MemMinAvailMb > 0 && t.MemMinAvailMb < 60)
+        {
+            text += $" ⚠ В системе оставалось меньше 60 МБ ({t.MemMinAvailMb}) — соседям было тесно.";
+        }
+
+        return text;
     }
 
     private static string DescribeFab(RunStats t)
