@@ -14,11 +14,53 @@ using System.Text.Json;
 /// </summary>
 internal sealed partial class UnityAssetAutomationApp
 {
-    private async Task RunFabAsync()
+    /// <summary>Сколько ждём человека на сервере: вход в Epic, галочка, лицензия. Потом окно закрывается — оно занимает память.</summary>
+    private static readonly TimeSpan FabServerHumanWait = TimeSpan.FromMinutes(30);
+
+    /// <summary>Сервер: не чаще раза в это время зовём человека, если он в прошлый раз не пришёл.</summary>
+    private static readonly TimeSpan FabHumanQuietPeriod = TimeSpan.FromHours(24);
+
+    /// <summary>
+    /// Сервер: сколько последних постов канала читаем в первый раз. Старые ссылки Fab к тому времени уже
+    /// разобрали на ПК и Deck (пункт F), а читать всю историю — сотни страниц и заходов на Fab.
+    /// </summary>
+    private const int FabServerFirstPosts = 100;
+
+    /// <summary>Сервер: как часто заходим на страницу раздачи, если в каналах ничего нового.</summary>
+    private static readonly TimeSpan FabLimitedTimeFreeEvery = TimeSpan.FromDays(2);
+
+    /// <summary>Ручной запуск: --fab, --fab-login, --fab-url (Deck, ПК, на сервере — через exec).</summary>
+    private Task RunFabAsync() => RunFabAsync(server: _options.FabServerOnce);
+
+    /// <summary>
+    /// Сервер (--watch и FAB=on): после прогона Unity. Новые ссылки Fab из каналов — в библиотеку, раздачу
+    /// раз в пару дней — сообщить боту. Браузер открывается, только если есть что делать. Человека зовёт
+    /// только за входом, галочкой и лицензией — и не чаще раза в сутки. Ничего не бросает наружу.
+    /// </summary>
+    internal async Task RunFabServerStageAsync()
     {
-        var loginOnly = _options.FabLoginOnly;
+        if (!_options.Watch || !_options.FabOnServer)
+        {
+            return;
+        }
+
+        try
+        {
+            await RunFabAsync(server: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"[Fab] Этап Fab на сервере сорвался: {ex.Message}");
+            _logger.Debug(ex.ToString());
+        }
+    }
+
+    private async Task RunFabAsync(bool server)
+    {
+        var loginOnly = !server && _options.FabLoginOnly;
         _logger.Info("============================================================");
-        _logger.Info(loginOnly ? " FAB: ВХОД В АККАУНТ EPIC GAMES" : " FAB.COM: БЕСПЛАТНЫЕ АССЕТЫ НА АККАУНТ EPIC GAMES");
+        _logger.Info(server ? " FAB (СЕРВЕР): НОВЫЕ АССЕТЫ ИЗ КАНАЛОВ И РАЗДАЧА"
+            : loginOnly ? " FAB: ВХОД В АККАУНТ EPIC GAMES" : " FAB.COM: БЕСПЛАТНЫЕ АССЕТЫ НА АККАУНТ EPIC GAMES");
         _logger.Info("============================================================");
 
         // Сервер без экрана: окно браузера живёт на виртуальном экране, а человеку (вход в Epic,
@@ -52,7 +94,7 @@ internal sealed partial class UnityAssetAutomationApp
 
         try
         {
-            await RunFabOnScreenAsync(loginOnly, remote);
+            await RunFabOnScreenAsync(loginOnly, remote, server);
         }
         finally
         {
@@ -63,7 +105,7 @@ internal sealed partial class UnityAssetAutomationApp
         }
     }
 
-    private async Task RunFabOnScreenAsync(bool loginOnly, RemoteWindow? remote)
+    private async Task RunFabOnScreenAsync(bool loginOnly, RemoteWindow? remote, bool server)
     {
         if (_options.Headless && remote is null)
         {
@@ -78,6 +120,21 @@ internal sealed partial class UnityAssetAutomationApp
         var owned = new OwnedAssetsCache(fabDirectory, "library.txt", "Ассеты Fab, которые точно в библиотеке аккаунта Epic (проверено по странице).");
         var removed = new OwnedAssetsCache(fabDirectory, "removed.txt", "Ассеты Fab, которых больше нет на сайте.");
         var telegramState = TelegramChannelState.Load(fabDirectory);
+        // Сервер: что программа сама не получает (раздача −100 %): бот о таком сообщает один раз.
+        var needsManual = new OwnedAssetsCache(fabDirectory, "needs_manual.txt",
+            "Ассеты Fab, которые программа сама не получает (раздача −100 % — покупка за 0): бот о них сообщил.");
+        var serverState = server ? FabServerState.Load(fabDirectory) : null;
+        // Человека недавно звали и он не пришёл: на Fab не заходим (Cloudflare, память) до конца суток
+        // или до его ручного входа (--fab-login сбрасывает эту отметку).
+        if (serverState is { HumanAskedUtc: { } askedAt } && !serverState.CanAskHuman(DateTime.UtcNow, FabHumanQuietPeriod))
+        {
+            _logger.Info($"[Fab] Сервер: человека звали {askedAt.ToLocalTime():dd.MM HH:mm} ({serverState.HumanReason}) — ответа не было. " +
+                         "На Fab пока не заходим: повторим через сутки после того вызова или после ручного входа (--fab-login).");
+            return;
+        }
+
+        bool IsKnown(string url) => !_options.RecheckOwned &&
+                                    (owned.Contains(url) || removed.Contains(url) || (server && needsManual.Contains(url)));
 
         // Что проверять. Каналы читаются до браузера: без него, за секунды.
         var queue = new List<(string Url, string From)>();
@@ -121,12 +178,18 @@ internal sealed partial class UnityAssetAutomationApp
             }
             else if (_options.TelegramChannels.Count > 0)
             {
-                cursors = _options.TelegramChannels.Select(c => new TelegramChannelCursor(c) { StopAtId = telegramState.LastSeen(c) }).ToList();
+                cursors = _options.TelegramChannels.Select(c =>
+                {
+                    var seen = telegramState.LastSeen(c);
+                    return new TelegramChannelCursor(c) { StopAtId = seen, MaxPosts = server && seen == 0 ? FabServerFirstPosts : int.MaxValue };
+                }).ToList();
                 foreach (var cursor in cursors)
                 {
                     _logger.Info(cursor.StopAtId > 0
                         ? $"[Fab] Telegram: канал {cursor.Name} — посты новее #{cursor.StopAtId}."
-                        : $"[Fab] Telegram: канал {cursor.Name} впервые для Fab — читаем всю историю (раздачи Fab живут долго).");
+                        : server
+                            ? $"[Fab] Telegram: канал {cursor.Name} впервые для сервера — берём последние {FabServerFirstPosts} постов (старые ссылки уже разобраны на ПК)."
+                            : $"[Fab] Telegram: канал {cursor.Name} впервые для Fab — читаем всю историю (раздачи Fab живут долго).");
                 }
 
                 var tg = await ParseTelegramChannelsAsync(null, cursors, int.MaxValue, _ => false, int.MaxValue, int.MaxValue);
@@ -146,6 +209,22 @@ internal sealed partial class UnityAssetAutomationApp
 
                 _logger.Info($"[Fab] Telegram: постов {tg.AllPosts.Count}, ссылок на ассеты Fab: {fromTelegram.Count}.");
             }
+        }
+
+        // Сервер заходит на Fab редко и по делу: Cloudflare запоминает частые заходы с одного адреса,
+        // а Chrome с экраном занимает на тесном сервере сотни мегабайт.
+        if (serverState is not null)
+        {
+            var pending = queue.Count(q => !IsKnown(q.Url));
+            var ltfDue = serverState.LimitedTimeFreeDue(DateTime.UtcNow, FabLimitedTimeFreeEvery);
+            if (pending == 0 && !ltfDue)
+            {
+                _logger.Info("[Fab] Сервер: новых ассетов Fab из каналов нет, раздачу смотрели недавно — браузер не открываем.");
+                AdvanceFabCursors(cursors, telegramState, unfinished: false, stoppedEarly: false);
+                return;
+            }
+
+            _logger.Info($"[Fab] Сервер: к проверке из каналов {pending}; раздачу {(ltfDue ? "пора посмотреть" : "смотрели недавно")}.");
         }
 
         var window = default((int, int, int, int)?);
@@ -186,13 +265,20 @@ internal sealed partial class UnityAssetAutomationApp
         var stoppedEarly = false;
         var closedByUser = false;
         var challenges = string.Empty;
+        var newlyManual = new List<(string Title, string Url)>();
 
         await using (browser)
         {
-            var fab = new FabStore(browser, _logger, _logsDirectory, _options.FabBaseUrl, _options.Interactive,
+            var fab = new FabStore(browser, _logger, _logsDirectory, _options.FabBaseUrl, _options.Interactive || server,
                 _notifier is { Enabled: true } ? NotifyAsync : null, TimeSpan.FromMilliseconds(_options.NavigationTimeoutMs))
             {
-                HumanWindowHint = remote?.Hint
+                HumanWindowHint = remote?.Hint,
+                DeferManualAdds = server,
+                LoginWait = server ? FabServerHumanWait : FabStore.DefaultLoginWait,
+                ChallengeWait = server ? FabServerHumanWait : FabStore.DefaultChallengeWait,
+                ManualAddWait = server ? FabServerHumanWait : FabStore.DefaultManualAddWait,
+                CanAskHuman = serverState is null ? null : () => serverState.CanAskHuman(DateTime.UtcNow, FabHumanQuietPeriod),
+                OnHumanAsked = serverState is null ? null : reason => serverState.MarkAsked(DateTime.UtcNow, reason)
             };
 
             try
@@ -210,7 +296,9 @@ internal sealed partial class UnityAssetAutomationApp
                 {
                     _logger.Error("============================================================");
                     _logger.Error(" FAB: НЕ ПОЛУЧИЛОСЬ ВОЙТИ В EPIC GAMES");
-                    _logger.Error(" Запустите ещё раз и войдите в открывшемся окне браузера (пункт E в меню).");
+                    _logger.Error(server
+                        ? " Сервер попробует снова в следующий прогон; человека зовём не чаще раза в сутки."
+                        : " Запустите ещё раз и войдите в открывшемся окне браузера (пункт E в меню).");
                     _logger.Error("============================================================");
                     Environment.ExitCode = 2;
                     return;
@@ -231,6 +319,8 @@ internal sealed partial class UnityAssetAutomationApp
 
                 if (loginOnly)
                 {
+                    // Вход подтверждён вручную: сервер снова может заходить на Fab сам.
+                    ClearServerHumanCall(fabDirectory);
                     if (!await OnLimitedFreeAsync())
                     {
                         _logger.Warn("[Fab] Вход есть, но страница раздачи не открылась.");
@@ -264,6 +354,7 @@ internal sealed partial class UnityAssetAutomationApp
                     else
                     {
                         var ltf = await fab.ReadLimitedTimeFreeAsync();
+                        serverState?.MarkLimitedTimeFreeChecked(DateTime.UtcNow);
                         _logger.Info($"[Fab] Раздача «Limited-Time Free»{(ltf.Until is null ? string.Empty : $" ({ltf.Until})")}: {ltf.Links.Count} ассетов" +
                                      (ltf.Titles.Any(t => t.Length > 0) ? $" — {string.Join(", ", ltf.Titles.Where(t => t.Length > 0))}" : string.Empty));
                         foreach (var url in ltf.Links)
@@ -274,7 +365,7 @@ internal sealed partial class UnityAssetAutomationApp
                     }
                 }
 
-                var known = queue.Count(q => !_options.RecheckOwned && (owned.Contains(q.Url) || removed.Contains(q.Url)));
+                var known = queue.Count(q => IsKnown(q.Url));
                 _logger.Info($"[Fab] К проверке: {queue.Count - known}" +
                              (known > 0 ? $" (ещё {known} уже известны по прошлым запускам — их страницы не открываем)" : string.Empty) + ".");
 
@@ -287,16 +378,18 @@ internal sealed partial class UnityAssetAutomationApp
 
                 foreach (var (url, from) in queue)
                 {
-                    if (!_options.RecheckOwned && (owned.Contains(url) || removed.Contains(url)))
+                    if (IsKnown(url))
                     {
                         var isOwned = owned.Contains(url);
+                        var isManual = !isOwned && !removed.Contains(url);
                         report.Items.Add(new ProcessResult
                         {
                             Url = url,
                             TimestampUtc = DateTime.UtcNow,
-                            Status = isOwned ? AssetProcessStatus.AlreadyOwned : AssetProcessStatus.Deprecated,
+                            Status = isOwned ? AssetProcessStatus.AlreadyOwned : isManual ? AssetProcessStatus.NeedsHuman : AssetProcessStatus.Deprecated,
                             Message = isOwned
                                 ? "Уже в библиотеке Fab (известно с прошлых запусков, страница не открывалась)."
+                                : isManual ? "Получает только человек (бот об этом уже сообщал, страница не открывалась)."
                                 : "Нет на Fab (известно с прошлых запусков)."
                         });
                         continue;
@@ -326,6 +419,7 @@ internal sealed partial class UnityAssetAutomationApp
                         FabStore.ClaimOutcome.Paid => AssetProcessStatus.PaidSkipped,
                         FabStore.ClaimOutcome.Removed => AssetProcessStatus.Deprecated,
                         FabStore.ClaimOutcome.Unknown => AssetProcessStatus.UnknownAfterClick,
+                        FabStore.ClaimOutcome.NeedsHuman => AssetProcessStatus.NeedsHuman,
                         _ => AssetProcessStatus.Failed
                     };
 
@@ -359,6 +453,11 @@ internal sealed partial class UnityAssetAutomationApp
                     {
                         removed.Add(url);
                     }
+                    else if (status == AssetProcessStatus.NeedsHuman && server)
+                    {
+                        needsManual.Add(url);
+                        newlyManual.Add((claim.Title ?? url, url));
+                    }
 
                     if (status == AssetProcessStatus.Added || (_options.DryRun && status == AssetProcessStatus.WouldAddInDryRun))
                     {
@@ -386,6 +485,18 @@ internal sealed partial class UnityAssetAutomationApp
             {
                 owned.Save();
                 removed.Save();
+                needsManual.Save();
+                if (serverState is not null)
+                {
+                    // Всё, что требовало человека, сделано (или не требовалось) — снова можно звать, когда понадобится.
+                    if (fab.HumanUnresolved == 0)
+                    {
+                        serverState.ClearAsked();
+                    }
+
+                    serverState.Save();
+                }
+
                 if (fab.ChallengesSelfPassed + fab.ChallengesByHuman > 0)
                 {
                     challenges = $"Проверок Cloudflare: {fab.ChallengesSelfPassed + fab.ChallengesByHuman} " +
@@ -398,25 +509,7 @@ internal sealed partial class UnityAssetAutomationApp
         // иначе в следующий раз их не прочитать заново.
         var telegramUnfinished = report.Items.Any(i => fromTelegram.Contains(i.Url) &&
             i.Status is AssetProcessStatus.Failed or AssetProcessStatus.UnknownAfterClick);
-        if (cursors is not null && !stoppedEarly && !_options.DryRun)
-        {
-            if (telegramUnfinished)
-            {
-                _logger.Info("[Fab] Не все ассеты из каналов получилось проверить — в следующий раз прочитаем эти посты снова.");
-            }
-            else
-            {
-                var advanced = cursors
-                    .Where(c => c.Exhausted && c.NewestId > 0 && telegramState.Advance(c.Name, c.NewestId))
-                    .Select(c => $"{c.Name} #{c.NewestId}")
-                    .ToList();
-                if (advanced.Count > 0)
-                {
-                    telegramState.Save();
-                    _logger.Info($"[Fab] Telegram: запомнили, где остановились: {string.Join(", ", advanced)}. Дальше — только новые посты.");
-                }
-            }
-        }
+        AdvanceFabCursors(cursors, telegramState, telegramUnfinished, stoppedEarly);
 
         report.FinishedAtUtc = DateTime.UtcNow;
         try
@@ -442,6 +535,50 @@ internal sealed partial class UnityAssetAutomationApp
             var lines = addedItems.Take(15).Select(i => $"• {i.DetectionSummary?.Split(" | ")[0] ?? i.Url}\n  {i.Url}");
             await NotifyAsync($"✅ Fab: добавлено {addedItems.Count} на аккаунт Epic (профиль {_profileName}):\n" +
                               string.Join("\n", lines) + (addedItems.Count > 15 ? $"\n… и ещё {addedItems.Count - 15}" : string.Empty));
+        }
+
+        if (newlyManual.Count > 0)
+        {
+            var lines = newlyManual.Take(15).Select(m => $"• {m.Title}\n  {m.Url}");
+            await NotifyAsync("🧩 Fab: эти ассеты получает только человек (раздача −100 % — это покупка за 0), сама я их не беру:\n" +
+                              string.Join("\n", lines) + (newlyManual.Count > 15 ? $"\n… и ещё {newlyManual.Count - 15}" : string.Empty) +
+                              "\nВозьмите их на сайте Fab под своим аккаунтом (кнопка «Add to My Library») или пунктом F на Deck/ПК.");
+        }
+    }
+
+    /// <summary>Человек вошёл вручную (--fab-login): отметка «звали, не пришёл» больше не нужна.</summary>
+    private static void ClearServerHumanCall(string fabDirectory)
+    {
+        var state = FabServerState.Load(fabDirectory);
+        state.ClearAsked();
+        state.Save();
+    }
+
+    /// <summary>
+    /// Запоминает, до какого поста в каналах дочитали Fab. Только если каналы прочитаны до конца и все
+    /// найденные ссылки проверены (unfinished = false): иначе часть постов потерялась бы.
+    /// </summary>
+    private void AdvanceFabCursors(List<TelegramChannelCursor>? cursors, TelegramChannelState telegramState, bool unfinished, bool stoppedEarly)
+    {
+        if (cursors is null || stoppedEarly || _options.DryRun)
+        {
+            return;
+        }
+
+        if (unfinished)
+        {
+            _logger.Info("[Fab] Не все ассеты из каналов получилось проверить — в следующий раз прочитаем эти посты снова.");
+            return;
+        }
+
+        var advanced = cursors
+            .Where(c => c.Exhausted && c.NewestId > 0 && telegramState.Advance(c.Name, c.NewestId))
+            .Select(c => $"{c.Name} #{c.NewestId}")
+            .ToList();
+        if (advanced.Count > 0)
+        {
+            telegramState.Save();
+            _logger.Info($"[Fab] Telegram: запомнили, где остановились: {string.Join(", ", advanced)}. Дальше — только новые посты.");
         }
     }
 

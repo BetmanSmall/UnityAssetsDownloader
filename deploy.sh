@@ -299,6 +299,12 @@ if [ -z "$FAB_VNC_PASSWORD" ]; then
 else
     ok "Пароль окна уже сохранён в .env."
 fi
+echo "  Когда вы вошли в Epic (команда в конце вывода), сервер может сам, после каждого прогона,"
+echo "  забирать новые бесплатные ассеты Fab из каналов. Человека он зовёт только за входом и"
+echo "  галочкой Cloudflare — не чаще раза в сутки. Раздачи −100 % пока забираете вы."
+if [ "$(env_get FAB)" = on ]; then FAB_DEFAULT=Y; else FAB_DEFAULT=N; fi
+if ask_yes "Забирать ассеты Fab на сервере сам (FAB=on)?" "$FAB_DEFAULT"; then FAB_VALUE=on; else FAB_VALUE=off; fi
+ok "Fab на сервере: $FAB_VALUE"
 
 DEFAULT_TZ=$(env_get TZ)
 [ -z "$DEFAULT_TZ" ] && DEFAULT_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true)
@@ -322,13 +328,14 @@ umask 077
     echo "TELEGRAM_CHANNELS=$(env_quote "$CHANNELS_VALUE")"
     echo "WATCH_INTERVAL=$INTERVAL"
     echo "SOURCES=$SOURCES_VALUE"
+    echo "FAB=$FAB_VALUE"
     echo "FAB_VNC_PASSWORD=$(env_quote "$FAB_VNC_PASSWORD")"
     echo "PROFILE=$PROFILE"
     echo "TZ=$TZ_VALUE"
     # Настройки, о которых deploy.sh не спрашивает (TELEGRAM_PROXY, BOT_DIGEST и другие,
     # вписанные руками), переносим как есть — раньше они молча пропадали.
     if [ -f "$ENV_FILE" ]; then
-        grep -vE '^(#|[[:space:]]*$|(UNITY_EMAIL|UNITY_PASSWORD|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_CHANNELS|WATCH_INTERVAL|SOURCES|FAB_VNC_PASSWORD|PROFILE|TZ)=)' "$ENV_FILE" || true
+        grep -vE '^(#|[[:space:]]*$|(UNITY_EMAIL|UNITY_PASSWORD|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_CHANNELS|WATCH_INTERVAL|SOURCES|FAB|FAB_VNC_PASSWORD|PROFILE|TZ)=)' "$ENV_FILE" || true
     fi
 } > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
 chmod 600 "$ENV_FILE"

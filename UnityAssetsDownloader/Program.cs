@@ -353,6 +353,14 @@ internal sealed partial class UnityAssetAutomationApp
         }
     }
 
+    private bool _runCrashed;
+
+    private bool MarkRunCrashed()
+    {
+        _runCrashed = true;
+        return false;
+    }
+
     public async Task RunAsync()
     {
         try
@@ -397,7 +405,7 @@ internal sealed partial class UnityAssetAutomationApp
             }
 
             // Fab — свой браузер и свой аккаунт (Epic Games): вход в Unity для него не нужен.
-            if (_options.Fab || _options.FabLoginOnly)
+            if (_options.Fab || _options.FabLoginOnly || _options.FabServerOnce)
             {
                 await RunFabAsync();
                 return;
@@ -1074,11 +1082,23 @@ internal sealed partial class UnityAssetAutomationApp
             await NotifyRunSummaryAsync(report);
             }
         }
+        catch (Exception) when (MarkRunCrashed())
+        {
+            throw; // сюда не попасть: фильтр всегда false, он лишь отмечает падение до finally
+        }
         finally
         {
             Console.CancelKeyPress -= OnCancelRequested;
             SaveCaches();
             FinalizeProfileName();
+
+            // Сервер: Fab после Unity. Браузер Unity уже закрыт, память свободна; лог прогона ещё открыт.
+            // После падения прогона Fab не запускаем — сначала разберёмся с падением. Ничего не бросает.
+            if (!_runCrashed)
+            {
+                await RunFabServerStageAsync();
+            }
+
             DisposeTelegramClients();
 
             var problemsPath = Path.Combine(_logsDirectory, CliOptions.ProblemsFileName);
@@ -1385,7 +1405,8 @@ internal sealed partial class UnityAssetAutomationApp
     /// </summary>
     private async Task AnnounceNewFabAsync(TelegramParseResult tgResult)
     {
-        if (!_options.Watch || _notifier is not { Enabled: true })
+        // С FAB=on эти ссылки забирает сам этап Fab: объявлять их заранее — лишний шум.
+        if (!_options.Watch || _options.FabOnServer || _notifier is not { Enabled: true })
         {
             return;
         }
@@ -7945,6 +7966,7 @@ internal sealed partial class UnityAssetAutomationApp
         AssetProcessStatus.PromoNotApplied => "Промокод не сработал (раздача кончилась)",
         AssetProcessStatus.Deprecated => "Удалены из магазина издателем",
         AssetProcessStatus.Failed => "Ошибка",
+        AssetProcessStatus.NeedsHuman => "Нужен человек (сами не получаем)",
         _ => status.ToString()
     };
 }
@@ -8179,6 +8201,19 @@ internal sealed class CliOptions
     /// </summary>
     public string? FabVncPassword { get; init; }
 
+    /// <summary>
+    /// Сервер (--watch): после прогона Unity брать новые ассеты Fab из каналов (FAB=on). Выключено по
+    /// умолчанию: включать после того, как вход в Epic выполнен (--fab-login).
+    /// </summary>
+    public bool FabOnServer { get; init; }
+
+    /// <summary>
+    /// Один раз выполнить серверный этап Fab вручную (--fab-server): как после прогона Unity в службе —
+    /// только новые посты каналов, раздача раз в пару дней, человек не на каждом ассете. Для проверки
+    /// на сервере до того, как включать FAB=on.
+    /// </summary>
+    public bool FabServerOnce { get; init; }
+
     /// <summary>Есть ли где показать окно браузера. Нет — Docker, SSH, сервер.</summary>
     public bool HasScreen { get; init; } = true;
 
@@ -8311,6 +8346,7 @@ internal sealed class CliOptions
         var cliTelegramChannels = new List<string>();
         var cliFab = false;
         var cliFabLogin = false;
+        var cliFabServer = false;
         var cliFabUrls = new List<string>();
         string? cliFabBrowser = null;
 
@@ -8434,6 +8470,9 @@ internal sealed class CliOptions
                     break;
                 case "--fab-login":
                     cliFabLogin = true;
+                    break;
+                case "--fab-server":
+                    cliFabServer = true;
                     break;
                 case "--fab-url" when i + 1 < args.Length:
                     cliFab = true;
@@ -8908,10 +8947,12 @@ internal sealed class CliOptions
             TelegramScreenshotOnNoLinks = telegramScreenshotOnNoLinks,
             Fab = cliFab,
             FabLoginOnly = cliFabLogin,
+            FabServerOnce = cliFabServer,
             FabUrls = cliFabUrls,
             FabBrowser = FirstNonEmpty(cliFabBrowser, Environment.GetEnvironmentVariable("FAB_BROWSER")),
             FabBaseUrl = FirstNonEmpty(Environment.GetEnvironmentVariable("FAB_BASE_URL")),
             FabVncPassword = FirstNonEmpty(Environment.GetEnvironmentVariable("FAB_VNC_PASSWORD")),
+            FabOnServer = ParseSwitch(Environment.GetEnvironmentVariable("FAB")),
             HasScreen = !noScreen
         };
     }
@@ -8919,6 +8960,26 @@ internal sealed class CliOptions
     /// <summary>
     /// Разбирает значение вида true/false/да/нет/1/0. Непонятное значение — берём запасное.
     /// </summary>
+    /// <summary>
+    /// Переключатель из .env: on / true / 1 / yes / да — включено; пусто, off, false, 0, no, нет — выключено.
+    /// Непонятное значение — предупреждение и «выключено»: забирать что-то с аккаунта по опечатке нельзя.
+    /// </summary>
+    private static bool ParseSwitch(string? raw)
+    {
+        var value = (raw ?? string.Empty).Trim().ToLowerInvariant();
+        switch (value)
+        {
+            case "":
+            case "off" or "false" or "0" or "no" or "n" or "нет" or "н":
+                return false;
+            case "on" or "true" or "1" or "yes" or "y" or "да" or "д":
+                return true;
+            default:
+                Console.WriteLine($"Непонятное значение FAB='{raw}' (нужно on или off). Fab на сервере выключен.");
+                return false;
+        }
+    }
+
     private static bool ParseBool(string raw, bool fallback)
     {
         var value = raw.Trim().ToLowerInvariant();
@@ -9309,7 +9370,10 @@ internal enum AssetProcessStatus
     UnknownAfterClick,
     PromoNotApplied,
     Deprecated,
-    Failed
+    Failed,
+
+    /// <summary>Fab на сервере: получает только человек (раздача −100 %); программа сообщила и идёт дальше.</summary>
+    NeedsHuman
 }
 
 /// <summary>Сообщение у поля промокода. Explicit — из красной строки ошибки блока купона.</summary>

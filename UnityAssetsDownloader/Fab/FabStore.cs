@@ -32,9 +32,12 @@ internal sealed partial class FabStore
     private readonly TimeSpan _navigationTimeout;
 
     /// <summary>Сколько ждать человека: вход в Epic — дольше, галочку Cloudflare — меньше.</summary>
-    public TimeSpan LoginWait { get; init; } = TimeSpan.FromMinutes(15);
-    public TimeSpan ChallengeWait { get; init; } = TimeSpan.FromMinutes(10);
-    public TimeSpan ManualAddWait { get; init; } = TimeSpan.FromMinutes(3);
+    public static readonly TimeSpan DefaultLoginWait = TimeSpan.FromMinutes(15);
+    public static readonly TimeSpan DefaultChallengeWait = TimeSpan.FromMinutes(10);
+    public static readonly TimeSpan DefaultManualAddWait = TimeSpan.FromMinutes(3);
+    public TimeSpan LoginWait { get; init; } = DefaultLoginWait;
+    public TimeSpan ChallengeWait { get; init; } = DefaultChallengeWait;
+    public TimeSpan ManualAddWait { get; init; } = DefaultManualAddWait;
 
     /// <summary>Сколько Cloudflare даём пропустить браузер самому, прежде чем звать человека.</summary>
     public TimeSpan ChallengeSelfPass { get; init; } = TimeSpan.FromSeconds(15);
@@ -57,6 +60,24 @@ internal sealed partial class FabStore
     /// том же компьютере, где запущена программа.
     /// </summary>
     public string? HumanWindowHint { get; init; }
+
+    /// <summary>
+    /// Сервер: ассеты, которые получает только человек (раздача −100 %), не ждут окна — результат
+    /// NeedsHuman, программа идёт дальше. Окно человека — только для входа, галочки и лицензии.
+    /// </summary>
+    public bool DeferManualAdds { get; init; }
+
+    /// <summary>
+    /// Сервер: можно ли сейчас звать человека. false — недавно уже звали и он не пришёл, окно
+    /// не открываем (оно занимает память) и ничего не пишем боту.
+    /// </summary>
+    public Func<bool>? CanAskHuman { get; init; }
+
+    /// <summary>Сервер: человека позвали (причина) — запомнить время, чтобы не звать слишком часто.</summary>
+    public Action<string>? OnHumanAsked { get; init; }
+
+    /// <summary>Сколько раз человек был нужен, а дело не сделано (не пришёл, не успел, звать нельзя).</summary>
+    public int HumanUnresolved { get; private set; }
 
     public FabStore(HumanBrowser browser, AppLogger logger, string logsDirectory, string? baseUrl,
         bool interactive, Func<string, Task>? notify, TimeSpan navigationTimeout)
@@ -456,7 +477,10 @@ internal sealed partial class FabStore
         Removed,
         NeedsLogin,
         Unknown,
-        Failed
+        Failed,
+
+        /// <summary>Сервер: ассет получает только человек (раздача −100 %, покупка за 0); программа не ждёт и идёт дальше.</summary>
+        NeedsHuman
     }
 
     internal sealed class ClaimResult
@@ -747,7 +771,7 @@ internal sealed partial class FabStore
                 return result;
             }
 
-            return await AddByHandAsync(uid, result, "на странице нет данных о лицензиях");
+            return await AddByHandAsync(uid, result, "на странице нет данных о лицензиях", HumanKind.Deferrable);
         }
 
         // «В библиотеку» Fab кладёт только то, что бесплатно само по себе (базовая цена 0) — так
@@ -768,7 +792,8 @@ internal sealed partial class FabStore
             }
 
             return await AddByHandAsync(uid, result,
-                "раздача со скидкой 100 % оформляется как покупка за 0 — покупки программа сама не делает, получает человек");
+                "раздача со скидкой 100 % оформляется как покупка за 0 — покупки программа сама не делает, получает человек",
+                HumanKind.Deferrable);
         }
 
         // Бесплатная профессиональная лицензия шире личной: берём её, если отдают даром.
@@ -790,7 +815,7 @@ internal sealed partial class FabStore
         if (view.Eula == false)
         {
             // Лицензию Fab принимает человек, а не программа: первый ассет — кнопкой в окне.
-            return await AddByHandAsync(uid, result, "на аккаунте ещё не принята лицензия Fab EULA");
+            return await AddByHandAsync(uid, result, "на аккаунте ещё не принята лицензия Fab EULA", HumanKind.Eula);
         }
 
         ApiReply? add = null;
@@ -840,12 +865,47 @@ internal sealed partial class FabStore
         }
 
         // Не вышло запросом (например, Fab хочет, чтобы один раз приняли лицензию Fab EULA) —
-        // человек нажимает кнопку на открытой странице сам.
-        return await AddByHandAsync(uid, result, add?.Describe() ?? "нет ответа");
+        // человек нажимает кнопку на открытой странице сам. Сбой сети, лимит запросов и ошибка
+        // самого Fab (нет ответа, 403, 429, 5xx) человека не требуют: на сервере повторим в следующий раз.
+        var transient = add is null || add.Status is 0 or 403 or 429 || !(add.Status is >= 400 and < 500);
+        return await AddByHandAsync(uid, result, add?.Describe() ?? "нет ответа",
+            transient ? HumanKind.Transient : HumanKind.Deferrable);
     }
 
-    private async Task<ClaimResult> AddByHandAsync(string uid, ClaimResult result, string reason)
+    /// <summary>Почему понадобился человек: от этого зависит, что делает сервер.</summary>
+    private enum HumanKind
     {
+        /// <summary>Лицензия Fab EULA: без неё не добавится ничего — звать человека в окно, один раз на аккаунт.</summary>
+        Eula,
+
+        /// <summary>Раздача −100 % и подобное: добавляет только человек; сервер отмечает и идёт дальше.</summary>
+        Deferrable,
+
+        /// <summary>Сбой, который может пройти сам: человек не нужен, повторим в следующий прогон.</summary>
+        Transient
+    }
+
+    private async Task<ClaimResult> AddByHandAsync(string uid, ClaimResult result, string reason, HumanKind kind)
+    {
+        // Сервер: окна для каждого ассета не открываем — они ждали бы человека часами. Раздача и
+        // подобное — «нужен человек» (программа сообщит и пойдёт дальше), сбой — «не вышло, повторим».
+        if (DeferManualAdds && kind != HumanKind.Eula)
+        {
+            if (kind == HumanKind.Transient)
+            {
+                result.Outcome = ClaimOutcome.Failed;
+                result.Message = $"Не добавился (повторим в следующий прогон): {reason}";
+            }
+            else
+            {
+                _logger.Info($"[Fab] Нужен человек: {reason}.");
+                result.Outcome = ClaimOutcome.NeedsHuman;
+                result.Message = $"Нужен человек: {reason}.";
+            }
+
+            return result;
+        }
+
         // Скриншот не нужен: раздача и лицензия — обычный путь; не вышло — снимет AskHumanAsync.
         _logger.Info($"[Fab] Нужен человек: {reason}.");
 
@@ -962,9 +1022,20 @@ internal sealed partial class FabStore
         if (!_interactive)
         {
             _logger.Warn($"[Fab] {title.ToLowerInvariant()} — но программа запущена без человека (--interactive false), ждать некого.");
+            HumanUnresolved++;
             await SaveDiagnosticsAsync(shotPrefix);
             return false;
         }
+
+        // Сервер: человека недавно уже звали и он не пришёл — окно не открываем и не пишем снова.
+        if (CanAskHuman is { } canAsk && !canAsk())
+        {
+            _logger.Warn($"[Fab] {title.ToLowerInvariant()} — человека недавно уже звали, ответа не было; снова позовём позже.");
+            HumanUnresolved++;
+            return false;
+        }
+
+        OnHumanAsked?.Invoke(title);
 
         for (var attempt = 1; attempt <= attempts; attempt++)
         {
@@ -986,7 +1057,11 @@ internal sealed partial class FabStore
             if (attempt == 1 && _notify is not null)
             {
                 await _notify($"⏳ Fab ждёт вас: {title.ToLowerInvariant()}. " +
-                              (string.IsNullOrWhiteSpace(HumanWindowHint) ? "Окно Chrome открыто на компьютере." : HumanWindowHint));
+                              (string.IsNullOrWhiteSpace(HumanWindowHint) ? "Окно Chrome открыто на компьютере." : HumanWindowHint) +
+                              $" Окно ждёт до {timeout.TotalMinutes:0} мин." +
+                              (DeferManualAdds
+                                  ? " Не успели — войдите вручную командой --fab-login (она в конце вывода ./deploy.sh): после неё сервер снова заходит на Fab сам."
+                                  : string.Empty));
             }
 
             _lastHandOverClosedByHuman = await _browser.HandOverToHumanAsync(url, timeout);
@@ -1023,6 +1098,7 @@ internal sealed partial class FabStore
         }
 
         _logger.Warn($"[Fab] Не получилось: {title.ToLowerInvariant()}.");
+        HumanUnresolved++;
         await SaveDiagnosticsAsync(shotPrefix);
         return false;
     }
