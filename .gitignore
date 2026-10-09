@@ -409,6 +409,10 @@ config.json
 logs-*.zip
 telegram_sources.local.txt
 
+# Сводки прогона, скопированные с сервера в корень проекта для разбора (настоящие лежат в logs/).
+/run-summary-*.txt
+/last-run-summary.txt
+
 # Пароль Unity и токен бота для сервера
 .env
 
