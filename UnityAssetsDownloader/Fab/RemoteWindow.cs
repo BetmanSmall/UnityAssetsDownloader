@@ -70,9 +70,10 @@ internal sealed class RemoteWindow : IAsyncDisposable
         get
         {
             var port = HostPort(_settings);
-            return $"Откройте окно: на своём компьютере выполните «ssh -L {port}:localhost:{port} <ваш сервер>», " +
-                   $"затем в браузере откройте http://localhost:{port}/vnc.html?autoconnect=true&resize=scale " +
-                   "(пароль окна — FAB_VNC_PASSWORD в .env на сервере).";
+            return $"Откройте окно: на своём компьютере выполните «ssh -L 127.0.0.1:{port}:127.0.0.1:{port} <ваш сервер>», " +
+                   $"затем в браузере откройте http://127.0.0.1:{port}/vnc.html?autoconnect=true&resize=scale " +
+                   "(пароль окна — FAB_VNC_PASSWORD в .env на сервере). " +
+                   "Закрыть окно Chrome — Ctrl+Shift+W: на виртуальном экране кнопок окна нет.";
         }
     }
 

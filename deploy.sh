@@ -452,6 +452,6 @@ cat <<EOF
 
   Войти в Fab (аккаунт Epic Games) — один раз, между прогонами (в логе «Следующий прогон»):
     ${DC[*]} exec -it unity-assets dotnet UnityAssetsDownloader.dll --logs-dir /app/logs --data-dir /app/data --profile $PROFILE --fab-login
-    затем на своём компьютере: ssh -L 6085:localhost:6085 <ваш сервер>
-    и в браузере: http://localhost:6085/vnc.html?autoconnect=true&resize=scale  (пароль окна — FAB_VNC_PASSWORD в .env)
+    затем на своём компьютере: ssh -L 127.0.0.1:6085:127.0.0.1:6085 <ваш сервер>
+    и в браузере: http://127.0.0.1:6085/vnc.html?autoconnect=true&resize=scale  (пароль окна — FAB_VNC_PASSWORD в .env)
 EOF
