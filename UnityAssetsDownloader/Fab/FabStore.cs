@@ -496,6 +496,9 @@ internal sealed partial class FabStore
         /// <summary>Добавил человек в обычном окне, а не программа.</summary>
         public bool ByHuman { get; set; }
 
+        /// <summary>Человек сам закрыл своё окно (а не истекло время): значит он у экрана.</summary>
+        public bool HumanClosedWindow { get; set; }
+
         public string Summary =>
             string.Join(" | ", new[]
             {
@@ -876,9 +879,67 @@ internal sealed partial class FabStore
     /// Разведка (--fab-recon): человек сам получает ассет в обычном окне, записывая сеть в DevTools
     /// (Network → «Save all as HAR»). Программа только открывает страницу, ждёт и потом по самой странице
     /// проверяет, что ассет в библиотеке. Нужна, чтобы увидеть, как Fab оформляет раздачу со скидкой
-    /// 100 % (покупку за 0), и научить этому программу: деньги тут не нужны, платить нельзя.
+    /// 100 % (покупку за 0): деньги тут не нужны, платить нельзя.
     /// </summary>
-    public async Task<ClaimResult> ReconAsync(string uid, TimeSpan wait)
+    public Task<ClaimResult> ReconAsync(string uid, TimeSpan wait) =>
+        GetByHandAsync(uid, wait, "FAB: РАЗВЕДКА — ПОЛУЧИТЕ АССЕТ САМИ, ЗАПИСАВ СЕТЬ", "fab-recon", notify: true,
+            result =>
+            [
+                $"Ассет «{result.Title ?? uid}». Окно откроется на его странице.",
+                "1) В окне нажмите F12 → вкладка Network → отметьте «Preserve log». Запись должна идти ДО вашего нажатия.",
+                "2) Получите ассет кнопкой на странице («Add to My Library» или оформление за 0). К оплате должно быть 0:",
+                "   если Fab просит платёжные данные или сумму больше нуля — остановитесь и закройте окно.",
+                "3) Когда кнопка сменится на «View in My Library»: в Network нажмите кнопку скачивания (стрелка вниз) →",
+                "   «Export HAR (sanitized)» (или правый клик → «Save all as HAR with content»), файл fab.har — в Downloads.",
+                "4) Закройте окно Chrome — Ctrl+Shift+W. Программа проверит страницу и покажет, где лежит файл."
+            ]);
+
+    /// <summary>
+    /// Человек сам получает ассет в обычном окне: программа открывает страницу, ждёт, потом по самой
+    /// странице проверяет «View in My Library». Раздача со скидкой 100 % оформляется как покупка за 0, и
+    /// на подтверждении Epic показывает капчу hCaptcha: её решает только человек.
+    /// </summary>
+    public Task<ClaimResult> TakeByHandAsync(string uid, TimeSpan wait, bool notify = true) =>
+        GetByHandAsync(uid, wait, "FAB: ПОЛУЧИТЕ АССЕТ РАЗДАЧИ САМИ", "fab-take", notify,
+            result =>
+            [
+                $"Ассет «{result.Title ?? uid}». Окно откроется на его странице.",
+                "1) Нажмите кнопку получения («Add to My Library») и в окне оформления проверьте: к оплате 0.",
+                "   Если Fab просит платёжные данные или сумму больше нуля — остановитесь и закройте окно.",
+                "2) Решите капчу Epic (картинки) и нажмите подтверждение. Если капчу отклонят — попробуйте ещё раз.",
+                "3) Когда кнопка сменится на «View in My Library», закройте окно Chrome — Ctrl+Shift+W."
+            ]);
+
+    /// <summary>
+    /// Раздача по очереди: каждый ассет — в окне человека. Идёт по списку, пока человек у экрана; не
+    /// пришёл (окно закрылось по времени) — останавливается, чтобы не ждать впустую по несколько раз.
+    /// </summary>
+    public async Task<List<(string Url, ClaimResult Result)>> TakeGiveawayAsync(IReadOnlyList<string> links, TimeSpan perAssetWait)
+    {
+        var results = new List<(string Url, ClaimResult Result)>();
+        foreach (var url in links)
+        {
+            var uid = ListingUid(url);
+            if (uid is null)
+            {
+                continue;
+            }
+
+            // Сообщение боту — только про первый ассет: дальше человек уже у экрана.
+            var result = await TakeByHandAsync(uid, perAssetWait, notify: results.Count == 0);
+            results.Add((url, result));
+            if (result.Outcome == ClaimOutcome.Failed && !result.HumanClosedWindow)
+            {
+                _logger.Warn("[Fab] Человек не пришёл к окну — остальные ассеты раздачи пропускаем, команду можно запустить снова.");
+                break;
+            }
+        }
+
+        return results;
+    }
+
+    private async Task<ClaimResult> GetByHandAsync(string uid, TimeSpan wait, string title, string shotPrefix, bool notify,
+        Func<ClaimResult, string[]> lines)
     {
         if (!await OpenAsync(PageUrl(uid)))
         {
@@ -906,29 +967,86 @@ internal sealed partial class FabStore
             return result;
         }
 
-        var ok = await AskHumanAsync(
-            "FAB: РАЗВЕДКА — ПОЛУЧИТЕ АССЕТ САМИ, ЗАПИСАВ СЕТЬ",
-            [
-                $"Ассет «{result.Title ?? uid}». Окно откроется на его странице.",
-                "1) В окне нажмите F12 → вкладка Network → отметьте «Preserve log». Запись должна идти ДО вашего нажатия.",
-                "2) Получите ассет кнопкой на странице («Add to My Library» или оформление за 0). К оплате должно быть 0:",
-                "   если Fab просит платёжные данные или сумму больше нуля — остановитесь и закройте окно.",
-                "3) Когда кнопка сменится на «View in My Library»: в Network нажмите кнопку скачивания (стрелка вниз) →",
-                "   «Export HAR (sanitized)» (или правый клик → «Save all as HAR with content»), файл fab.har — в Downloads.",
-                "4) Закройте окно Chrome — Ctrl+Shift+W. Программа проверит страницу и покажет, где лежит файл."
-            ],
-            PageUrl(uid),
+        var ok = await AskHumanAsync(title, lines(result), PageUrl(uid),
             async () => (await ReadListingViewAsync(uid))?.ButtonOwned == true,
-            wait,
-            "fab-recon",
-            attempts: 1);
+            wait, shotPrefix, attempts: 1, notify: notify);
 
         result.ByHuman = ok;
+        result.HumanClosedWindow = _lastHandOverClosedByHuman;
         result.Outcome = ok ? ClaimOutcome.Added : ClaimOutcome.Failed;
         result.Message = ok
             ? "Ассет в библиотеке Fab (получен вами в окне)."
-            : "Страница не показала «View in My Library»: не успели или не получилось. Можно запустить разведку ещё раз.";
+            : "Страница не показала «View in My Library»: не успели или не получилось (капчу Epic могли отклонить). Можно запустить ещё раз.";
         return result;
+    }
+
+    /// <summary>
+    /// Когда кончается раздача: из надписи страницы «Until October 20 at 9:59 AM ET» (время восточное
+    /// США, летнее или зимнее — по часовому поясу системы). null — надпись не разобрана.
+    /// </summary>
+    public static DateTime? ParseGiveawayEnd(string? until, DateTime nowUtc)
+    {
+        if (string.IsNullOrWhiteSpace(until))
+        {
+            return null;
+        }
+
+        var m = System.Text.RegularExpressions.Regex.Match(until,
+            @"(?<mon>[A-Za-z]+)\s+(?<day>\d{1,2})\s+at\s+(?<h>\d{1,2}):(?<min>\d{2})\s*(?<ap>AM|PM)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!m.Success)
+        {
+            return null;
+        }
+
+        var month = DateTime.TryParseExact(m.Groups["mon"].Value, ["MMMM", "MMM"], System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out var parsedMonth) ? parsedMonth.Month : 0;
+        if (month == 0)
+        {
+            return null;
+        }
+
+        var hour = int.Parse(m.Groups["h"].Value) % 12 + (m.Groups["ap"].Value.Equals("PM", StringComparison.OrdinalIgnoreCase) ? 12 : 0);
+        TimeZoneInfo? eastern = null;
+        foreach (var id in new[] { "America/New_York", "Eastern Standard Time" })
+        {
+            try
+            {
+                eastern = TimeZoneInfo.FindSystemTimeZoneById(id);
+                break;
+            }
+            catch (TimeZoneNotFoundException)
+            {
+            }
+            catch (InvalidTimeZoneException)
+            {
+            }
+        }
+
+        if (eastern is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            // Год в надписи нет: берём ближайшую дату, которая не ушла в прошлое больше чем на полгода.
+            for (var year = nowUtc.Year; year <= nowUtc.Year + 1; year++)
+            {
+                var local = new DateTime(year, month, int.Parse(m.Groups["day"].Value), hour, int.Parse(m.Groups["min"].Value), 0, DateTimeKind.Unspecified);
+                var utc = TimeZoneInfo.ConvertTimeToUtc(local, eastern);
+                if (utc > nowUtc - TimeSpan.FromDays(180))
+                {
+                    return utc;
+                }
+            }
+        }
+        catch (ArgumentException)
+        {
+            // Такой даты не бывает (например 30 февраля) — надпись непонятная.
+        }
+
+        return null;
     }
 
     /// <summary>Почему понадобился человек: от этого зависит, что делает сервер.</summary>
@@ -1075,7 +1193,7 @@ internal sealed partial class FabStore
     /// Не вышло — ещё одна попытка. Сообщение в консоли и боту — чтобы человек знал, что делать.
     /// </summary>
     private async Task<bool> AskHumanAsync(string title, string[] lines, string url, Func<Task<bool>> done,
-        TimeSpan timeout, string shotPrefix, int attempts = 2)
+        TimeSpan timeout, string shotPrefix, int attempts = 2, bool notify = true)
     {
         _lastHandOverClosedByHuman = false;
         if (!_interactive)
@@ -1113,7 +1231,7 @@ internal sealed partial class FabStore
             _logger.Info($" Программа ждёт до {timeout.TotalMinutes:0} мин.");
             _logger.Info("============================================================");
 
-            if (attempt == 1 && _notify is not null)
+            if (attempt == 1 && _notify is not null && notify)
             {
                 await _notify($"⏳ Fab ждёт вас: {title.ToLowerInvariant()}. " +
                               (string.IsNullOrWhiteSpace(HumanWindowHint) ? "Окно Chrome открыто на компьютере." : HumanWindowHint) +

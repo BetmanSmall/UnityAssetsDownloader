@@ -26,6 +26,9 @@ internal sealed partial class UnityAssetAutomationApp
     /// </summary>
     private const int FabServerFirstPosts = 100;
 
+    /// <summary>Сервер: за сколько до конца раздачи напомнить, что остались неполученные ассеты.</summary>
+    private static readonly TimeSpan FabGiveawayReminderLead = TimeSpan.FromDays(3);
+
     /// <summary>Сервер: как часто заходим на страницу раздачи, если в каналах ничего нового.</summary>
     private static readonly TimeSpan FabLimitedTimeFreeEvery = TimeSpan.FromDays(2);
 
@@ -61,6 +64,7 @@ internal sealed partial class UnityAssetAutomationApp
         _logger.Info("============================================================");
         _logger.Info(server ? " FAB (СЕРВЕР): НОВЫЕ АССЕТЫ ИЗ КАНАЛОВ И РАЗДАЧА"
             : _options.FabReconUrl is not null ? " FAB: РАЗВЕДКА — ВЫ ПОЛУЧАЕТЕ АССЕТ САМИ, ПРОГРАММА ЖДЁТ"
+            : _options.FabGiveaway ? " FAB: РАЗДАЧА LIMITED-TIME FREE — АССЕТЫ ПО ОЧЕРЕДИ, КАПЧУ РЕШАЕТЕ ВЫ"
             : loginOnly ? " FAB: ВХОД В АККАУНТ EPIC GAMES" : " FAB.COM: БЕСПЛАТНЫЕ АССЕТЫ НА АККАУНТ EPIC GAMES");
         _logger.Info("============================================================");
 
@@ -113,6 +117,7 @@ internal sealed partial class UnityAssetAutomationApp
             _logger.Info("[Fab] Невидимый режим для Fab не работает (Cloudflare) — окно браузера будет видно.");
         }
 
+        var giveaway = !server && _options.FabGiveaway;
         var reconUid = !server && _options.FabReconUrl is { } reconUrl ? FabStore.ListingUid(reconUrl) : null;
         if (!server && _options.FabReconUrl is not null && reconUid is null)
         {
@@ -175,7 +180,7 @@ internal sealed partial class UnityAssetAutomationApp
         }
 
         List<TelegramChannelCursor>? cursors = null;
-        if (!loginOnly && reconUid is null)
+        if (!loginOnly && reconUid is null && !giveaway)
         {
             if (explicitUrls.Count > 0)
             {
@@ -222,18 +227,21 @@ internal sealed partial class UnityAssetAutomationApp
 
         // Сервер заходит на Fab редко и по делу: Cloudflare запоминает частые заходы с одного адреса,
         // а Chrome с экраном занимает на тесном сервере сотни мегабайт.
+        var reminderDue = false;
         if (serverState is not null)
         {
             var pending = queue.Count(q => !IsKnown(q.Url));
             var ltfDue = serverState.LimitedTimeFreeDue(DateTime.UtcNow, FabLimitedTimeFreeEvery);
-            if (pending == 0 && !ltfDue)
+            reminderDue = serverState.GiveawayReminderDue(DateTime.UtcNow, FabGiveawayReminderLead);
+            if (pending == 0 && !ltfDue && !reminderDue)
             {
                 _logger.Info("[Fab] Сервер: новых ассетов Fab из каналов нет, раздачу смотрели недавно — браузер не открываем.");
                 AdvanceFabCursors(cursors, telegramState, unfinished: false, stoppedEarly: false);
                 return;
             }
 
-            _logger.Info($"[Fab] Сервер: к проверке из каналов {pending}; раздачу {(ltfDue ? "пора посмотреть" : "смотрели недавно")}.");
+            _logger.Info($"[Fab] Сервер: к проверке из каналов {pending}; раздачу " +
+                         (ltfDue ? "пора посмотреть" : reminderDue ? "скоро кончится — проверим, всё ли забрано" : "смотрели недавно") + ".");
         }
 
         var window = default((int, int, int, int)?);
@@ -254,7 +262,8 @@ internal sealed partial class UnityAssetAutomationApp
                 Window = window,
                 Display = remote?.Display,
                 BeforeHumanWindow = remote is null ? null : remote.StartViewerAsync,
-                AfterHumanWindow = remote is null ? null : remote.StopViewerAsync
+                // Раздача по очереди: окно удалённого доступа не закрываем между ассетами, чтобы не подключаться заново.
+                AfterHumanWindow = remote is null || giveaway ? null : remote.StopViewerAsync
             }, _logger);
         }
         catch (Exception ex)
@@ -275,10 +284,13 @@ internal sealed partial class UnityAssetAutomationApp
         var closedByUser = false;
         var challenges = string.Empty;
         var newlyManual = new List<(string Title, string Url)>();
+        var reminderMissing = new List<(string Title, string Url)>();
+        List<string>? ltfLinks = null;
+        string? giveawayUntil = null;
 
         await using (browser)
         {
-            var fab = new FabStore(browser, _logger, _logsDirectory, _options.FabBaseUrl, _options.Interactive || server || reconUid is not null,
+            var fab = new FabStore(browser, _logger, _logsDirectory, _options.FabBaseUrl, _options.Interactive || server || reconUid is not null || giveaway,
                 _notifier is { Enabled: true } ? NotifyAsync : null, TimeSpan.FromMilliseconds(_options.NavigationTimeoutMs))
             {
                 HumanWindowHint = remote?.Hint,
@@ -375,6 +387,12 @@ internal sealed partial class UnityAssetAutomationApp
                     return;
                 }
 
+                if (giveaway)
+                {
+                    await RunGiveawayWalkAsync(fab, owned, OnLimitedFreeAsync);
+                    return;
+                }
+
                 if (explicitUrls.Count == 0)
                 {
                     if (!await OnLimitedFreeAsync())
@@ -385,6 +403,9 @@ internal sealed partial class UnityAssetAutomationApp
                     {
                         var ltf = await fab.ReadLimitedTimeFreeAsync();
                         serverState?.MarkLimitedTimeFreeChecked(DateTime.UtcNow);
+                        serverState?.NoteGiveaway(ltf.Until, FabStore.ParseGiveawayEnd(ltf.Until, DateTime.UtcNow));
+                        giveawayUntil = ltf.Until;
+                        ltfLinks = ltf.Links.ToList();
                         _logger.Info($"[Fab] Раздача «Limited-Time Free»{(ltf.Until is null ? string.Empty : $" ({ltf.Until})")}: {ltf.Links.Count} ассетов" +
                                      (ltf.Titles.Any(t => t.Length > 0) ? $" — {string.Join(", ", ltf.Titles.Where(t => t.Length > 0))}" : string.Empty));
                         foreach (var url in ltf.Links)
@@ -504,6 +525,33 @@ internal sealed partial class UnityAssetAutomationApp
                     // режет слишком частые добавления.
                     await Task.Delay(pace);
                 }
+
+                // Раздача скоро кончится: смотрим, остались ли ассеты, которых нет в библиотеке (страницы
+                // открываем только сейчас, не при каждом прогоне).
+                if (serverState is not null && reminderDue && ltfLinks is { Count: > 0 })
+                {
+                    foreach (var link in ltfLinks)
+                    {
+                        if (owned.Contains(link))
+                        {
+                            continue;
+                        }
+
+                        var check = await fab.ClaimAsync(link, dryRun: true);
+                        if (check.Outcome == FabStore.ClaimOutcome.AlreadyOwned)
+                        {
+                            owned.Add(link);
+                        }
+                        else if (check.Outcome is FabStore.ClaimOutcome.WouldAdd or FabStore.ClaimOutcome.NeedsHuman)
+                        {
+                            reminderMissing.Add((check.Title ?? link, link));
+                        }
+
+                        await Task.Delay(pace);
+                    }
+
+                    serverState.MarkGiveawayReminded();
+                }
             }
             catch (CdpException ex) when (ex.IsDisconnected)
             {
@@ -570,9 +618,84 @@ internal sealed partial class UnityAssetAutomationApp
         if (newlyManual.Count > 0)
         {
             var lines = newlyManual.Take(15).Select(m => $"• {m.Title}\n  {m.Url}");
-            await NotifyAsync("🧩 Fab: эти ассеты получает только человек (раздача −100 % — это покупка за 0), сама я их не беру:\n" +
+            await NotifyAsync($"🧩 Fab: раздача −100 %{(giveawayUntil is null ? string.Empty : $" ({giveawayUntil})")} — эти ассеты получает только человек " +
+                              "(покупка за 0, Epic просит капчу), сама я их не беру:\n" +
                               string.Join("\n", lines) + (newlyManual.Count > 15 ? $"\n… и ещё {newlyManual.Count - 15}" : string.Empty) +
-                              "\nВозьмите их на сайте Fab под своим аккаунтом (кнопка «Add to My Library») или пунктом F на Deck/ПК.");
+                              GiveawayWaysText());
+        }
+
+        if (reminderMissing.Count > 0)
+        {
+            var lines = reminderMissing.Take(15).Select(m => $"• {m.Title}\n  {m.Url}");
+            await NotifyAsync($"⏰ Fab: раздача заканчивается{(giveawayUntil is null ? string.Empty : $" ({giveawayUntil})")}. Ещё не у вас:\n" +
+                              string.Join("\n", lines) + GiveawayWaysText());
+        }
+    }
+
+    /// <summary>Как забрать раздачу: два способа — на ПК или Deck и в окне сервера. Текст для бота.</summary>
+    private string GiveawayWaysText() =>
+        "\nДва способа:\n" +
+        "1) ПК или Deck: пункт F → Fab. С домашнего адреса капча Epic обычно проходит надёжнее (с сервера Epic отклонил 2 решения из 3).\n" +
+        "2) Окно сервера: docker compose exec -it unity-assets dotnet UnityAssetsDownloader.dll --logs-dir /app/logs --data-dir /app/data " +
+        $"--profile {_options.ProfileName} --fab-giveaway\n" +
+        "   Дальше SSH-туннель и окно, как при входе: программа проведёт по всем ещё не полученным ассетам раздачи подряд.";
+
+    /// <summary>
+    /// --fab-giveaway: раздача по очереди. Программа открывает каждый ещё не полученный ассет в окне человека;
+    /// кнопку, оформление за 0 и капчу Epic делает человек, а подтверждает программа — по странице.
+    /// </summary>
+    private async Task RunGiveawayWalkAsync(FabStore fab, OwnedAssetsCache owned, Func<Task<bool>> onLimitedFree)
+    {
+        if (!await onLimitedFree())
+        {
+            _logger.Error("[Fab] Страница раздачи «Limited-Time Free» не открылась.");
+            Environment.ExitCode = 2;
+            return;
+        }
+
+        var ltf = await fab.ReadLimitedTimeFreeAsync();
+        _logger.Info($"[Fab] Раздача «Limited-Time Free»{(ltf.Until is null ? string.Empty : $" ({ltf.Until})")}: {ltf.Links.Count} ассетов.");
+        var todo = ltf.Links.Where(u => _options.RecheckOwned || !owned.Contains(u)).ToList();
+        if (todo.Count == 0)
+        {
+            _logger.Info("[Fab] Нечего получать: раздачи сейчас нет или все её ассеты уже у вас.");
+            return;
+        }
+
+        _logger.Info($"[Fab] Провожу по ассетам раздачи по очереди ({todo.Count}). В каждом: кнопка, проверка «к оплате 0», капча Epic, закрыть окно (Ctrl+Shift+W).");
+        var results = await fab.TakeGiveawayAsync(todo, TimeSpan.FromMinutes(10));
+        var got = 0;
+        var failed = 0;
+        foreach (var (url, r) in results)
+        {
+            var title = r.Title ?? url;
+            if (r.Outcome == FabStore.ClaimOutcome.Added)
+            {
+                got++;
+                owned.Add(url);
+                _logger.Info($"[Fab] Получено: {title}");
+            }
+            else if (r.Outcome == FabStore.ClaimOutcome.AlreadyOwned)
+            {
+                owned.Add(url);
+                _logger.Info($"[Fab] Уже было: {title}");
+            }
+            else
+            {
+                failed++;
+                _logger.Warn($"[Fab] Не получено: {title} — {r.Message}");
+            }
+        }
+
+        owned.Save();
+        var skipped = todo.Count - results.Count;
+        _logger.Info("============================================================");
+        _logger.Info($" РАЗДАЧА: получено {got}, не получено {failed + skipped} из {todo.Count}.");
+        _logger.Info("============================================================");
+        Environment.ExitCode = failed + skipped == 0 ? 0 : 2;
+        if (got > 0)
+        {
+            await NotifyAsync($"✅ Fab: по раздаче получено {got} из {todo.Count} (профиль {_profileName}).");
         }
     }
 

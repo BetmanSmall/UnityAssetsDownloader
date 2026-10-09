@@ -15,6 +15,9 @@ internal sealed class FabServerState
         public DateTime? LimitedTimeFreeCheckedUtc { get; set; }
         public DateTime? HumanAskedUtc { get; set; }
         public string? HumanReason { get; set; }
+        public DateTime? GiveawayEndUtc { get; set; }
+        public string? GiveawayUntilText { get; set; }
+        public string? GiveawayRemindedFor { get; set; }
     }
 
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
@@ -30,6 +33,9 @@ internal sealed class FabServerState
         LimitedTimeFreeCheckedUtc = saved.LimitedTimeFreeCheckedUtc;
         HumanAskedUtc = saved.HumanAskedUtc;
         HumanReason = saved.HumanReason;
+        GiveawayEndUtc = saved.GiveawayEndUtc;
+        GiveawayUntilText = saved.GiveawayUntilText;
+        GiveawayRemindedFor = saved.GiveawayRemindedFor;
         _askedBefore = saved.HumanAskedUtc;
     }
 
@@ -40,6 +46,14 @@ internal sealed class FabServerState
     public DateTime? HumanAskedUtc { get; private set; }
 
     public string? HumanReason { get; private set; }
+
+    /// <summary>Когда кончается нынешняя раздача Limited-Time Free (по её надписи «Until … ET»), если удалось разобрать.</summary>
+    public DateTime? GiveawayEndUtc { get; private set; }
+
+    public string? GiveawayUntilText { get; private set; }
+
+    /// <summary>Для какой раздачи (по тексту «Until …») уже напомнили о конце.</summary>
+    public string? GiveawayRemindedFor { get; private set; }
 
     public static FabServerState Load(string fabDirectory)
     {
@@ -67,6 +81,29 @@ internal sealed class FabServerState
     public void MarkLimitedTimeFreeChecked(DateTime nowUtc)
     {
         LimitedTimeFreeCheckedUtc = nowUtc;
+        _changed = true;
+    }
+
+    /// <summary>Запоминает, когда кончается раздача. Новая раздача (другой текст) сбрасывает отметку «напомнили».</summary>
+    public void NoteGiveaway(string? untilText, DateTime? endUtc)
+    {
+        if (string.IsNullOrWhiteSpace(untilText) || (GiveawayUntilText == untilText && GiveawayEndUtc == endUtc))
+        {
+            return;
+        }
+
+        GiveawayUntilText = untilText;
+        GiveawayEndUtc = endUtc;
+        _changed = true;
+    }
+
+    /// <summary>Пора напомнить: до конца раздачи осталось не больше lead, она ещё идёт, и об этой раздаче ещё не напоминали.</summary>
+    public bool GiveawayReminderDue(DateTime nowUtc, TimeSpan lead) =>
+        GiveawayEndUtc is { } end && nowUtc < end && end - nowUtc <= lead && GiveawayRemindedFor != GiveawayUntilText;
+
+    public void MarkGiveawayReminded()
+    {
+        GiveawayRemindedFor = GiveawayUntilText;
         _changed = true;
     }
 
@@ -113,7 +150,10 @@ internal sealed class FabServerState
             {
                 LimitedTimeFreeCheckedUtc = LimitedTimeFreeCheckedUtc,
                 HumanAskedUtc = HumanAskedUtc,
-                HumanReason = HumanReason
+                HumanReason = HumanReason,
+                GiveawayEndUtc = GiveawayEndUtc,
+                GiveawayUntilText = GiveawayUntilText,
+                GiveawayRemindedFor = GiveawayRemindedFor
             }, Json));
             _changed = false;
         }

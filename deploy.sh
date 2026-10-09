@@ -461,4 +461,8 @@ cat <<EOF
     ${DC[*]} exec -it unity-assets dotnet UnityAssetsDownloader.dll --logs-dir /app/logs --data-dir /app/data --profile $PROFILE --fab-login
     затем на своём компьютере: ssh -L 127.0.0.1:6085:127.0.0.1:6085 <ваш сервер>
     и в браузере: http://127.0.0.1:6085/vnc.html?autoconnect=true&resize=scale  (пароль окна — FAB_VNC_PASSWORD в .env)
+
+  Раздачу Fab «Limited-Time Free» (−100 %) сервер сам не берёт: на оформлении Epic просит капчу. Два способа:
+    на ПК или Deck:     ./run.sh → F (с домашнего адреса капча проходит надёжнее)
+    в окне сервера:     ${DC[*]} exec -it unity-assets dotnet UnityAssetsDownloader.dll --logs-dir /app/logs --data-dir /app/data --profile $PROFILE --fab-giveaway
 EOF
