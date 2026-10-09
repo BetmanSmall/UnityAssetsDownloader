@@ -8,8 +8,8 @@ internal enum ChannelPostKind
     Card,
 
     /// <summary>
-    /// Раздача файла через бота («СКАЧАТЬ», t.me/…bot?start=…). По ценам магазина это платные ассеты,
-    /// отданные без оплаты: такие посты в каталог не берём и ссылки на бота нигде не храним.
+    /// Раздача файла через бота («СКАЧАТЬ», t.me/…bot?start=file_… или start=download_…). По ценам магазина
+    /// это платные ассеты, отданные без оплаты: такие посты в каталог не берём и ссылки на бота нигде не храним.
     /// </summary>
     DownloadBot,
 
@@ -176,7 +176,9 @@ internal static class ChannelCardParser
         return id is null ? null : (id, "https://assetstore.unity.com" + uri.AbsolutePath);
     }
 
-    // Ссылка на бота, который отдаёт файл: t.me/<что-то>bot?start=<что-то>.
+    // Ссылка на бота, который отдаёт файл: t.me/<что-то>bot?start=file_… (LockBotChanel_bot) или start=download_…
+    // (tg_game_market_bot). Любая другая ссылка на бота — не раздача: подпись «наш бот: …?start=channel» или
+    // реферальная ссылка не должны отбрасывать пост с бесплатным ассетом.
     private static bool IsDownloadBotLink(string href)
     {
         if (!Uri.TryCreate(href, UriKind.Absolute, out var uri) || !TelegramHosts.Contains(uri.Host))
@@ -185,7 +187,14 @@ internal static class ChannelCardParser
         }
 
         var first = uri.AbsolutePath.Trim('/').Split('/')[0];
-        return first.EndsWith("bot", StringComparison.OrdinalIgnoreCase) &&
-               uri.Query.Contains("start=", StringComparison.OrdinalIgnoreCase);
+        if (!first.EndsWith("bot", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var start = System.Web.HttpUtility.ParseQueryString(uri.Query)["start"];
+        return start is not null &&
+               (start.StartsWith("file_", StringComparison.OrdinalIgnoreCase) ||
+                start.StartsWith("download_", StringComparison.OrdinalIgnoreCase));
     }
 }
