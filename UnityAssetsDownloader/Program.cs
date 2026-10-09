@@ -56,10 +56,19 @@ if (options.Watch)
     return;
 }
 
+// Разовый прогон (не служба): docker stop / ./backfill.sh --stop присылают SIGTERM. Успеваем сохранить память
+// профиля и записать сводку, потом процесс завершается как обычно.
+UnityAssetAutomationApp? singleApp = null;
+using var singleRunSigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, _ =>
+{
+    Console.WriteLine("Получен сигнал остановки. Сохраняем память профиля и сводку прогона.");
+    singleApp?.WriteSummaryOnExit();
+});
+
 try
 {
-    var app = new UnityAssetAutomationApp(options);
-    await app.RunAsync();
+    singleApp = new UnityAssetAutomationApp(options);
+    await singleApp.RunAsync();
 }
 catch (Exception ex)
 {
@@ -289,6 +298,16 @@ internal sealed partial class UnityAssetAutomationApp
     private readonly string _cookiesPath;
     private readonly string _sessionStatePath;
     private readonly string _reportPath;
+
+    // Для сводки прогона (run-summary-*.txt): отчёт, сколько пропущено без открытия страницы, размер каталога.
+    private RunReport? _runReport;
+    private volatile bool _interrupted;
+    private readonly DateTime _startedLocal = DateTime.Now;
+    private int _summarySkippedKnown;
+    private int _summarySkippedUnaddable;
+    private int _summarySkippedDeprecated;
+    private int _summaryCatalogCount;
+    private int _summaryCatalogWithSources;
     private readonly HttpClient _httpClient = new();
     private DateTime? _lastFullAuthAttemptUtc;
 
@@ -700,6 +719,10 @@ internal sealed partial class UnityAssetAutomationApp
 
             var sources = ResolveSources();
             var assetUrls = await CollectAssetUrlsAsync(page, sources);
+            if (sources.Count > 0 && ListSourcesSchedule.Applies(_options))
+            {
+                ListSourcesSchedule.MarkDone(_profileStore.GetProfileDirectory(_profileName), DateTime.UtcNow);
+            }
             var assetPromocodes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
             // Память профиля нужна ещё до Telegram: пачка из каналов набирается
@@ -737,6 +760,7 @@ internal sealed partial class UnityAssetAutomationApp
                 DryRun = _options.DryRun,
                 Sources = sources
             };
+            _runReport = report;
 
             // Ассеты, про которые всё известно с прошлых запусков: страницу не открываем.
             // Возвращает true, если ассет пропущен.
@@ -1085,6 +1109,11 @@ internal sealed partial class UnityAssetAutomationApp
 
             SaveCaches();
             await UpdateCatalogAfterRunAsync(page, catalog, report, EnsureLoggedInAsync);
+            _summarySkippedKnown = skippedKnown;
+            _summarySkippedUnaddable = skippedUnaddable;
+            _summarySkippedDeprecated = skippedDeprecated;
+            _summaryCatalogCount = catalog.Count;
+            _summaryCatalogWithSources = catalog.Entries.Count(e => e.Sources is { Count: > 0 });
 
             if (skippedUnaddable > 0)
             {
@@ -1139,18 +1168,22 @@ internal sealed partial class UnityAssetAutomationApp
                 await RunFabServerStageAsync();
             }
 
+            string? memoryText = null;
             if (_memory is not null)
             {
                 _memory.Stop();
                 Stats.AddMemory(_memory, fab: false);
                 if (_memory.HasData)
                 {
-                    _logger.Info($"[Память] за прогон: {_memory.Describe()}.");
+                    memoryText = _memory.Describe();
+                    _logger.Info($"[Память] за прогон: {memoryText}.");
                 }
 
                 _memory.Dispose();
                 _memory = null;
             }
+
+            await WriteRunSummaryAsync(memoryText);
 
             // Переименование профиля — после этапа Fab: он работает с папкой по старому имени, и если бы папку
             // переименовали раньше, этап создал бы рядом новую пустую.
@@ -1164,6 +1197,110 @@ internal sealed partial class UnityAssetAutomationApp
             _logger.Info("============================================================");
             _logger.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Пишет короткую сводку прогона (logs/run-summary-*.txt и logs/last-run-summary.txt) и, если прогон разовый
+    /// (запустил человек), присылает её боту файлом. Полный лог — тысячи строк, а этого файла хватает, чтобы понять
+    /// прогон целиком. Ничего не бросает: сводка не должна ронять прогон.
+    /// </summary>
+    private async Task WriteRunSummaryAsync(string? memoryText)
+    {
+        if (_runReport is not { } report)
+        {
+            return;
+        }
+
+        try
+        {
+            var finished = DateTime.Now;
+            var data = new RunSummaryData
+            {
+                Version = BuildVersionLine(),
+                Profile = _profileName,
+                Mode = DescribeRunMode(),
+                Settings = DescribeRunSettings(),
+                StartedLocal = _startedLocal,
+                FinishedLocal = finished,
+                DryRun = _options.DryRun,
+                Crashed = _runCrashed,
+                Interrupted = _interrupted,
+                Report = report,
+                Stats = Stats,
+                Warnings = _logger.Digest(),
+                SkippedKnown = _summarySkippedKnown,
+                SkippedUnaddable = _summarySkippedUnaddable,
+                SkippedDeprecated = _summarySkippedDeprecated,
+                Memory = memoryText,
+                CatalogCount = _summaryCatalogCount,
+                CatalogWithSources = _summaryCatalogWithSources,
+                RunLogPath = _logger.LogFilePath ?? string.Empty,
+                ReportPath = _reportPath,
+                ErrorsPath = Path.Combine(_logsDirectory, CliOptions.ProblemsFileName)
+            };
+
+            var text = RunSummary.Build(data);
+            var path = Path.Combine(_logsDirectory, $"run-summary-{_startedLocal:yyyyMMdd-HHmmss}.txt");
+            await File.WriteAllTextAsync(path, text);
+            await File.WriteAllTextAsync(Path.Combine(_logsDirectory, "last-run-summary.txt"), text);
+            RunSummary.Prune(_logsDirectory, keep: 60);
+            _logger.Info($"Сводка прогона (коротко, её и присылайте): {path}");
+
+            if (!_options.Watch && _notifier is { Enabled: true } && (report.Items.Count > 0 || _runCrashed))
+            {
+                var added = report.Items.Count(i => i.Status is AssetProcessStatus.Added or AssetProcessStatus.WouldAddInDryRun);
+                var bad = report.Items.Count(i => i.Status is AssetProcessStatus.Failed or AssetProcessStatus.UnknownAfterClick);
+                await _notifier.SendDocumentAsync(path,
+                    $"📋 Сводка прогона, профиль {_profileName}: " +
+                    $"{(_options.DryRun ? "добавились бы" : "добавлено")} {added}, не вышло {bad}" +
+                    $"{(_runCrashed ? ", прогон упал" : string.Empty)}. Файл можно переслать ассистенту.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"Сводку прогона записать не удалось: {ex.Message}");
+        }
+    }
+
+    private string DescribeRunMode()
+    {
+        var kind = _options.Watch
+            ? $"служба (прогон раз в {RunSummary.FormatDuration(_options.WatchInterval)})"
+            : "разовый прогон";
+        var reading = _options.TelegramChannels.Count == 0
+            ? "каналы не заданы"
+            : _options.TelegramOnlyNew
+                ? "каналы: только новые посты"
+                : "каналы: вся история, пачками";
+        return $"{kind}; {reading}";
+    }
+
+    private string DescribeRunSettings()
+    {
+        var parts = new List<string>();
+        if (_options.TelegramChannels.Count > 0)
+        {
+            parts.Add($"каналы {string.Join(", ", _options.TelegramChannels)}");
+        }
+
+        parts.Add($"источники {(string.IsNullOrWhiteSpace(_options.SourcesPreset) ? "заданы флагами" : _options.SourcesPreset)}");
+        if (_options.TelegramBatchSize > 0)
+        {
+            parts.Add($"пачки по {_options.TelegramBatchSize}");
+        }
+
+        if (_options.MaxAddAttempts is { } maxAdd)
+        {
+            parts.Add($"не больше {maxAdd} новых");
+        }
+
+        if (_options.MaxVisitedAssets is { } maxVisited)
+        {
+            parts.Add($"не больше {maxVisited} страниц");
+        }
+
+        parts.Add($"пауза {_options.DelayMs} мс");
+        return string.Join("; ", parts);
     }
 
     /// <summary>
@@ -1799,7 +1936,9 @@ internal sealed partial class UnityAssetAutomationApp
         total.Promocodes.AddRange(partial.Promocodes);
         total.PostsWithoutLinks.AddRange(partial.PostsWithoutLinks);
         total.AllPosts.AddRange(partial.AllPosts);
-        total.SkippedDownloadPosts += partial.SkippedDownloadPosts;
+        total.DownloadPosts += partial.DownloadPosts;
+        total.DownloadAssetsFree += partial.DownloadAssetsFree;
+        total.DownloadAssetsPaid += partial.DownloadAssetsPaid;
         foreach (var card in partial.Cards)
         {
             total.Cards.TryAdd(card.Key, card.Value);
@@ -2824,6 +2963,24 @@ internal sealed partial class UnityAssetAutomationApp
     /// <summary>Сохранить память профиля перед остановкой службы (docker stop, systemctl stop).</summary>
     public void SaveCachesOnExit() => SaveCaches();
 
+    /// <summary>
+    /// Остановка разового прогона (SIGTERM или Ctrl+C): память профиля и сводка с пометкой «прерван».
+    /// Ждёт запись не дольше 15 секунд и ничего не бросает.
+    /// </summary>
+    public void WriteSummaryOnExit()
+    {
+        try
+        {
+            SaveCaches();
+            _interrupted = true;
+            WriteRunSummaryAsync(null).Wait(TimeSpan.FromSeconds(15));
+        }
+        catch
+        {
+            // На выходе из программы падать нельзя.
+        }
+    }
+
     /// <summary>Сохраняет память профиля. Вызывать можно сколько угодно раз.</summary>
     private void SaveCaches()
     {
@@ -2839,6 +2996,8 @@ internal sealed partial class UnityAssetAutomationApp
         try
         {
             SaveCaches();
+            _interrupted = true;
+            WriteRunSummaryAsync(null).Wait(TimeSpan.FromSeconds(15));
             Console.WriteLine();
             Console.WriteLine("Прервано. Всё, что программа успела узнать про ассеты, сохранено.");
             Console.WriteLine("Следующий запуск не станет проверять их заново.");
@@ -5005,11 +5164,21 @@ internal sealed partial class UnityAssetAutomationApp
             }
         }
 
-        return sources
+        var resolved = sources
             .Select(x => x.Trim())
             .Where(x => !string.IsNullOrWhiteSpace(x) && !x.Equals("none", StringComparison.OrdinalIgnoreCase))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+
+        // Служба: списки магазина реже каналов (TOP_FREE_EVERY). Не пора — в этот прогон их не читаем.
+        if (resolved.Count > 0 &&
+            !ListSourcesSchedule.IsDue(_options, _profileStore.GetProfileDirectory(_profileName), DateTime.UtcNow, out var scheduleNote))
+        {
+            _logger.Info(scheduleNote);
+            return [];
+        }
+
+        return resolved;
     }
 
     private List<string> LoadSourcesFromFile(string fileName, string notFoundMessagePrefix)
@@ -8150,7 +8319,7 @@ internal sealed partial class UnityAssetAutomationApp
     }
 
     /// <summary>Переводит технический статус в понятную строку.</summary>
-    private static string DescribeStatus(AssetProcessStatus status) => status switch
+    internal static string DescribeStatus(AssetProcessStatus status) => status switch
     {
         AssetProcessStatus.Added => "Добавлено на аккаунт",
         AssetProcessStatus.AlreadyOwned => "Уже было на аккаунте",
@@ -8174,8 +8343,15 @@ internal sealed class AppLogger : IDisposable
     private readonly object _sync = new();
     private bool _disposed;
 
+    // Предупреждения и ошибки по смыслу (числа и адреса не различаются): для сводки прогона. Не больше 200 видов.
+    private readonly Dictionary<string, (string Level, int Count, string Example)> _digest = new(StringComparer.Ordinal);
+
+    /// <summary>Файл полного лога этого прогона (null — лог в файл не пишется).</summary>
+    public string? LogFilePath { get; }
+
     public AppLogger(bool verbose, bool traceNetwork, string? logFilePath, string? errorsFilePath = null)
     {
+        LogFilePath = string.IsNullOrWhiteSpace(logFilePath) ? null : logFilePath;
         _verbose = verbose;
         _traceNetwork = traceNetwork;
 
@@ -8248,12 +8424,48 @@ internal sealed class AppLogger : IDisposable
                 if (level is "WARN" or "ERROR")
                 {
                     _errorWriter?.WriteLine(line);
+                    Track(level, message);
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [WARN] Не удалось записать в файл лога: {ex.Message}");
             }
+        }
+    }
+
+    private static readonly Regex DigestUrlRegex = new(@"https?://\S+", RegexOptions.Compiled);
+    private static readonly Regex DigestNumberRegex = new(@"\d+", RegexOptions.Compiled);
+
+    // Вызывается под _sync.
+    private void Track(string level, string message)
+    {
+        var key = DigestNumberRegex.Replace(DigestUrlRegex.Replace(message, "<url>"), "#");
+        if (key.Length > 160)
+        {
+            key = key[..160];
+        }
+
+        key = level + "|" + key;
+        if (_digest.TryGetValue(key, out var entry))
+        {
+            _digest[key] = entry with { Count = entry.Count + 1 };
+        }
+        else if (_digest.Count < 200)
+        {
+            _digest[key] = (level, 1, message);
+        }
+    }
+
+    /// <summary>Предупреждения и ошибки этого прогона, одинаковые по смыслу сложены вместе, частые — первыми.</summary>
+    public IReadOnlyList<LogDigestEntry> Digest()
+    {
+        lock (_sync)
+        {
+            return _digest.Values
+                .Select(e => new LogDigestEntry(e.Level, e.Count, e.Example))
+                .OrderByDescending(e => e.Count)
+                .ToList();
         }
     }
 
@@ -8370,6 +8582,12 @@ internal sealed class CliOptions
     /// null — только по --build-catalog. Добавленные программой ассеты попадают в каталог всегда.
     /// </summary>
     public TimeSpan? CatalogRefresh { get; init; } = TimeSpan.FromDays(7);
+
+    /// <summary>
+    /// Служба: как часто читать списки магазина («топ бесплатных») при SOURCES=top-free или all (TOP_FREE_EVERY, 3d).
+    /// null — каждый прогон. Каналы читаются каждый прогон в любом случае.
+    /// </summary>
+    public TimeSpan? ListSourcesEvery { get; init; } = ListSourcesSchedule.DefaultPeriod;
 
     /// <summary>Присылать ли со сводкой бота страницу каталога файлом, если он изменился (BOT_CATALOG).</summary>
     public bool BotCatalog { get; init; } = true;
@@ -8986,7 +9204,9 @@ internal sealed class CliOptions
         }
         else if (envTelegramChannels.Count > 0)
         {
-            // Так каналы задаёт deploy.sh на сервере: в .env, а не в telegram_sources.txt из git.
+            // Сервер: общий список из telegram_sources.txt (он в git, один для всех машин) плюс то, что
+            // добавлено только на этом сервере (TELEGRAM_CHANNELS в .env, его пишет deploy.sh).
+            telegramChannels.AddRange(ReadTelegramSourcesFile("telegram_sources.txt"));
             telegramChannels.AddRange(envTelegramChannels);
         }
         else if (config?.Telegram?.Channels?.Count > 0)
@@ -8997,6 +9217,9 @@ internal sealed class CliOptions
         {
             telegramChannels.AddRange(ReadTelegramSourcesFile("telegram_sources.txt"));
         }
+
+        // Один канал в двух списках (или в разном регистре) читается один раз.
+        telegramChannels = telegramChannels.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
         var signInUrl = FirstNonEmpty(cliSignInUrl, config?.SignInUrl) ?? DefaultSignInUrl;
         var logsDirectory = ResolveDirectory(cliLogsDirectory ?? config?.LogsDirectory, "logs");
@@ -9095,6 +9318,24 @@ internal sealed class CliOptions
             }
         }
 
+        TimeSpan? listSourcesEvery = ListSourcesSchedule.DefaultPeriod;
+        var topFreeEveryText = Environment.GetEnvironmentVariable("TOP_FREE_EVERY")?.Trim().ToLowerInvariant();
+        if (!string.IsNullOrWhiteSpace(topFreeEveryText))
+        {
+            if (topFreeEveryText is "off" or "no" or "0" or "false" or "нет")
+            {
+                listSourcesEvery = null;
+            }
+            else if (TryParseInterval(topFreeEveryText, out var parsedEvery))
+            {
+                listSourcesEvery = parsedEvery;
+            }
+            else
+            {
+                Console.WriteLine($"[Источники] Не понял TOP_FREE_EVERY='{topFreeEveryText}'. Примеры: 3d, 1d, 12h, off. Берём 3d.");
+            }
+        }
+
         var botCatalogText = Environment.GetEnvironmentVariable("BOT_CATALOG")?.Trim().ToLowerInvariant();
         var botCatalog = botCatalogText is not ("off" or "no" or "0" or "false" or "нет");
 
@@ -9129,6 +9370,7 @@ internal sealed class CliOptions
             RenderCatalog = cliRenderCatalog,
             CatalogCopyDir = FirstNonEmpty(cliCatalogDir, Environment.GetEnvironmentVariable("CATALOG_DIR")),
             CatalogRefresh = catalogRefresh,
+            ListSourcesEvery = listSourcesEvery,
             BotCatalog = botCatalog,
             TelegramOnlyNew = watch || cliTelegramOnlyNew || (config?.Telegram?.OnlyNew ?? false),
             NotifyBotToken = FirstNonEmpty(cliNotifyBotToken, Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN"), config?.Notify?.TelegramBotToken),

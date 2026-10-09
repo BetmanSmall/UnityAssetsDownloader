@@ -229,35 +229,63 @@ while :; do
 done
 
 bold "3. Telegram-каналы с раздачами"
-OLD_CHANNELS=$(env_get TELEGRAM_CHANNELS)
-if [ -z "$OLD_CHANNELS" ] && [ -f telegram_sources.txt ]; then
-    OLD_CHANNELS=$(grep -vE '^\s*(#|//|$)' telegram_sources.txt | tr -d '\r' | xargs | tr ' ' ',')
-fi
-[ -n "$OLD_CHANNELS" ] && echo "  Сейчас: ${OLD_CHANNELS//,/, }"
-echo "  Введите каналы: имя, @имя или ссылку t.me/… По одному на строку или через запятую."
-echo "  Пустая строка — закончить$([ -n "$OLD_CHANNELS" ] && echo " (сразу пустая — оставить как есть)")."
-CHANNELS=()
+# Общий список — telegram_sources.txt: он в git, один для всех машин (ПК, Deck, сервер) и приходит сюда через
+# git pull. В .env (TELEGRAM_CHANNELS) — только каналы, добавленные именно на этом сервере. Программа читает оба.
+BASE_CHANNELS=$(grep -vE '^\s*(#|//|$)' telegram_sources.txt 2>/dev/null | tr -d '\r' | xargs | tr ' ' ',')
+
+# has_channel "список,через,запятую" имя — есть ли имя в списке (без учёта регистра)
+has_channel() { case ",${1,,}," in *",${2,,},"*) return 0 ;; *) return 1 ;; esac; }
+
+EXTRA_CSV=""
+add_extra() {
+    if has_channel "$BASE_CHANNELS" "$1"; then
+        [ "${2:-}" = quiet ] || warn "«$1» уже в общем списке (telegram_sources.txt)."
+        return
+    fi
+    has_channel "$EXTRA_CSV" "$1" || EXTRA_CSV=${EXTRA_CSV:+$EXTRA_CSV,}$1
+}
+remove_extra() {
+    local out="" e
+    for e in ${EXTRA_CSV//,/ }; do
+        [ "${e,,}" = "${1,,}" ] || out=${out:+$out,}$e
+    done
+    EXTRA_CSV=$out
+}
+
+# Что уже записано в .env: каналы, которые теперь есть в общем списке, оттуда убираются сами.
+for c in $(env_get TELEGRAM_CHANNELS | tr ',;' '  '); do add_extra "$c" quiet; done
+
+echo "  Общий список (telegram_sources.txt, одинаковый на всех машинах): ${BASE_CHANNELS:-пуст}"
+[ -n "$EXTRA_CSV" ] && echo "  Добавлено только на этом сервере: ${EXTRA_CSV//,/, }"
+echo "  Новые каналы лучше вписывать в telegram_sources.txt на ПК и коммитить: тогда они появятся везде."
+echo "  Здесь можно добавить канал только для этого сервера: имя, @имя или ссылка t.me/… (по одному или через запятую)."
+echo "  «-имя» убирает канал, добавленный на этом сервере. Пустая строка — закончить (сразу пустая — оставить как есть)."
 while :; do
     read -r -p "  канал: " LINE
     [ -z "$LINE" ] && break
     for raw in ${LINE//,/ }; do
+        remove=0
+        if [ "${raw:0:1}" = "-" ]; then remove=1; raw=${raw:1}; fi
         c=$(normalize_channel "$raw")
-        if [[ "$c" =~ ^[A-Za-z0-9_]{4,}$ ]]; then
-            CHANNELS+=("$c")
-        else
+        if [[ ! "$c" =~ ^[A-Za-z0-9_]{4,}$ ]]; then
             fail "«$raw» не похоже на канал Telegram, пропускаю."
+        elif [ "$remove" = 1 ]; then
+            if has_channel "$BASE_CHANNELS" "$c"; then
+                warn "«$c» из общего списка: чтобы убрать, удалите строку в telegram_sources.txt и закоммитьте."
+            else
+                remove_extra "$c"
+            fi
+        else
+            add_extra "$c"
         fi
     done
 done
-if [ ${#CHANNELS[@]} -eq 0 ]; then
-    CHANNELS_VALUE=$OLD_CHANNELS
-else
-    CHANNELS_VALUE=$(printf '%s\n' "${CHANNELS[@]}" | awk '!seen[$0]++' | paste -sd, -)
-fi
-if [ -z "$CHANNELS_VALUE" ]; then
+CHANNELS_VALUE=$EXTRA_CSV
+ALL_CHANNELS="${BASE_CHANNELS}${EXTRA_CSV:+${BASE_CHANNELS:+,}$EXTRA_CSV}"
+if [ -z "$ALL_CHANNELS" ]; then
     warn "Каналы не заданы — программе нечего будет читать. Запустите ./deploy.sh ещё раз, чтобы добавить."
 else
-    ok "Каналы: ${CHANNELS_VALUE//,/, }"
+    ok "Будут читаться: ${ALL_CHANNELS//,/, }"
 fi
 
 bold "4. Что читать, кроме каналов"
@@ -280,6 +308,18 @@ while :; do
     esac
 done
 ok "Источники: $SOURCES_VALUE"
+
+# Каналы проверяются каждый прогон, а страница «топ бесплатных» меняется медленно и требует браузера:
+# её читаем реже. С SOURCES=telegram вопрос не нужен.
+TOP_FREE_EVERY=$(env_get TOP_FREE_EVERY); TOP_FREE_EVERY=${TOP_FREE_EVERY:-3d}
+if [ "$SOURCES_VALUE" != telegram ]; then
+    echo "  Каналы проверяются в каждом прогоне, а списки магазина («топ бесплатных») — реже: они меняются медленно."
+    while :; do
+        ask TOP_FREE_EVERY "Как часто читать списки магазина (3d, 1d, 12h; off — в каждом прогоне)" "$TOP_FREE_EVERY"
+        [[ "$TOP_FREE_EVERY" =~ ^([0-9]+[dhms])+$ || "$TOP_FREE_EVERY" =~ ^[0-9]+$ || "$TOP_FREE_EVERY" = off ]] && break
+        fail "Не понял. Примеры: 3d — раз в 3 дня, 12h — раз в 12 часов, off — каждый прогон."
+    done
+fi
 
 bold "5. Расписание"
 while :; do
@@ -332,6 +372,7 @@ umask 077
     echo "TELEGRAM_CHANNELS=$(env_quote "$CHANNELS_VALUE")"
     echo "WATCH_INTERVAL=$INTERVAL"
     echo "SOURCES=$SOURCES_VALUE"
+    echo "TOP_FREE_EVERY=$TOP_FREE_EVERY"
     echo "FAB=$FAB_VALUE"
     echo "FAB_VNC_PASSWORD=$(env_quote "$FAB_VNC_PASSWORD")"
     echo "PROFILE=$PROFILE"
@@ -339,7 +380,7 @@ umask 077
     # Настройки, о которых deploy.sh не спрашивает (TELEGRAM_PROXY, BOT_DIGEST и другие,
     # вписанные руками), переносим как есть — раньше они молча пропадали.
     if [ -f "$ENV_FILE" ]; then
-        grep -vE '^(#|[[:space:]]*$|(UNITY_EMAIL|UNITY_PASSWORD|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_CHANNELS|WATCH_INTERVAL|SOURCES|FAB|FAB_VNC_PASSWORD|PROFILE|TZ)=)' "$ENV_FILE" || true
+        grep -vE '^(#|[[:space:]]*$|(UNITY_EMAIL|UNITY_PASSWORD|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_CHANNELS|WATCH_INTERVAL|SOURCES|TOP_FREE_EVERY|FAB|FAB_VNC_PASSWORD|PROFILE|TZ)=)' "$ENV_FILE" || true
     fi
 } > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
 chmod 600 "$ENV_FILE"

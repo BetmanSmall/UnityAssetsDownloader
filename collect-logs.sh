@@ -86,12 +86,12 @@ fi
 # ---------------------------------------------------------------- файлы логов
 mkdir -p "$OUT/logs"
 if [ -d logs ]; then
-    cp -p logs/errors.log logs/telegram_promocodes.log "$OUT/logs/" 2>/dev/null
+    cp -p logs/errors.log logs/telegram_promocodes.log logs/last-run-summary.txt "$OUT/logs/" 2>/dev/null
     # Тексты постов: весь файл большой, хватит хвоста.
     [ -f logs/telegram_posts_raw.log ] && tail -c 3000000 logs/telegram_posts_raw.log > "$OUT/logs/telegram_posts_raw.tail.log"
     # Логи прогонов и скриншоты ошибок за период.
     find logs -maxdepth 1 -type f -newermt "$SINCE" \
-        \( -name 'run-log-*' -o -name 'run-report-*' -o -name '*.png' -o -name '*.html' \) \
+        \( -name 'run-log-*' -o -name 'run-report-*' -o -name 'run-summary-*' -o -name 'backfill-*' -o -name '*.png' -o -name '*.html' \) \
         -exec cp -p {} "$OUT/logs/" \;
     ls -la logs > "$OUT/logs-listing.txt" 2>&1
 fi

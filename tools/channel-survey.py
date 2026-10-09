@@ -128,24 +128,34 @@ def first_line_shape(text):
 
 
 def fetch_prices(ids):
+    """Цены по номерам. Номер есть в ответе: значение None — магазин такого ассета не знает. Номера, которых в ответе
+    нет, магазин не отдал (сеть, 500): пачка, не прошедшая с трёх попыток, делится пополам, как в программе."""
     csrf = secrets.token_hex(16)
     out = {}
-    for i in range(0, len(ids), 50):
-        batch = ids[i:i + 50]
+
+    def fetch_batch(batch):
         query = "query P {" + "".join(f' a{j}: product(id: "{b}") {{ id state originalPrice {{ isFree finalPrice currency }} }}' for j, b in enumerate(batch)) + " }"
         body = json.dumps([{"operationName": "P", "query": query}]).encode()
-        req = urllib.request.Request("https://assetstore.unity.com/api/graphql/batch", data=body, headers={
-            "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest", "X-Csrf-Token": csrf, "Cookie": f"_csrf={csrf}", **UA})
         for attempt in range(3):
+            req = urllib.request.Request("https://assetstore.unity.com/api/graphql/batch", data=body, headers={
+                "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest", "X-Csrf-Token": csrf, "Cookie": f"_csrf={csrf}", **UA})
             try:
                 data = json.loads(urllib.request.urlopen(req, timeout=60).read())
                 data = (data[0] if isinstance(data, list) else data)["data"]
                 out.update({b: data.get(f"a{j}") for j, b in enumerate(batch)})
-                break
+                return
             except Exception as ex:
-                if attempt == 2:
-                    print(f"  магазин не отдал пачку {i}: {ex}", file=sys.stderr)
+                err = ex
                 time.sleep(3)
+        if len(batch) > 1:
+            half = len(batch) // 2
+            fetch_batch(batch[:half])
+            fetch_batch(batch[half:])
+        else:
+            print(f"  магазин не отдал {batch[0]}: {err}", file=sys.stderr)
+
+    for i in range(0, len(ids), 50):
+        fetch_batch(ids[i:i + 50])
     return out
 
 
@@ -224,7 +234,10 @@ def main():
         for k, ids in ids_by_kind.items():
             c = collections.Counter()
             for i in ids:
-                s = prices.get(i)
+                if i not in prices:
+                    c["магазин не ответил"] += 1
+                    continue
+                s = prices[i]
                 if not s:
                     c["нет в магазине"] += 1
                     continue
@@ -234,6 +247,9 @@ def main():
                     free_not_owned[i] = k
             if ids:
                 print(f"   {k}: {len(ids)} — " + "; ".join(f"{n} {name}" for name, n in sorted(c.items())))
+        # Полный список — рядом со страницами: по нескольким каналам из него считается объединение без повторов.
+        json.dump({"free_not_owned": free_not_owned, "no_answer": [i for i in all_ids if i not in prices]},
+                  open(os.path.join(pages_dir, "free_missing.json"), "w", encoding="utf-8"))
         print(f"\n== 4. Бесплатные, которых нет на аккаунте: {len(free_not_owned)}")
         for i, k in list(free_not_owned.items())[:15]:
             print(f"   {i} ({k})")

@@ -21,6 +21,17 @@ internal sealed class RunStats
     public int OtherPosts { get; set; }
 
     public int ChannelsFailed { get; set; }
+
+    /// <summary>Посты с описанием ассета (карточки), раздачи через бота и что из них взято: для сводки прогона.</summary>
+    public int Cards { get; set; }
+
+    public int DownloadPosts { get; set; }
+    public int DownloadAssetsFree { get; set; }
+    public int DownloadAssetsPaid { get; set; }
+
+    /// <summary>Сколько постов прочитано в каждом канале и в каких номерах: для сводки прогона.</summary>
+    public Dictionary<string, ChannelPostsInfo> Channels { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
     public int Added { get; set; }
     public int AlreadyOwned { get; set; }
     public int PromoFailed { get; set; }
@@ -115,9 +126,25 @@ internal sealed class RunStats
         PostsRead += result.AllPosts.Count;
         AssetStoreLinks += result.AssetUrls.Count;
         ChannelsFailed += result.FailedChannels.Count;
+        Cards += result.Cards.Count;
+        DownloadPosts += result.DownloadPosts;
+        DownloadAssetsFree += result.DownloadAssetsFree;
+        DownloadAssetsPaid += result.DownloadAssetsPaid;
 
         foreach (var post in result.AllPosts)
         {
+            if (!Channels.TryGetValue(post.ChannelName, out var info))
+            {
+                Channels[post.ChannelName] = info = new ChannelPostsInfo();
+            }
+
+            info.Posts++;
+            if (int.TryParse(post.PostId.Split('/').Last(), out var number) && number > 0)
+            {
+                info.MinId = info.MinId == 0 ? number : Math.Min(info.MinId, number);
+                info.MaxId = Math.Max(info.MaxId, number);
+            }
+
             var text = post.Text;
             if (text.Contains("assetstore.unity.com", StringComparison.OrdinalIgnoreCase))
             {

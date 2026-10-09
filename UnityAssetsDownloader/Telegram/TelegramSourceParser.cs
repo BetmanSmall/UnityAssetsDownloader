@@ -16,6 +16,13 @@ internal sealed class TelegramSourceParser
     /// Ошибки не бросает: вернула null — открываем канал браузером, как раньше.
     /// </summary>
     private readonly Func<string, Task<string?>>? _fetchHtmlAsync;
+
+    /// <summary>
+    /// Бесплатны ли ассеты в магазине, по номерам: true — бесплатный, false — платный или магазин такого не знает.
+    /// Номера, которых нет в ответе, магазин не отдал (сеть): такие ассеты берём в очередь, страница разберётся сама.
+    /// null — спрашиваем магазин по GraphQL.
+    /// </summary>
+    private readonly Func<IReadOnlyList<string>, Task<Dictionary<string, bool>>>? _freeLookupAsync;
     // Страница канала отдаёт около 20 постов. При чтении за один раз десяти страниц
     // (~200 постов) хватает: старые раздачи давно закончились. Пачками читается без предела.
     public const int MaxPagesPerChannel = 10;
@@ -51,7 +58,8 @@ internal sealed class TelegramSourceParser
         int navigationTimeoutMs,
         int postLimit = 50,
         bool screenshotOnNoLinks = true,
-        Func<string, Task<string?>>? fetchHtmlAsync = null)
+        Func<string, Task<string?>>? fetchHtmlAsync = null,
+        Func<IReadOnlyList<string>, Task<Dictionary<string, bool>>>? freeLookupAsync = null)
     {
         _browser = browser;
         _logger = logger;
@@ -60,6 +68,7 @@ internal sealed class TelegramSourceParser
         _postLimit = postLimit;
         _screenshotOnNoLinks = screenshotOnNoLinks;
         _fetchHtmlAsync = fetchHtmlAsync;
+        _freeLookupAsync = freeLookupAsync;
     }
 
     /// <summary>
@@ -121,13 +130,16 @@ internal sealed class TelegramSourceParser
                 foreach (var cursor in cursors.Where(CanRead).ToList())
                 {
                     var channelResult = await ReadPageWithRetryAsync(OpenPageAsync, cursor, maxPostsPerChannel);
+                    await ResolveDownloadAssetsAsync(channelResult);
 
                     result.GitLinks.AddRange(channelResult.GitLinks);
                     result.Promocodes.AddRange(channelResult.Promocodes);
                     result.PostsWithoutLinks.AddRange(channelResult.PostsWithoutLinks);
                     result.Errors.AddRange(channelResult.Errors);
                     result.AllPosts.AddRange(channelResult.AllPosts);
-                    result.SkippedDownloadPosts += channelResult.SkippedDownloadPosts;
+                    result.DownloadPosts += channelResult.DownloadPosts;
+                    result.DownloadAssetsFree += channelResult.DownloadAssetsFree;
+                    result.DownloadAssetsPaid += channelResult.DownloadAssetsPaid;
                     foreach (var card in channelResult.Cards)
                     {
                         result.Cards.TryAdd(card.Key, card.Value);
@@ -175,10 +187,11 @@ internal sealed class TelegramSourceParser
 
         result.GitLinks = result.GitLinks.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
-        if (result.SkippedDownloadPosts > 0)
+        if (result.DownloadPosts > 0)
         {
-            _logger.Info($"[Telegram] Пропущено постов с раздачей файлов через бота: {result.SkippedDownloadPosts} " +
-                         "(платные ассеты без оплаты в очередь не берём).");
+            _logger.Info($"[Telegram] Постов с раздачей файлов через бота: {result.DownloadPosts}. Бесплатных в магазине ассетов " +
+                         $"взято: {result.DownloadAssetsFree}, платных пропущено: {result.DownloadAssetsPaid} " +
+                         "(файлы из бота не берём, ссылки на бота не храним).");
         }
 
         foreach (var cursor in cursors.Where(c => c.PostsRead > 0))
@@ -373,7 +386,7 @@ internal sealed class TelegramSourceParser
 
     /// <summary>
     /// Ищет в посте ссылки на ассеты, git-ссылки и промокоды. parsed — вид поста по карточке:
-    /// раздачи через бота пропускаются, у карточки адрес берётся из неё самой.
+    /// у раздачи через бота ассеты ждут проверки цены (берётся только бесплатное), у карточки адрес берётся из неё самой.
     /// </summary>
     private async Task AnalyzePostAsync(
         IPage? page, string channelName, string text, string postId, TelegramChannelResult channelResult,
@@ -381,19 +394,32 @@ internal sealed class TelegramSourceParser
     {
         var promocodes = ExtractPromocodes(text);
 
-        // Раздача файла через бота: по ценам магазина — платные ассеты без оплаты. В очередь такой пост
-        // не берём и ссылку на бота не храним. Пост с промокодом разбирается как обычно: код проверит
-        // магазин, а оплата идёт только при итоге $0.
+        // Ссылку на бота-раздатчика не храним нигде: ни в очереди, ни в журнале, ни в каталоге.
+        if (parsed is { Kind: ChannelPostKind.DownloadBot })
+        {
+            text = StripDownloadBotLinks(text);
+        }
+
+        // Раздача файла через бота: по ценам магазина это в основном платные ассеты без оплаты. Платные не берём,
+        // а бесплатные в магазине — берём как любые: ассет ждёт проверки цены (ResolveDownloadAssetsAsync) и
+        // идёт в очередь по ссылке магазина. Пост с промокодом разбирается как обычно: код проверит магазин,
+        // а оплата идёт только при итоге $0.
         if (parsed is { Kind: ChannelPostKind.DownloadBot } && promocodes.Count == 0)
         {
             channelResult.AllPosts.Add(new TelegramPostInfo
             {
                 ChannelName = channelName,
                 PostId = postId,
-                Text = "(раздача файла через бота — пропущена)"
+                Text = text
             });
-            channelResult.SkippedDownloadPosts++;
-            _logger.Debug($"[Telegram] пост {postId}: раздача файла через бота, пропущен");
+            channelResult.DownloadPosts++;
+            foreach (var (id, url) in parsed.StoreAssets)
+            {
+                // Посты идут от новых к старым: первое описание ассета — самое свежее.
+                channelResult.DownloadAssets.TryAdd(id, new DownloadPostAsset(url, parsed.Card is { } c && c.AssetId == id ? c : null));
+            }
+
+            _logger.Debug($"[Telegram] пост {postId}: раздача файла через бота, ассетов магазина: {parsed.StoreAssets.Count} (ждут проверки цены)");
             return;
         }
 
@@ -408,7 +434,7 @@ internal sealed class TelegramSourceParser
 
         // Карточка ассета: адрес берём из ссылки, спрятанной за «Перейти на Unity Asset Store», а не ищем
         // по тексту — так не обрезаются адреса с «!» и «'» в названии.
-        var card = parsed is { Kind: ChannelPostKind.Card } ? parsed.Card : null;
+        var card = parsed?.Card;
         if (card is not null)
         {
             channelResult.Cards.TryAdd(card.AssetId, card);
@@ -493,6 +519,69 @@ internal sealed class TelegramSourceParser
                 TextPreview = text.Length > 200 ? text[..200] + "..." : text
             });
         }
+    }
+
+    // Ссылка на бота-раздатчика целиком: t.me/<…>bot?start=file_… или download_… (как в ChannelCardParser).
+    private static readonly Regex DownloadBotLinkRegex = new(
+        @"(?:https?://)?(?:t|telegram)\.(?:me|dog)/\w*bot\?start=(?:file_|download_)\S*",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>Текст поста без ссылок на бота-раздатчика (пустые после этого строки убираются).</summary>
+    internal static string StripDownloadBotLinks(string text)
+    {
+        var lines = text.Split('\n')
+            .Select(l => DownloadBotLinkRegex.Replace(l, string.Empty))
+            .Where(l => l.Trim().Length > 0);
+        return string.Join('\n', lines).Trim();
+    }
+
+    /// <summary>
+    /// Ассеты из постов-раздач, прочитанных на этой странице: бесплатные в магазине — в очередь (и их карточки —
+    /// в источники каталога), платные — мимо. Цену спрашиваем у магазина одним запросом на пачку; если магазин
+    /// не ответил, ассет берём в очередь: страница ассета сама покажет цену, а деньги программа не тратит никогда.
+    /// </summary>
+    private async Task ResolveDownloadAssetsAsync(TelegramChannelResult channelResult)
+    {
+        if (channelResult.DownloadAssets.Count == 0)
+        {
+            return;
+        }
+
+        var ids = channelResult.DownloadAssets.Keys.ToList();
+        Dictionary<string, bool> verdicts = [];
+        try
+        {
+            verdicts = await (_freeLookupAsync ?? LookUpFreeInStoreAsync)(ids);
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[Telegram] Цены ассетов из постов с ботом не проверились: {ex.Message}. Берём их в очередь, цену покажет страница.");
+        }
+
+        foreach (var (id, asset) in channelResult.DownloadAssets)
+        {
+            if (verdicts.TryGetValue(id, out var free) && !free)
+            {
+                channelResult.DownloadAssetsPaid++;
+                continue;
+            }
+
+            channelResult.DownloadAssetsFree++;
+            channelResult.AssetUrls.Add(asset.Url);
+            if (asset.Card is not null)
+            {
+                channelResult.Cards.TryAdd(id, asset.Card);
+            }
+        }
+
+        channelResult.DownloadAssets.Clear();
+    }
+
+    private async Task<Dictionary<string, bool>> LookUpFreeInStoreAsync(IReadOnlyList<string> ids)
+    {
+        using var api = new AssetStoreProductApi(msg => _logger.Debug(msg));
+        var products = await api.FetchAsync(ids);
+        return products.ToDictionary(p => p.Key, p => p.Value is { } product && AssetStoreProductApi.IsFree(product), StringComparer.Ordinal);
     }
 
     /// <summary>Промокоды из текста поста.</summary>
@@ -706,8 +795,14 @@ internal sealed class TelegramParseResult
     /// <summary>Карточки ассетов из постов по номеру ассета (при повторах — самая свежая).</summary>
     public Dictionary<string, ChannelAssetCard> Cards { get; set; } = new(StringComparer.Ordinal);
 
-    /// <summary>Сколько постов-раздач через бота пропущено.</summary>
-    public int SkippedDownloadPosts { get; set; }
+    /// <summary>Сколько прочитано постов-раздач через бота (без промокода).</summary>
+    public int DownloadPosts { get; set; }
+
+    /// <summary>Из них ассетов, бесплатных в магазине (или цену узнать не вышло): они в очереди.</summary>
+    public int DownloadAssetsFree { get; set; }
+
+    /// <summary>И платных ассетов: они мимо.</summary>
+    public int DownloadAssetsPaid { get; set; }
 }
 
 internal sealed class TelegramChannelResult
@@ -721,8 +816,16 @@ internal sealed class TelegramChannelResult
     public List<TelegramPostInfo> AllPosts { get; set; } = [];
     public Dictionary<string, string> AssetPromocodes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, ChannelAssetCard> Cards { get; set; } = new(StringComparer.Ordinal);
-    public int SkippedDownloadPosts { get; set; }
+    public int DownloadPosts { get; set; }
+    public int DownloadAssetsFree { get; set; }
+    public int DownloadAssetsPaid { get; set; }
+
+    /// <summary>Ассеты из постов-раздач по номеру: ждут проверки цены в магазине.</summary>
+    public Dictionary<string, DownloadPostAsset> DownloadAssets { get; set; } = new(StringComparer.Ordinal);
 }
+
+/// <summary>Ассет из поста-раздачи: адрес магазина и то, что пост о нём рассказывает (описание, темы). Ссылки на бота здесь нет.</summary>
+internal sealed record DownloadPostAsset(string Url, ChannelAssetCard? Card);
 
 internal sealed class PostWithoutLink
 {

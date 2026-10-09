@@ -155,6 +155,14 @@ internal sealed class AssetStoreProductApi : IDisposable
         return list;
     }
 
+    /// <summary>
+    /// Бесплатен ли ассет по ответу магазина: цена без скидки равна нулю. Платный со скидкой 100 % сюда не попадает:
+    /// им занимается промокод. Состояние (published, deprecated) не смотрим: добавится ли ассет, покажет его страница.
+    /// </summary>
+    public static bool IsFree(JsonElement product) =>
+        product.TryGetProperty("originalPrice", out var price) && price.ValueKind == JsonValueKind.Object &&
+        price.TryGetProperty("isFree", out var isFree) && isFree.ValueKind == JsonValueKind.True;
+
     private static string Shorten(string text) => text.Length > 200 ? text[..200] + "…" : text;
 
     public void Dispose() => _http.Dispose();
