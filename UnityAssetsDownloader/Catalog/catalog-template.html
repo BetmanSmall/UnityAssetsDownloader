@@ -444,8 +444,10 @@
 
   // ---- Поисковый текст и справочники фильтров ----
   for (const x of ITEMS) {
+    x._topics = [...new Set((x.sr || []).flatMap((s) => s.t || []))];
     x._q = [x.n, x.p, x.c, x.i, (x.t || []).join(' '), (x.m || []).join(' '), x.d,
-      x.ai ? [x.ai.sum, (x.ai.tags || []).join(' '), (x.ai.use || []).join(' '), x.ai.note].join(' ') : '']
+      x.ai ? [x.ai.sum, (x.ai.tags || []).join(' '), (x.ai.use || []).join(' '), x.ai.note].join(' ') : '',
+      x._topics.join(' '), (x.sr || []).map((s) => s.x || '').join(' ')]
       .join(' ').toLowerCase();
     const parts = (x.c || 'other').split('/');
     x._root = parts[0];
@@ -594,13 +596,15 @@
           ${fact('Оценка', x.rc && x.r ? `★ ${x.r} (${x.rc})` : '')}
           ${fact('Получен', x.h ? `${x.h === 'promo' ? 'по промокоду ' + esc(x.pc || '') : 'программой, бесплатно'}${x.a ? ', ' + x.a : ''}` : 'был на аккаунте раньше')}
           ${fact('Цена сейчас', x.pr ? esc(x.pr) : '')}
+          ${fact('Из канала', (x.sr || []).map((s) => `<a href="https://t.me/${esc(s.c)}/${s.p}" target="_blank" rel="noopener">${esc(s.c)} #${s.p}</a>${s.d ? ', ' + s.d : ''}`).join('<br>'))}
         </div>
         ${x.ai ? `<div class="aibox"><b>Разметка ИИ</b><div>${esc(x.ai.sum || '')}</div>
           ${(x.ai.use || []).length ? `<div class="chips">${chips(x.ai.use, 'ai', true)}</div>` : ''}
           ${x.ai.note ? `<div>⚠ ${esc(x.ai.note)}</div>` : ''}</div>` : ''}
         ${x.d ? `<div>${esc(x.d)}</div>` : ''}
         ${x.x && x.x !== x.d ? `<div class="desc">${esc(x.x)}</div>` : ''}
-        ${(x.t || []).length ? `<div class="chips">${chips(x.t, '', true)}</div>` : ''}
+        ${(x.sr || []).find((s) => s.x) ? `<div class="desc">${esc((x.sr || []).find((s) => s.x).x)}</div>` : ''}
+        ${(x.t || []).length || x._topics.length ? `<div class="chips">${chips([...(x.t || []), ...x._topics.filter((t) => !(x.t || []).includes(t))], '', true)}</div>` : ''}
         <div class="actions">
           <a class="btn primary" href="${esc(x.u)}" target="_blank" rel="noopener">Открыть в магазине</a>
           <button class="btn" type="button" data-copy="${esc(x.i)}">Скопировать номер #${esc(x.i)}</button>

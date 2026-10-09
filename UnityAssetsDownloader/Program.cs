@@ -270,6 +270,7 @@ internal sealed partial class UnityAssetAutomationApp
     private string? _unityAccount;
     private OwnedAssetsCache? _ownedCache;
     private OwnedAssetsCache? _deprecatedCache;
+    private OwnedAssetsCache? _unaddableCache;
     private OwnedAssetsCache? _rejectedPromoCache;
     private readonly TelegramNotifier? _notifier;
 
@@ -716,11 +717,19 @@ internal sealed partial class UnityAssetAutomationApp
             // там только то, что эта программа сама проверяла.
             var catalog = AssetCatalog.Load(profileDirectory);
 
+            // Ассеты, которые магазин не добавляет на аккаунт: на запрос добавления он отвечает без права на ассет
+            // (userEntitlement: null), хотя плашка «Added to My Assets» всё равно появляется. Две попытки — и хватит.
+            var unaddableCache = new OwnedAssetsCache(
+                profileDirectory, "unaddable_assets.txt",
+                "Ассеты, которые магазин не добавил на аккаунт с двух попыток (плашка «Added» есть, а в «My Assets» их нет).");
+
             _ownedCache = ownedCache;
             _deprecatedCache = deprecatedCache;
+            _unaddableCache = unaddableCache;
             _rejectedPromoCache = rejectedPromoCache;
             var skippedKnown = 0;
             var skippedDeprecated = 0;
+            var skippedUnaddable = 0;
 
             var report = new RunReport
             {
@@ -759,6 +768,12 @@ internal sealed partial class UnityAssetAutomationApp
                         Status = AssetProcessStatus.AlreadyOwned,
                         Message = "Уже в библиотеке аккаунта (по каталогу, страница не открывалась)."
                     });
+                    return true;
+                }
+
+                if (unaddableCache.Contains(url))
+                {
+                    skippedUnaddable++;
                     return true;
                 }
 
@@ -879,7 +894,7 @@ internal sealed partial class UnityAssetAutomationApp
                     _logger.Info($"==== Telegram: собираем пачку №{batchNo + 1} (нужно ещё {need} новых ассетов) ====");
                     var tg = await ParseTelegramChannelsAsync(
                         browser, telegramCursors!, need,
-                        url => !seen.Contains(url) && (_options.RecheckOwned || (!ownedCache.Contains(url) && !deprecatedCache.Contains(url) && !catalog.ContainsUrl(url))),
+                        url => !seen.Contains(url) && (_options.RecheckOwned || (!ownedCache.Contains(url) && !deprecatedCache.Contains(url) && !unaddableCache.Contains(url) && !catalog.ContainsUrl(url))),
                         maxPostsPerChannel: int.MaxValue, maxPagesPerChannel: int.MaxValue);
 
                     await ReportTelegramResultAsync(tg, assetPromocodes);
@@ -932,6 +947,12 @@ internal sealed partial class UnityAssetAutomationApp
                     {
                         stoppedEarly = true;
                         break;
+                    }
+
+                    // Пачка проверена: что в ней добавилось, сразу идёт в каталог.
+                    if (batchNo > 0)
+                    {
+                        await SaveCatalogProgressAsync(catalog, report);
                     }
 
                     var batch = await NextTelegramBatchAsync();
@@ -1004,6 +1025,10 @@ internal sealed partial class UnityAssetAutomationApp
                 {
                     deprecatedCache.Add(assetUrl);
                 }
+                else if (result.Status == AssetProcessStatus.UnknownAfterClick)
+                {
+                    unaddableCache.Add(assetUrl);
+                }
                 else if (result.Status == AssetProcessStatus.PromoNotApplied && promoCode != null)
                 {
                     rejectedPromoCache.Add(PromoCacheKey(assetUrl, promoCode));
@@ -1060,6 +1085,11 @@ internal sealed partial class UnityAssetAutomationApp
 
             SaveCaches();
             await UpdateCatalogAfterRunAsync(page, catalog, report, EnsureLoggedInAsync);
+
+            if (skippedUnaddable > 0)
+            {
+                _logger.Info($"Пропущено ассетов, которые магазин не добавляет на аккаунт: {skippedUnaddable} (список — unaddable_assets.txt в папке профиля).");
+            }
 
             if (skippedKnown + skippedDeprecated > 0)
             {
@@ -1369,6 +1399,9 @@ internal sealed partial class UnityAssetAutomationApp
     private readonly List<string> _telegramGitLinks = [];
     private readonly List<string> _telegramPromocodes = [];
 
+    /// <summary>Карточки ассетов из постов каналов, по номеру ассета: для источников в каталоге.</summary>
+    private readonly Dictionary<string, ChannelAssetCard> _channelCards = new(StringComparer.Ordinal);
+
     /// <summary>
     /// Пишет в лог, что принесло чтение Telegram, и копит найденное за весь запуск:
     /// промокоды — в общий словарь (код из более свежего поста не перетирается),
@@ -1390,6 +1423,11 @@ internal sealed partial class UnityAssetAutomationApp
         foreach (var kvp in tgResult.AssetPromocodes)
         {
             assetPromocodes.TryAdd(kvp.Key, kvp.Value);
+        }
+
+        foreach (var card in tgResult.Cards)
+        {
+            _channelCards.TryAdd(card.Key, card.Value);
         }
 
         if (tgResult.GitLinks.Count > 0)
@@ -1761,6 +1799,12 @@ internal sealed partial class UnityAssetAutomationApp
         total.Promocodes.AddRange(partial.Promocodes);
         total.PostsWithoutLinks.AddRange(partial.PostsWithoutLinks);
         total.AllPosts.AddRange(partial.AllPosts);
+        total.SkippedDownloadPosts += partial.SkippedDownloadPosts;
+        foreach (var card in partial.Cards)
+        {
+            total.Cards.TryAdd(card.Key, card.Value);
+        }
+
         total.Errors = partial.Errors;
         total.FailedChannels = partial.FailedChannels;
 
@@ -2575,23 +2619,7 @@ internal sealed partial class UnityAssetAutomationApp
         try
         {
             var now = DateTime.UtcNow;
-            var got = report.Items
-                .Where(i => i.Status is AssetProcessStatus.Added or AssetProcessStatus.AlreadyOwned)
-                .Select(i => (Id: ExtractPackageId(i.Url), Item: i))
-                .Where(x => x.Id is not null)
-                .ToList();
-
-            var unknown = got.Select(x => x.Id!).Where(id => !catalog.ContainsId(id)).Distinct().ToList();
-            if (unknown.Count > 0)
-            {
-                await FetchIntoCatalogAsync(catalog, unknown, now);
-            }
-
-            foreach (var (id, item) in got.Where(x => x.Item.Status == AssetProcessStatus.Added))
-            {
-                catalog.MarkAdded(id!, item.PromoCode is null ? "free" : "promo", item.PromoCode,
-                    item.TimestampUtc == default ? now : item.TimestampUtc);
-            }
+            await RecordReportInCatalogAsync(catalog, report, now);
 
             if (_options.CatalogRefresh is { } period && catalog.LibrarySyncDue(period, now))
             {
@@ -2612,6 +2640,58 @@ internal sealed partial class UnityAssetAutomationApp
         catch (Exception ex)
         {
             _logger.Warn($"[Каталог] Не обновился: {ex.Message}. Прогон это не затронуло, попробуем в следующий раз.");
+        }
+    }
+
+    /// <summary>
+    /// Добавленные и уже имевшиеся ассеты из отчёта — в каталог (данные берутся из магазина), у добавленных
+    /// отмечается, как и когда получены, а у всех — из каких постов каналов о них узнали. Файлы не пишет.
+    /// </summary>
+    private async Task RecordReportInCatalogAsync(AssetCatalog catalog, RunReport report, DateTime now)
+    {
+        var got = report.Items
+            .Where(i => i.Status is AssetProcessStatus.Added or AssetProcessStatus.AlreadyOwned)
+            .Select(i => (Id: ExtractPackageId(i.Url), Item: i))
+            .Where(x => x.Id is not null)
+            .ToList();
+
+        var unknown = got.Select(x => x.Id!).Where(id => !catalog.ContainsId(id)).Distinct().ToList();
+        if (unknown.Count > 0)
+        {
+            await FetchIntoCatalogAsync(catalog, unknown, now);
+        }
+
+        foreach (var (id, item) in got.Where(x => x.Item.Status == AssetProcessStatus.Added))
+        {
+            catalog.MarkAdded(id!, item.PromoCode is null ? "free" : "promo", item.PromoCode,
+                item.TimestampUtc == default ? now : item.TimestampUtc);
+        }
+
+        catalog.AddSources(_channelCards.Values);
+    }
+
+    /// <summary>
+    /// Сохраняет каталог между пачками из Telegram: обрыв посреди долгого прогона не должен оставить
+    /// добавленные ассеты вне каталога. Ошибка каталога прогон не портит.
+    /// </summary>
+    private async Task SaveCatalogProgressAsync(AssetCatalog catalog, RunReport report)
+    {
+        if (_options.DryRun)
+        {
+            return;
+        }
+
+        try
+        {
+            await RecordReportInCatalogAsync(catalog, report, DateTime.UtcNow);
+            if (catalog.Changed)
+            {
+                WriteCatalog(catalog);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[Каталог] Между пачками не обновился: {ex.Message}. Обновим в конце прогона.");
         }
     }
 
@@ -2749,6 +2829,7 @@ internal sealed partial class UnityAssetAutomationApp
     {
         _ownedCache?.Save();
         _deprecatedCache?.Save();
+        _unaddableCache?.Save();
         _rejectedPromoCache?.Save();
     }
 
@@ -5405,6 +5486,16 @@ internal sealed partial class UnityAssetAutomationApp
                 }
 
                 var clicked = await TryClickAddButtonAsync(page);
+
+                // Главная кнопка иногда дорисовывается позже кнопок «похожих» ассетов (пока бледная заглушка):
+                // 09.10 так не нажалась «Add to My Assets» у skner's Dual Grid. Даём ей несколько секунд.
+                for (var attempt = 1; !clicked && attempt <= 4; attempt++)
+                {
+                    _logger.Debug($"Кнопка добавления ещё не нажимается. Ждём 2,5с (попытка {attempt} из 4)...");
+                    await Task.Delay(2500);
+                    clicked = await TryClickAddButtonAsync(page);
+                }
+
                 if (!clicked)
                 {
                     result.Status = AssetProcessStatus.Failed;
@@ -6118,6 +6209,10 @@ internal sealed partial class UnityAssetAutomationApp
             };
 
             const idOf = (href) => {
+                // /packages/category/asset-store-tools-115 — раздел магазина, а не чужой ассет: его
+                // «номер» не должен отсеивать кнопку страницы (так не нажималась «Add to My Assets»
+                // у Stylized Stone UI Buttons: раздел был единственной ссылкой рядом с кнопкой).
+                if (/\/packages\/category\//.test(href || '')) return null;
                 const m = (href || '').match(/\/packages\/[^?#]*?-(\d+)\/?(?:[?#]|$)/);
                 return m ? m[1] : null;
             };
@@ -6125,9 +6220,14 @@ internal sealed partial class UnityAssetAutomationApp
             // Чей это блок: поднимаемся от кнопки, пока не встретим ссылки на ассеты.
             // Одна ссылка — это карточка одного ассета. Несколько — общий блок страницы,
             // выше подниматься незачем.
+            // Блок, в котором есть заголовок самой страницы, — это сам ассет, а не чужая карточка: у «Free Demo»
+            // в описании стоит ссылка на полную платную версию, и без этого правила кнопка считалась чужой.
+            // Карточки «похожие» и «top free» заголовка этой страницы не содержат.
+            const pageTitle = document.querySelector('h1');
             const ownerOf = (el) => {
                 let node = el;
                 while (node && node !== document.body) {
+                    if (pageTitle && node.contains(pageTitle)) return null;
                     const ids = Array.from(new Set(
                         Array.from(node.querySelectorAll('a[href*=""/packages/""]'))
                             .map(a => idOf(a.getAttribute('href')))
@@ -7331,6 +7431,37 @@ internal sealed partial class UnityAssetAutomationApp
         return string.Join("_", name.Split(invalid, StringSplitOptions.RemoveEmptyEntries));
     }
 
+    /// <summary>
+    /// Ждёт плашку магазина «Added to My Assets» (кнопка на странице при этом называется «Add to My Assets» и
+    /// в прошедшем времени не пишется). true — плашка появилась в течение timeout.
+    /// </summary>
+    internal static async Task<bool> WaitForAddedBannerAsync(IPage page, TimeSpan timeout)
+    {
+        var stopAt = DateTime.UtcNow.Add(timeout);
+        while (true)
+        {
+            try
+            {
+                if (await page.EvaluateFunctionAsync<bool>(
+                        "() => ((document.body && document.body.innerText) || '').toLowerCase().includes('added to my assets')"))
+                {
+                    return true;
+                }
+            }
+            catch (Exception ex) when (IsTransientPageError(ex))
+            {
+                // Страница как раз перезагружается — смотрим на следующем круге.
+            }
+
+            if (DateTime.UtcNow >= stopAt)
+            {
+                return false;
+            }
+
+            await Task.Delay(500);
+        }
+    }
+
     private async Task<AssetStatusSnapshot> VerifyPostAddStatusAsync(IPage page, string assetUrl, TimeSpan timeout)
     {
         var stopAt = DateTime.UtcNow.Add(timeout);
@@ -7361,6 +7492,29 @@ internal sealed partial class UnityAssetAutomationApp
 
             if (current.HasAddToMyAssets)
             {
+                // Две попытки — и хватит: некоторые ассеты магазин не добавляет вовсе (отвечает без права на ассет,
+                // хотя плашка «Added to My Assets» появляется). Такой ассет запоминается и больше не открывается.
+                if (cycle > 2)
+                {
+                    _logger.Debug($"PostAddCycle[{cycle}]: после двух попыток ассет так и не добавился — оставляем как есть.");
+                    return current;
+                }
+
+                // Магазин добавляет ассет не мгновенно: после «Accept» страница ещё несколько секунд показывает
+                // прежнюю кнопку, а потом выходит плашка «Added to My Assets». Перезагрузка в этот момент обрывает
+                // добавление (09.10 на Deck шесть ассетов так и не добавились: «Accept» нажимался по кругу).
+                // Поэтому сначала ждём плашку, и только потом обновляем страницу.
+                if (await WaitForAddedBannerAsync(page, TimeSpan.FromSeconds(10)))
+                {
+                    _logger.Debug($"PostAddCycle[{cycle}]: магазин показал «Added to My Assets», даём ему закончить и обновляем страницу.");
+                    await Task.Delay(1500);
+                    refreshAttempt++;
+                    await SafeGoToAsync(page, assetUrl);
+                    await WaitForAssetSignalsAsync(page,
+                        TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 15000)));
+                    continue;
+                }
+
                 _logger.Debug($"PostAddCycle[{cycle}]: кнопка Add to My Assets всё ещё видна, повторяем клик...");
                 var clickedAdd = await TryClickAddButtonAsync(page);
                 if (clickedAdd)
@@ -7371,6 +7525,8 @@ internal sealed partial class UnityAssetAutomationApp
                     if (accepted)
                     {
                         _logger.Info("Подтверждение добавления найдено во время проверки: нажата кнопка Accept.");
+                        // Перезагрузка раньше времени обрывает добавление — ждём плашку и тут.
+                        await WaitForAddedBannerAsync(page, TimeSpan.FromSeconds(6));
                     }
                 }
                 else
@@ -7684,6 +7840,10 @@ internal sealed partial class UnityAssetAutomationApp
             };
 
             const idOf = (href) => {
+                // /packages/category/asset-store-tools-115 — раздел магазина, а не чужой ассет: его
+                // «номер» не должен отсеивать кнопку страницы (так не нажималась «Add to My Assets»
+                // у Stylized Stone UI Buttons: раздел был единственной ссылкой рядом с кнопкой).
+                if (/\/packages\/category\//.test(href || '')) return null;
                 const m = (href || '').match(/\/packages\/[^?#]*?-(\d+)\/?(?:[?#]|$)/);
                 return m ? m[1] : null;
             };
@@ -7691,9 +7851,14 @@ internal sealed partial class UnityAssetAutomationApp
             // Ассет, открытый на странице. Если номер не разобрался, чужие кнопки не отсеиваем.
             const wanted = idOf(location.pathname);
 
+            // Блок, в котором есть заголовок самой страницы, — это сам ассет, а не чужая карточка: у «Free Demo»
+            // в описании стоит ссылка на полную платную версию, и без этого правила кнопка считалась чужой.
+            // Карточки «похожие» и «top free» заголовка этой страницы не содержат.
+            const pageTitle = document.querySelector('h1');
             const ownerOf = (el) => {
                 let node = el;
                 while (node && node !== document.body) {
+                    if (pageTitle && node.contains(pageTitle)) return null;
                     const ids = Array.from(new Set(
                         Array.from(node.querySelectorAll('a[href*=""/packages/""]'))
                             .map(a => idOf(a.getAttribute('href')))

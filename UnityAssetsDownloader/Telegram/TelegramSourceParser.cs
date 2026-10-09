@@ -127,6 +127,11 @@ internal sealed class TelegramSourceParser
                     result.PostsWithoutLinks.AddRange(channelResult.PostsWithoutLinks);
                     result.Errors.AddRange(channelResult.Errors);
                     result.AllPosts.AddRange(channelResult.AllPosts);
+                    result.SkippedDownloadPosts += channelResult.SkippedDownloadPosts;
+                    foreach (var card in channelResult.Cards)
+                    {
+                        result.Cards.TryAdd(card.Key, card.Value);
+                    }
 
                     foreach (var url in channelResult.AssetUrls)
                     {
@@ -169,6 +174,12 @@ internal sealed class TelegramSourceParser
         }
 
         result.GitLinks = result.GitLinks.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+        if (result.SkippedDownloadPosts > 0)
+        {
+            _logger.Info($"[Telegram] Пропущено постов с раздачей файлов через бота: {result.SkippedDownloadPosts} " +
+                         "(платные ассеты без оплаты в очередь не берём).");
+        }
 
         foreach (var cursor in cursors.Where(c => c.PostsRead > 0))
         {
@@ -245,6 +256,7 @@ internal sealed class TelegramSourceParser
         // Сначала — простой запрос страницы: t.me/s/<канал> приходит уже готовой,
         // выполнять на ней нечего. Это в разы быстрее браузера и не требует второго Chrome.
         List<(string Text, string PostId)> pagePosts = [];
+        Dictionary<string, ChannelPostParse> cards = [];
         IPage? page = null;
 
         if (_fetchHtmlAsync is not null)
@@ -256,6 +268,7 @@ internal sealed class TelegramSourceParser
             }
 
             pagePosts = TelegramHtmlParser.ExtractPosts(html);
+            cards = ParseCards(cursor.Name, html);
 
             // Постов может не быть по двум причинам: они кончились или вместо страницы
             // пришла заглушка провайдера. Настоящую страницу узнаём по разметке Telegram.
@@ -275,6 +288,7 @@ internal sealed class TelegramSourceParser
             await Task.Delay(firstPage ? 2000 : 1500);
 
             pagePosts = await ExtractPostsRawAsync(page);
+            cards = ParseCards(cursor.Name, await page.GetContentAsync());
         }
         var postLimit = Math.Min(maxPostsPerChannel, cursor.MaxPosts);
 
@@ -319,7 +333,7 @@ internal sealed class TelegramSourceParser
         foreach (var (text, postId) in fresh)
         {
             cursor.SeenPostIds.Add(postId);
-            await AnalyzePostAsync(page, cursor.Name, text, postId, channelResult);
+            await AnalyzePostAsync(page, cursor.Name, text, postId, channelResult, cards.GetValueOrDefault(postId));
         }
 
         cursor.PostsRead += fresh.Count;
@@ -337,10 +351,52 @@ internal sealed class TelegramSourceParser
         }
     }
 
-    /// <summary>Ищет в посте ссылки на ассеты, git-ссылки и промокоды.</summary>
-    private async Task AnalyzePostAsync(
-        IPage? page, string channelName, string text, string postId, TelegramChannelResult channelResult)
+    // Карточки ассетов страницы по номеру поста. Разбор карточек — дополнение к чтению канала:
+    // если он споткнулся, посты читаются, как раньше.
+    private Dictionary<string, ChannelPostParse> ParseCards(string channelName, string? html)
     {
+        var parsed = new Dictionary<string, ChannelPostParse>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            foreach (var raw in TelegramHtmlParser.ExtractRawPosts(html))
+            {
+                parsed[raw.PostId] = ChannelCardParser.Parse(channelName, raw);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"[Telegram] Карточки канала {channelName} не разобрались: {ex.Message}");
+        }
+
+        return parsed;
+    }
+
+    /// <summary>
+    /// Ищет в посте ссылки на ассеты, git-ссылки и промокоды. parsed — вид поста по карточке:
+    /// раздачи через бота пропускаются, у карточки адрес берётся из неё самой.
+    /// </summary>
+    private async Task AnalyzePostAsync(
+        IPage? page, string channelName, string text, string postId, TelegramChannelResult channelResult,
+        ChannelPostParse? parsed = null)
+    {
+        var promocodes = ExtractPromocodes(text);
+
+        // Раздача файла через бота: по ценам магазина — платные ассеты без оплаты. В очередь такой пост
+        // не берём и ссылку на бота не храним. Пост с промокодом разбирается как обычно: код проверит
+        // магазин, а оплата идёт только при итоге $0.
+        if (parsed is { Kind: ChannelPostKind.DownloadBot } && promocodes.Count == 0)
+        {
+            channelResult.AllPosts.Add(new TelegramPostInfo
+            {
+                ChannelName = channelName,
+                PostId = postId,
+                Text = "(раздача файла через бота — пропущена)"
+            });
+            channelResult.SkippedDownloadPosts++;
+            _logger.Debug($"[Telegram] пост {postId}: раздача файла через бота, пропущен");
+            return;
+        }
+
         channelResult.AllPosts.Add(new TelegramPostInfo
         {
             ChannelName = channelName,
@@ -350,11 +406,21 @@ internal sealed class TelegramSourceParser
         _logger.Debug($"[Telegram] ---- ПОСТ {channelName}/#{postId} ({text.Length} символов) ----");
         _logger.Debug($"[Telegram] {text}");
 
-        var assetUrls = AssetUrlRegex.Matches(text)
-            .Select(m => NormalizeAssetUrl(m.Value))
-            .Where(u => !string.IsNullOrWhiteSpace(u))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        // Карточка ассета: адрес берём из ссылки, спрятанной за «Перейти на Unity Asset Store», а не ищем
+        // по тексту — так не обрезаются адреса с «!» и «'» в названии.
+        var card = parsed is { Kind: ChannelPostKind.Card } ? parsed.Card : null;
+        if (card is not null)
+        {
+            channelResult.Cards.TryAdd(card.AssetId, card);
+        }
+
+        var assetUrls = card is not null
+            ? [card.StoreUrl]
+            : AssetUrlRegex.Matches(text)
+                .Select(m => NormalizeAssetUrl(m.Value))
+                .Where(u => !string.IsNullOrWhiteSpace(u))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
 
         var gitUrls = GitUrlRegex.Matches(text)
             .Select(m => m.Value.StartsWith("http", StringComparison.OrdinalIgnoreCase)
@@ -362,8 +428,6 @@ internal sealed class TelegramSourceParser
                 : "https://" + m.Value)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
-
-        var promocodes = ExtractPromocodes(text);
 
         channelResult.AssetUrls.AddRange(assetUrls);
         channelResult.GitLinks.AddRange(gitUrls);
@@ -638,6 +702,12 @@ internal sealed class TelegramParseResult
     public List<string> Errors { get; set; } = [];
     public List<TelegramPostInfo> AllPosts { get; set; } = [];
     public Dictionary<string, string> AssetPromocodes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Карточки ассетов из постов по номеру ассета (при повторах — самая свежая).</summary>
+    public Dictionary<string, ChannelAssetCard> Cards { get; set; } = new(StringComparer.Ordinal);
+
+    /// <summary>Сколько постов-раздач через бота пропущено.</summary>
+    public int SkippedDownloadPosts { get; set; }
 }
 
 internal sealed class TelegramChannelResult
@@ -650,6 +720,8 @@ internal sealed class TelegramChannelResult
     public List<string> Errors { get; set; } = [];
     public List<TelegramPostInfo> AllPosts { get; set; } = [];
     public Dictionary<string, string> AssetPromocodes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, ChannelAssetCard> Cards { get; set; } = new(StringComparer.Ordinal);
+    public int SkippedDownloadPosts { get; set; }
 }
 
 internal sealed class PostWithoutLink

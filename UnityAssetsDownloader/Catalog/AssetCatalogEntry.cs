@@ -4,6 +4,32 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
+/// <summary>Пост канала, из которого мы узнали об ассете.</summary>
+internal sealed class AssetSource
+{
+    /// <summary>Откуда: telegram.</summary>
+    public string Kind { get; set; } = "telegram";
+
+    public string Channel { get; set; } = string.Empty;
+    public int Post { get; set; }
+    public DateTime? PostedUtc { get; set; }
+
+    /// <summary>Темы канала в одном написании: 2d, gui, textures-materials.</summary>
+    public List<string>? Topics { get; set; }
+
+    /// <summary>Описание из поста, как в канале (обычно по-русски).</summary>
+    public string? Text { get; set; }
+
+    public static AssetSource FromCard(ChannelAssetCard card) => new()
+    {
+        Channel = card.Channel,
+        Post = card.PostId,
+        PostedUtc = card.PostedUtc,
+        Topics = card.Topics.Count > 0 ? card.Topics : null,
+        Text = AssetCatalogEntry.Truncate(card.Description, 500)
+    };
+}
+
 /// <summary>
 /// Один ассет в каталоге библиотеки: то, что нужно ИИ-агенту и человеку, чтобы понять,
 /// что это за ассет, не открывая его страницу в магазине.
@@ -68,6 +94,12 @@ internal sealed class AssetCatalogEntry
     public string? How { get; set; }
     public string? PromoCode { get; set; }
     public DateTime? AddedUtc { get; set; }
+
+    /// <summary>
+    /// Откуда мы узнали об ассете помимо списка «My Assets»: посты каналов с темами и описанием
+    /// по-русски. null — таких нет (писать пустой список в каждую строку jsonl незачем).
+    /// </summary>
+    public List<AssetSource>? Sources { get; set; }
 
     /// <summary>Свои метки по правилам (<see cref="AssetTagRules"/>): 3d, style:low-poly, rp:urp…</summary>
     public List<string> Marks { get; set; } = [];
@@ -183,7 +215,35 @@ internal sealed class AssetCatalogEntry
         PromoCode ??= old.PromoCode;
         AddedUtc ??= old.AddedUtc;
         Rank ??= old.Rank;
+
+        // Данные магазина обновились, а откуда мы про ассет узнали — нет: источники старой записи сохраняются.
+        foreach (var source in old.Sources ?? [])
+        {
+            AddSource(source);
+        }
     }
+
+    /// <summary>Добавляет источник, если такого поста у ассета ещё нет. true — запись изменилась.</summary>
+    public bool AddSource(AssetSource source)
+    {
+        Sources ??= [];
+        if (Sources.Any(s => s.Channel == source.Channel && s.Post == source.Post))
+        {
+            return false;
+        }
+
+        Sources.Add(source);
+        Sources = Sources.OrderByDescending(s => s.PostedUtc).ToList();
+        return true;
+    }
+
+    /// <summary>Описание из поста канала (перевод слов издателя, обычно по-русски), самое свежее.</summary>
+    [JsonIgnore]
+    public string? PostText => Sources?.Select(s => s.Text).FirstOrDefault(t => !string.IsNullOrWhiteSpace(t));
+
+    /// <summary>Темы каналов (#2D #GUI → 2d, gui) со всех постов, без повторов.</summary>
+    [JsonIgnore]
+    public IEnumerable<string> Topics => (Sources ?? []).SelectMany(s => s.Topics ?? []).Distinct(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Самая старая версия Unity из поддерживаемых, коротко: 2021.3, 6000.0.</summary>
     [JsonIgnore]
@@ -195,9 +255,9 @@ internal sealed class AssetCatalogEntry
     [JsonIgnore]
     public bool IsAvailable => State == "published";
 
-    /// <summary>Строка «о чём ассет»: разметка ИИ, иначе слова издателя, иначе начало описания.</summary>
+    /// <summary>Строка «о чём ассет»: разметка ИИ, иначе слова издателя, иначе начало описания, иначе описание из поста канала.</summary>
     [JsonIgnore]
-    public string Summary => FirstNonEmpty(Ai?.Sum, StoreSummary) ?? string.Empty;
+    public string Summary => FirstNonEmpty(Ai?.Sum, StoreSummary, PostText) ?? string.Empty;
 
     /// <summary>То же, но только словами издателя — для страницы, где разметка ИИ показана отдельно.</summary>
     [JsonIgnore]

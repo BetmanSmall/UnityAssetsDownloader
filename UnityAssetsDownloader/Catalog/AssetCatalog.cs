@@ -121,6 +121,26 @@ internal sealed class AssetCatalog
     }
 
     /// <summary>
+    /// Записывает у ассетов каталога, из каких постов каналов о них узнали (канал, дата, темы, описание
+    /// по-русски). Ассетов, которых в каталоге нет, это не касается: в каталог идёт только то, что на аккаунте.
+    /// Возвращает, у скольких ассетов запись изменилась.
+    /// </summary>
+    public int AddSources(IEnumerable<ChannelAssetCard> cards)
+    {
+        var changed = 0;
+        foreach (var card in cards)
+        {
+            if (_entries.TryGetValue(card.AssetId, out var entry) && entry.AddSource(AssetSource.FromCard(card)))
+            {
+                changed++;
+            }
+        }
+
+        Changed |= changed > 0;
+        return changed;
+    }
+
+    /// <summary>
     /// Применяет список «My Assets»: порядок (0 — получен последним) и отметку времени.
     /// Возвращает номера, данные которых надо взять из магазина: новые и устаревшие.
     /// </summary>
@@ -216,7 +236,9 @@ internal sealed class AssetCatalog
     public static string FormatLine(AssetCatalogEntry e)
     {
         var marks = e.Marks.Where(m => !IsObviousMark(m, e)).ToList();
-        var tags = e.Tags.Concat(e.Ai?.Tags ?? []).Distinct(StringComparer.OrdinalIgnoreCase).Take(6);
+        // Темы канала идут после тегов магазина и не вытесняются ими: у ассета с шестью тегами они всё равно видны.
+        var tags = e.Tags.Concat(e.Ai?.Tags ?? []).Distinct(StringComparer.OrdinalIgnoreCase).Take(6)
+            .Concat(e.Topics.Take(3)).Distinct(StringComparer.OrdinalIgnoreCase);
         var labels = string.Join(" ", marks);
         var tagText = string.Join(", ", tags);
         var summary = AssetCatalogEntry.Truncate(e.Summary, 150);
@@ -334,6 +356,7 @@ internal sealed class AssetCatalog
         sb.AppendLine("- `lite` — бесплатная урезанная версия (Free/Lite/Sample/Demo в названии); `old` — только Unity до 2021;");
         sb.AppendLine("  `deprecated` — снят с продажи; `missing` — магазин о нём не знает; `ai-made` — издатель указал контент от ИИ");
         sb.AppendLine("- в конце строки из разметки ИИ: суть по-русски, `[для чего годится]`, после `⚠` — подвох");
+        sb.AppendLine("- темы Telegram-канала (2d, gui, textures-materials) стоят среди тегов; в assets.jsonl поле `sources` — откуда узнали об ассете: канал, пост, дата, описание по-русски");
         sb.AppendLine();
         sb.AppendLine("## Разделы");
         sb.AppendLine();
@@ -506,7 +529,15 @@ internal static class CatalogHtml
                 h = e.How,
                 pc = e.PromoCode,
                 a = e.AddedUtc?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
-                k = e.Rank
+                k = e.Rank,
+                sr = e.Sources?.Select(s => new
+                {
+                    c = s.Channel,
+                    p = s.Post,
+                    d = s.PostedUtc?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                    t = s.Topics,
+                    x = s.Text
+                })
             })
         };
 
