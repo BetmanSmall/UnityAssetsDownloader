@@ -872,6 +872,65 @@ internal sealed partial class FabStore
             transient ? HumanKind.Transient : HumanKind.Deferrable);
     }
 
+    /// <summary>
+    /// Разведка (--fab-recon): человек сам получает ассет в обычном окне, записывая сеть в DevTools
+    /// (Network → «Save all as HAR»). Программа только открывает страницу, ждёт и потом по самой странице
+    /// проверяет, что ассет в библиотеке. Нужна, чтобы увидеть, как Fab оформляет раздачу со скидкой
+    /// 100 % (покупку за 0), и научить этому программу: деньги тут не нужны, платить нельзя.
+    /// </summary>
+    public async Task<ClaimResult> ReconAsync(string uid, TimeSpan wait)
+    {
+        if (!await OpenAsync(PageUrl(uid)))
+        {
+            return new ClaimResult { Outcome = ClaimOutcome.Failed, Message = "Страница ассета не открылась." };
+        }
+
+        var view = await ReadListingPageAsync(uid);
+        if (view is null || view.Challenged)
+        {
+            return new ClaimResult { Outcome = ClaimOutcome.Failed, Message = "Страница ассета не прочиталась (Cloudflare или другая вёрстка)." };
+        }
+
+        var result = new ClaimResult { Title = view.Listing?.Title ?? view.Heading };
+        if (view.Acquired == true || view.ButtonOwned)
+        {
+            result.Outcome = ClaimOutcome.AlreadyOwned;
+            result.Message = "Этот ассет уже в вашей библиотеке — записывать нечего. Возьмите другой, которого у вас ещё нет.";
+            return result;
+        }
+
+        if (!view.Me && (view.SignIn || view.Anonymous))
+        {
+            result.Outcome = ClaimOutcome.NeedsLogin;
+            result.Message = "Fab показывает кнопку «Sign in» — входа нет.";
+            return result;
+        }
+
+        var ok = await AskHumanAsync(
+            "FAB: РАЗВЕДКА — ПОЛУЧИТЕ АССЕТ САМИ, ЗАПИСАВ СЕТЬ",
+            [
+                $"Ассет «{result.Title ?? uid}». Окно откроется на его странице.",
+                "1) В окне нажмите F12 → вкладка Network → отметьте «Preserve log». Запись должна идти ДО вашего нажатия.",
+                "2) Получите ассет кнопкой на странице («Add to My Library» или оформление за 0). К оплате должно быть 0:",
+                "   если Fab просит платёжные данные или сумму больше нуля — остановитесь и закройте окно.",
+                "3) Когда кнопка сменится на «View in My Library»: в Network нажмите кнопку скачивания (стрелка вниз) →",
+                "   «Export HAR (sanitized)» (или правый клик → «Save all as HAR with content»), файл fab.har — в Downloads.",
+                "4) Закройте окно Chrome — Ctrl+Shift+W. Программа проверит страницу и покажет, где лежит файл."
+            ],
+            PageUrl(uid),
+            async () => (await ReadListingViewAsync(uid))?.ButtonOwned == true,
+            wait,
+            "fab-recon",
+            attempts: 1);
+
+        result.ByHuman = ok;
+        result.Outcome = ok ? ClaimOutcome.Added : ClaimOutcome.Failed;
+        result.Message = ok
+            ? "Ассет в библиотеке Fab (получен вами в окне)."
+            : "Страница не показала «View in My Library»: не успели или не получилось. Можно запустить разведку ещё раз.";
+        return result;
+    }
+
     /// <summary>Почему понадобился человек: от этого зависит, что делает сервер.</summary>
     private enum HumanKind
     {

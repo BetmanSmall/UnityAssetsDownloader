@@ -405,7 +405,7 @@ internal sealed partial class UnityAssetAutomationApp
             }
 
             // Fab — свой браузер и свой аккаунт (Epic Games): вход в Unity для него не нужен.
-            if (_options.Fab || _options.FabLoginOnly || _options.FabServerOnce)
+            if (_options.Fab || _options.FabLoginOnly || _options.FabServerOnce || _options.FabReconUrl is not null)
             {
                 await RunFabAsync();
                 return;
@@ -8214,6 +8214,12 @@ internal sealed class CliOptions
     /// </summary>
     public bool FabServerOnce { get; init; }
 
+    /// <summary>
+    /// Разведка (--fab-recon https://www.fab.com/listings/…): открыть ассет в окне, где вы сами получите
+    /// его с записью сети (DevTools → HAR). Нужна, чтобы научить программу получать раздачи со скидкой 100 %.
+    /// </summary>
+    public string? FabReconUrl { get; init; }
+
     /// <summary>Есть ли где показать окно браузера. Нет — Docker, SSH, сервер.</summary>
     public bool HasScreen { get; init; } = true;
 
@@ -8347,6 +8353,7 @@ internal sealed class CliOptions
         var cliFab = false;
         var cliFabLogin = false;
         var cliFabServer = false;
+        string? cliFabRecon = null;
         var cliFabUrls = new List<string>();
         string? cliFabBrowser = null;
 
@@ -8473,6 +8480,9 @@ internal sealed class CliOptions
                     break;
                 case "--fab-server":
                     cliFabServer = true;
+                    break;
+                case "--fab-recon" when i + 1 < args.Length:
+                    cliFabRecon = args[++i];
                     break;
                 case "--fab-url" when i + 1 < args.Length:
                     cliFab = true;
@@ -8948,6 +8958,7 @@ internal sealed class CliOptions
             Fab = cliFab,
             FabLoginOnly = cliFabLogin,
             FabServerOnce = cliFabServer,
+            FabReconUrl = cliFabRecon,
             FabUrls = cliFabUrls,
             FabBrowser = FirstNonEmpty(cliFabBrowser, Environment.GetEnvironmentVariable("FAB_BROWSER")),
             FabBaseUrl = FirstNonEmpty(Environment.GetEnvironmentVariable("FAB_BASE_URL")),

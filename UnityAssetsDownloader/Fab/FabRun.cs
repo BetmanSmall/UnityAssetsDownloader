@@ -60,6 +60,7 @@ internal sealed partial class UnityAssetAutomationApp
         var loginOnly = !server && _options.FabLoginOnly;
         _logger.Info("============================================================");
         _logger.Info(server ? " FAB (СЕРВЕР): НОВЫЕ АССЕТЫ ИЗ КАНАЛОВ И РАЗДАЧА"
+            : _options.FabReconUrl is not null ? " FAB: РАЗВЕДКА — ВЫ ПОЛУЧАЕТЕ АССЕТ САМИ, ПРОГРАММА ЖДЁТ"
             : loginOnly ? " FAB: ВХОД В АККАУНТ EPIC GAMES" : " FAB.COM: БЕСПЛАТНЫЕ АССЕТЫ НА АККАУНТ EPIC GAMES");
         _logger.Info("============================================================");
 
@@ -110,6 +111,14 @@ internal sealed partial class UnityAssetAutomationApp
         if (_options.Headless && remote is null)
         {
             _logger.Info("[Fab] Невидимый режим для Fab не работает (Cloudflare) — окно браузера будет видно.");
+        }
+
+        var reconUid = !server && _options.FabReconUrl is { } reconUrl ? FabStore.ListingUid(reconUrl) : null;
+        if (!server && _options.FabReconUrl is not null && reconUid is null)
+        {
+            _logger.Error("[Fab] --fab-recon: нужна ссылка вида https://www.fab.com/listings/<номер>.");
+            Environment.ExitCode = 2;
+            return;
         }
 
         var profileDirectory = _profileStore.GetProfileDirectory(_profileName);
@@ -166,7 +175,7 @@ internal sealed partial class UnityAssetAutomationApp
         }
 
         List<TelegramChannelCursor>? cursors = null;
-        if (!loginOnly)
+        if (!loginOnly && reconUid is null)
         {
             if (explicitUrls.Count > 0)
             {
@@ -269,7 +278,7 @@ internal sealed partial class UnityAssetAutomationApp
 
         await using (browser)
         {
-            var fab = new FabStore(browser, _logger, _logsDirectory, _options.FabBaseUrl, _options.Interactive || server,
+            var fab = new FabStore(browser, _logger, _logsDirectory, _options.FabBaseUrl, _options.Interactive || server || reconUid is not null,
                 _notifier is { Enabled: true } ? NotifyAsync : null, TimeSpan.FromMilliseconds(_options.NavigationTimeoutMs))
             {
                 HumanWindowHint = remote?.Hint,
@@ -342,6 +351,27 @@ internal sealed partial class UnityAssetAutomationApp
                     }
 
                     _logger.Info("============================================================");
+                    return;
+                }
+
+                if (reconUid is not null)
+                {
+                    var rr = await fab.ReconAsync(reconUid, TimeSpan.FromMinutes(30));
+                    _logger.Info("============================================================");
+                    _logger.Info($" РАЗВЕДКА: {rr.Message}");
+                    if (rr.Outcome == FabStore.ClaimOutcome.Added)
+                    {
+                        owned.Add(FabStore.CanonicalUrl(reconUid));
+                        owned.Save();
+                        var hars = FindHarFiles();
+                        _logger.Info(hars.Count > 0
+                            ? $" Найдены файлы HAR: {string.Join(", ", hars)}"
+                            : " Файл HAR не найден в Downloads — сохраните его ещё раз (Export HAR) и запустите разведку на другом ассете.");
+                        _logger.Info(" Дальше: docker compose cp unity-assets:<путь к fab.har> . && python3 tools/har-summary.py fab.har");
+                    }
+
+                    _logger.Info("============================================================");
+                    Environment.ExitCode = rr.Outcome == FabStore.ClaimOutcome.Added ? 0 : 2;
                     return;
                 }
 
@@ -544,6 +574,31 @@ internal sealed partial class UnityAssetAutomationApp
                               string.Join("\n", lines) + (newlyManual.Count > 15 ? $"\n… и ещё {newlyManual.Count - 15}" : string.Empty) +
                               "\nВозьмите их на сайте Fab под своим аккаунтом (кнопка «Add to My Library») или пунктом F на Deck/ПК.");
         }
+    }
+
+    /// <summary>Файлы HAR, которые человек мог сохранить в Downloads окна Chrome (разведка).</summary>
+    private static List<string> FindHarFiles()
+    {
+        var found = new List<string>();
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        foreach (var dir in new[] { Path.Combine(home, "Downloads"), "/root/Downloads", "/tmp" })
+        {
+            try
+            {
+                if (Directory.Exists(dir))
+                {
+                    found.AddRange(Directory.EnumerateFiles(dir, "*.har").Where(f => !found.Contains(f)));
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
+
+        return found;
     }
 
     /// <summary>Человек вошёл вручную (--fab-login): отметка «звали, не пришёл» больше не нужна.</summary>
