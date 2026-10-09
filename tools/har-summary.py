@@ -16,12 +16,18 @@ import re
 import sys
 from urllib.parse import urlsplit, parse_qsl
 
+# На сервере терминал бывает не в UTF-8 (LANG не задан): без этого русский текст не напечатается.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # Значения этих полей безопасно показывать (после маскирования почты и токенов).
 SAFE_KEYS = {
     "status", "state", "success", "ok", "code", "type", "currency", "currencycode", "price", "total",
     "totalprice", "discount", "discountedprice", "amount", "offerid", "offer_id", "license", "slug",
     "error", "errors", "detail", "message", "reason", "isfree", "free", "quantity", "count", "step",
     "result", "action", "method", "format", "kind",
+    "errorcode", "numericerrorcode", "errorname", "errorstatus", "orderstatus", "ordertype", "istotalpricezero",
+    "isdiscounttofree", "isfreetofree", "acquired", "mode", "plan_name",
 }
 # Значения таких полей — адреса: показываем только путь, без параметров.
 URL_KEYS = {"url", "next", "redirect", "redirecturl", "location", "returnurl", "href"}
@@ -42,6 +48,8 @@ LONG_ID = re.compile(r"^[0-9a-fA-F]{20,}$|^\d{7,}$")
 def mask_text(value):
     """Маскирует почту, длинные токены и идентификаторы; обрезает длинное."""
     text = str(value)
+    if re.fullmatch(r"errors\.com\.[\w.]+", text):
+        return text  # код ошибки Epic: не секрет, а по нему понятна причина отказа
     text = EMAIL.sub("<email>", text)
     text = UUID.sub(lambda m: m.group(0)[:8] + "…", text)
     if TOKENISH.match(text) and not text.isalpha():
