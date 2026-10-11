@@ -423,6 +423,8 @@ else
     fail "Нет Docker Compose. Установите пакет docker-compose-plugin и запустите ./deploy.sh снова."
     exit 1
 fi
+# Номер коммита — в строку «Версия» лога и сводки прогона (иначе не понять, какой код работает на сервере).
+BUILD_ARGS=(--build-arg "GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null)")
 ok "Docker: $("${DC[@]}" version --short 2>/dev/null || echo есть)"
 
 APP=("${DC[@]}" run --rm unity-assets --profile "$PROFILE" --quiet)
@@ -449,7 +451,7 @@ stop_here() {
 
 if [ "$FIRST_TIME" = 1 ]; then CHECK_DEFAULT=Y; else CHECK_DEFAULT=N; fi
 if ask_yes "Собрать и проверить всё по шагам?" "$CHECK_DEFAULT"; then
-    step "Шаг 1/5. Сборка образа (первый раз — несколько минут)" "${DC[@]}" build || stop_here
+    step "Шаг 1/5. Сборка образа (первый раз — несколько минут)" "${DC[@]}" build "${BUILD_ARGS[@]}" || stop_here
     step "Шаг 2/5. Браузер в контейнере открывает страницу входа Unity" "${APP[@]}" --check-login-page || stop_here
 
     # Каналы раньше бота: если Telegram заблокирован, здесь программа найдёт и запомнит
@@ -480,7 +482,7 @@ if ask_yes "Собрать и проверить всё по шагам?" "$CHEC
         step "Первый прогон" "${APP[@]}" --sources "$SOURCES_VALUE" --tg-only-new || stop_here
     fi
 elif [ "$SERVICE_RUNNING" = 0 ]; then
-    step "Сборка образа" "${DC[@]}" build || stop_here
+    step "Сборка образа" "${DC[@]}" build "${BUILD_ARGS[@]}" || stop_here
 fi
 
 bold "Служба"

@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 
 /// <summary>
 /// Предупреждение или ошибка из лога. Одинаковые по смыслу сложены вместе: числа и адреса при сравнении не
@@ -48,6 +49,15 @@ internal sealed class RunSummaryData
     /// <summary>Строка замера памяти (<see cref="MemorySampler.Describe"/>) или пусто.</summary>
     public string? Memory { get; init; }
 
+    /// <summary>Сколько раз восстанавливали вкладку и браузер («вкладка заменялась 2 раза…») или пусто.</summary>
+    public string? Browser { get; init; }
+
+    /// <summary>Почему прогон остановлен раньше времени из-за браузера, или пусто.</summary>
+    public string? BrowserStopReason { get; init; }
+
+    /// <summary>Названия ассетов по номерам (каталог, карточки каналов) — чтобы в списках были не голые номера.</summary>
+    public IReadOnlyDictionary<string, string> Names { get; init; } = new Dictionary<string, string>();
+
     public int CatalogCount { get; init; }
     public int CatalogWithSources { get; init; }
     public string RunLogPath { get; init; } = string.Empty;
@@ -79,6 +89,11 @@ internal static class RunSummary
             sb.AppendLine("‼ ПРОГОН ЗАВЕРШИЛСЯ ПАДЕНИЕМ. Причина — в errors.log; ниже то, что успело записаться.");
         }
 
+        if (!string.IsNullOrWhiteSpace(d.BrowserStopReason))
+        {
+            sb.AppendLine($"‼ ПРОГОН ОСТАНОВЛЕН: {d.BrowserStopReason}. Сделанное сохранено; следующий прогон продолжит с этого места.");
+        }
+
         if (d.Interrupted)
         {
             sb.AppendLine("⏹ ПРОГОН ПРЕРВАН (остановка или Ctrl+C). Сделанное сохранено в памяти профиля; следующий прогон не будет проверять это заново.");
@@ -98,8 +113,8 @@ internal static class RunSummary
 
         AppendTelegram(sb, d.Stats);
         AppendAssets(sb, d, items, duration);
-        AppendFailures(sb, items);
-        AppendAdded(sb, items);
+        AppendFailures(sb, items, d.Names);
+        AppendAdded(sb, items, d.Names);
         AppendWarnings(sb, d.Warnings);
 
         sb.AppendLine();
@@ -112,6 +127,11 @@ internal static class RunSummary
         if (!string.IsNullOrWhiteSpace(d.Memory))
         {
             sb.AppendLine($"Память: {d.Memory}.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(d.Browser))
+        {
+            sb.AppendLine($"Браузер: {d.Browser}.");
         }
 
         sb.AppendLine();
@@ -188,7 +208,7 @@ internal static class RunSummary
         }
     }
 
-    private static void AppendFailures(StringBuilder sb, List<ProcessResult> items)
+    private static void AppendFailures(StringBuilder sb, List<ProcessResult> items, IReadOnlyDictionary<string, string> names)
     {
         var bad = items.Where(i => i.Status is AssetProcessStatus.Failed or AssetProcessStatus.UnknownAfterClick
             or AssetProcessStatus.PromoNotApplied or AssetProcessStatus.NeedsHuman).ToList();
@@ -201,7 +221,7 @@ internal static class RunSummary
         sb.AppendLine($"-- Не вышло ({bad.Count}) --");
         foreach (var item in bad.Take(MaxFailures))
         {
-            sb.AppendLine($"• {UnityAssetAutomationApp.DescribeStatus(item.Status)} | {ShortName(item.Url)} | {Clip(item.Message, 140)}");
+            sb.AppendLine($"• {UnityAssetAutomationApp.DescribeStatus(item.Status)} | {ShortName(item.Url, names)} | {Clip(WithoutUrls(item.Message), 160)}");
         }
 
         if (bad.Count > MaxFailures)
@@ -210,7 +230,7 @@ internal static class RunSummary
         }
     }
 
-    private static void AppendAdded(StringBuilder sb, List<ProcessResult> items)
+    private static void AppendAdded(StringBuilder sb, List<ProcessResult> items, IReadOnlyDictionary<string, string> names)
     {
         var added = items.Where(i => i.Status is AssetProcessStatus.Added or AssetProcessStatus.WouldAddInDryRun).ToList();
         if (added.Count == 0)
@@ -222,7 +242,7 @@ internal static class RunSummary
         sb.AppendLine($"-- Добавлено (или добавилось бы) — {added.Count} --");
         foreach (var item in added.Take(MaxAdded))
         {
-            sb.AppendLine($"• {ShortName(item.Url)}{(item.PromoCode is null ? string.Empty : $" (промокод {item.PromoCode})")}");
+            sb.AppendLine($"• {ShortName(item.Url, names)}{(item.PromoCode is null ? string.Empty : $" (промокод {item.PromoCode})")}");
         }
 
         if (added.Count > MaxAdded)
@@ -252,9 +272,18 @@ internal static class RunSummary
         }
     }
 
-    /// <summary>Хвост адреса: «foo-123456» вместо https://assetstore.unity.com/packages/tools/gui/foo-123456.</summary>
-    internal static string ShortName(string url)
+    /// <summary>
+    /// Короткое имя ассета: «Название (123456)», если название известно (каталог, карточка канала), иначе хвост адреса —
+    /// «foo-123456» у обычного адреса, «foo (123456)» у адреса из каналов /packages/foo/123456.
+    /// </summary>
+    internal static string ShortName(string url, IReadOnlyDictionary<string, string>? names = null)
     {
+        var id = UnityAssetAutomationApp.ExtractPackageId(url);
+        if (id is not null && names is not null && names.TryGetValue(id, out var name) && !string.IsNullOrWhiteSpace(name))
+        {
+            return $"{name.Trim()} ({id})";
+        }
+
         var trimmed = url.TrimEnd('/');
         var cut = trimmed.IndexOf('?');
         if (cut > 0)
@@ -262,9 +291,21 @@ internal static class RunSummary
             trimmed = trimmed[..cut];
         }
 
-        var last = trimmed[(trimmed.LastIndexOf('/') + 1)..];
+        var parts = trimmed.Split('/');
+        var last = parts[^1];
+        if (id is not null && last == id && parts.Length >= 2 && parts[^2] is not ("package" or "packages"))
+        {
+            return $"{parts[^2]} ({id})";
+        }
+
         return last.Length > 0 ? last : url;
     }
+
+    private static readonly Regex UrlRegex = new(@"https?://\S+", RegexOptions.Compiled);
+
+    /// <summary>Сообщение без адресов: ассет уже назван в начале строки, адрес в сообщении только удлиняет её.</summary>
+    internal static string WithoutUrls(string? text) =>
+        UrlRegex.Replace(text ?? string.Empty, "…").Replace("( …)", string.Empty).Replace("(…)", string.Empty);
 
     private static string Clip(string? text, int max)
     {

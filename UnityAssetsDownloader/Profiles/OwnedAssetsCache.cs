@@ -25,6 +25,11 @@ internal sealed class OwnedAssetsCache
 
     public string FilePath => _path;
 
+    /// <summary>Заголовок файла при загрузке (первая строка «# …») — по нему видно, по какому правилу файл записан.</summary>
+    public string? LoadedTitle { get; private set; }
+
+    public IEnumerable<string> Items => _urls;
+
     private void Load()
     {
         try
@@ -37,6 +42,11 @@ internal sealed class OwnedAssetsCache
             foreach (var line in File.ReadAllLines(_path))
             {
                 var url = line.Trim();
+                if (LoadedTitle is null && url.StartsWith("# ", StringComparison.Ordinal))
+                {
+                    LoadedTitle = url[2..];
+                }
+
                 if (url.Length > 0 && !url.StartsWith('#'))
                 {
                     _urls.Add(url);
@@ -64,6 +74,14 @@ internal sealed class OwnedAssetsCache
     public void Add(string url)
     {
         if (!string.IsNullOrWhiteSpace(url) && _urls.Add(url.Trim()))
+        {
+            _changed = true;
+        }
+    }
+
+    public void Remove(string url)
+    {
+        if (!string.IsNullOrWhiteSpace(url) && _urls.Remove(url.Trim()))
         {
             _changed = true;
         }

@@ -217,7 +217,8 @@ echo "  Время:    на нашем сервере около 45 с на ка
 
 mkdir -p logs data
 echo "  Проверяю образ…"
-"${DC[@]}" build >/dev/null 2>&1 || { fail "Образ не собрался: ${DC[*]} build"; exit 1; }
+# Номер коммита — в строку «Версия» сводки (иначе по сводке не понять, какой код работал).
+"${DC[@]}" build --build-arg "GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null)" >/dev/null 2>&1 || { fail "Образ не собрался: ${DC[*]} build"; exit 1; }
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 ARGS_PASS=(--inner "$STAMP")

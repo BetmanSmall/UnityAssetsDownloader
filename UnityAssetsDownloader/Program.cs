@@ -280,6 +280,7 @@ internal sealed partial class UnityAssetAutomationApp
     private OwnedAssetsCache? _ownedCache;
     private OwnedAssetsCache? _deprecatedCache;
     private OwnedAssetsCache? _unaddableCache;
+    private OwnedAssetsCache? _unconfirmedCache;
     private OwnedAssetsCache? _rejectedPromoCache;
     private readonly TelegramNotifier? _notifier;
 
@@ -377,8 +378,27 @@ internal sealed partial class UnityAssetAutomationApp
 
     private bool _runCrashed;
 
-    /// <summary>Замер памяти за весь прогон (сервер, --watch). null — не запущен.</summary>
+    /// <summary>Замер памяти за весь прогон (служба и любой прогон в контейнере). null — не запущен.</summary>
     private MemorySampler? _memory;
+
+    /// <summary>Браузер и вкладка магазина этого прогона (счётчики восстановлений — в сводку).</summary>
+    private BrowserKeeper? _browserKeeper;
+
+    /// <summary>Каталог библиотеки этого прогона — названия ассетов для сводки.</summary>
+    private AssetCatalog? _runCatalog;
+
+    /// <summary>Почему прогон остановлен из-за браузера, или null.</summary>
+    private string? _browserStopReason;
+
+    /// <summary>Сколько раз подряд можно восстанавливать вкладку, не проверив между этим ни одного ассета.</summary>
+    private const int MaxBrowserRecoveriesInRow = 3;
+
+    /// <summary>
+    /// Заголовок unaddable_assets.txt по правилу 1.32.0. Файл со старым заголовком записан по старому правилу,
+    /// и его ассеты получают ещё одну попытку.
+    /// </summary>
+    internal const string UnaddableTitle =
+        "Ассеты, которые магазин не добавил на аккаунт два раза (в разных прогонах), и в «My Assets» их нет.";
 
     private bool MarkRunCrashed()
     {
@@ -393,8 +413,9 @@ internal sealed partial class UnityAssetAutomationApp
             Directory.CreateDirectory(_dataDirectory);
             Directory.CreateDirectory(_logsDirectory);
 
-            // Сервер: следим за памятью весь прогон — на тесной общей машине это главный вопрос.
-            if (_options.Watch)
+            // Сервер: следим за памятью весь прогон — на тесной общей машине это главный вопрос. В контейнере — и в
+            // разовом прогоне (backfill.sh): 10.10 вкладка умерла посреди такого прогона, а замера не было.
+            if (_options.Watch || File.Exists("/.dockerenv"))
             {
                 _memory = MemorySampler.Start();
             }
@@ -601,11 +622,6 @@ internal sealed partial class UnityAssetAutomationApp
             // Постоянная папка браузера. Без неё Chrome каждый раз стартует пустым,
             // как в режиме инкогнито: ни истории, ни расширений, ни сохранённого входа.
             var userDataDir = ResolveChromeUserDataDir();
-            if (!_options.UseSystemChromeProfile)
-            {
-                RemoveStaleChromeLock(userDataDir);
-            }
-
             _logger.Debug($"Аргументы браузера: {string.Join(" ", browserArgs)}");
 
             var launchOptions = new LaunchOptions
@@ -622,30 +638,32 @@ internal sealed partial class UnityAssetAutomationApp
                 launchOptions.ExecutablePath = chromePath;
             }
 
-            var browser = await LaunchBrowserWithRetryAsync(launchOptions);
+            // Браузер и вкладка переживают смерть вкладки и самого браузера. Вкладку каждый раз берём из keeper.Page,
+            // а не из переменной: после восстановления это уже другая вкладка. Папку профиля от убитого браузера
+            // нужно разблокировать и при первом запуске, и при перезапуске — поэтому это внутри launch.
+            var keeper = await BrowserKeeper.StartAsync(
+                () =>
+                {
+                    if (!_options.UseSystemChromeProfile)
+                    {
+                        RemoveStaleChromeLock(userDataDir);
+                    }
 
-            await using (browser)
+                    return LaunchBrowserWithRetryAsync(launchOptions);
+                },
+                PreparePageAsync,
+                _logger.Info,
+                _logger.Warn);
+            _browserKeeper = keeper;
+
+            await using (keeper)
             {
-            var browserVersion = await browser.GetVersionAsync();
+            var browserVersion = await keeper.Browser.GetVersionAsync();
             _logger.Info($"Браузер запущен: {browserVersion} | headless={_options.Headless}");
-
-            await using var page = await browser.NewPageAsync();
-            page.DefaultNavigationTimeout = _options.NavigationTimeoutMs;
-            page.DefaultTimeout = _options.NavigationTimeoutMs;
-
-            // Скрываем признаки Puppeteer (чтобы пускал Google OAuth)
-            await page.EvaluateFunctionOnNewDocumentAsync(@"() => {
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            }");
-
-            var ua = await browser.GetUserAgentAsync();
-            await page.SetUserAgentAsync(ua.Replace("HeadlessChrome", "Chrome"));
-
-            AttachPageDiagnostics(page);
 
             if (_options.CheckLoginPage)
             {
-                await CheckSignInPageAsync(page);
+                await CheckSignInPageAsync(keeper.Page);
                 return;
             }
 
@@ -653,7 +671,7 @@ internal sealed partial class UnityAssetAutomationApp
             // не трогая аккаунт и не дожидаясь авторизации.
             if (_options.CheckTelegram)
             {
-                await CheckTelegramAsync(browser);
+                await CheckTelegramAsync(keeper.Browser);
                 return;
             }
 
@@ -668,7 +686,7 @@ internal sealed partial class UnityAssetAutomationApp
                     return known;
                 }
 
-                authenticated = await EnsureAuthenticatedAsync(page);
+                authenticated = await EnsureAuthenticatedAsync(keeper.Page);
                 if (authenticated == true)
                 {
                     return true;
@@ -696,7 +714,7 @@ internal sealed partial class UnityAssetAutomationApp
                     return;
                 }
 
-                var whoami = await TryReadSignedInUserAsync(page);
+                var whoami = await TryReadSignedInUserAsync(keeper.Page);
                 _logger.Info("============================================================");
                 _logger.Info(" ГОТОВО. ВЫ ВОШЛИ В UNITY.");
                 _logger.Info($" Профиль: {_profileName}");
@@ -713,12 +731,12 @@ internal sealed partial class UnityAssetAutomationApp
 
             if (_options.BuildCatalog)
             {
-                await BuildCatalogAsync(page, EnsureLoggedInAsync);
+                await BuildCatalogAsync(keeper.Page, EnsureLoggedInAsync);
                 return;
             }
 
             var sources = ResolveSources();
-            var assetUrls = await CollectAssetUrlsAsync(page, sources);
+            var assetUrls = await CollectAssetUrlsAsync(keeper.Page, sources);
             if (sources.Count > 0 && ListSourcesSchedule.Applies(_options))
             {
                 ListSourcesSchedule.MarkDone(_profileStore.GetProfileDirectory(_profileName), DateTime.UtcNow);
@@ -739,16 +757,31 @@ internal sealed partial class UnityAssetAutomationApp
             // Каталог библиотеки: всё, что уже есть на аккаунте, по номерам. Точнее памяти профиля —
             // там только то, что эта программа сама проверяла.
             var catalog = AssetCatalog.Load(profileDirectory);
+            _runCatalog = catalog;
 
             // Ассеты, которые магазин не добавляет на аккаунт: на запрос добавления он отвечает без права на ассет
-            // (userEntitlement: null), хотя плашка «Added to My Assets» всё равно появляется. Две попытки — и хватит.
-            var unaddableCache = new OwnedAssetsCache(
-                profileDirectory, "unaddable_assets.txt",
-                "Ассеты, которые магазин не добавил на аккаунт с двух попыток (плашка «Added» есть, а в «My Assets» их нет).");
+            // (userEntitlement: null), хотя плашка «Added to My Assets» всё равно появляется. Две попытки — и хватит:
+            // первая неудача кладёт ассет в «не подтверждено», вторая (в следующем прогоне) — сюда. Оба раза ассета
+            // нет в «My Assets» (ReconcileUnclearAsync).
+            var unaddableCache = new OwnedAssetsCache(profileDirectory, "unaddable_assets.txt", UnaddableTitle);
+            var unconfirmedCache = new OwnedAssetsCache(
+                profileDirectory, "unconfirmed_assets.txt",
+                "Ассеты, которые не добавились с первого раза (в «My Assets» их нет). Следующий прогон попробует ещё раз; " +
+                "не выйдет и тогда — ассет уйдёт в unaddable_assets.txt.");
+
+            // До 1.32.0 ассет попадал в «не добавляется» после первой же неудачи, а на медленном сервере неудачей
+            // считалось и «страница не успела показать» (10.10: три таких ассета). Старому списку — ещё одна попытка.
+            var legacyUnaddable = MigrateLegacyUnaddable(unaddableCache, unconfirmedCache);
+            if (legacyUnaddable > 0)
+            {
+                _logger.Info($"Список «магазин не добавляет» ({legacyUnaddable}) записан по старому правилу — каждому ассету ещё одна " +
+                             "попытка (теперь решение — после сверки со списком «My Assets»).");
+            }
 
             _ownedCache = ownedCache;
             _deprecatedCache = deprecatedCache;
             _unaddableCache = unaddableCache;
+            _unconfirmedCache = unconfirmedCache;
             _rejectedPromoCache = rejectedPromoCache;
             var skippedKnown = 0;
             var skippedDeprecated = 0;
@@ -864,7 +897,7 @@ internal sealed partial class UnityAssetAutomationApp
                 }
                 else
                 {
-                    var tgResult = await ReadTelegramOnceAsync(browser);
+                    var tgResult = await ReadTelegramOnceAsync(keeper.Browser);
                     await ReportTelegramResultAsync(tgResult, assetPromocodes);
                     assetUrls.AddRange(tgResult.AssetUrls);
                 }
@@ -917,7 +950,7 @@ internal sealed partial class UnityAssetAutomationApp
                 {
                     _logger.Info($"==== Telegram: собираем пачку №{batchNo + 1} (нужно ещё {need} новых ассетов) ====");
                     var tg = await ParseTelegramChannelsAsync(
-                        browser, telegramCursors!, need,
+                        keeper.Browser, telegramCursors!, need,
                         url => !seen.Contains(url) && (_options.RecheckOwned || (!ownedCache.Contains(url) && !deprecatedCache.Contains(url) && !unaddableCache.Contains(url) && !catalog.ContainsUrl(url))),
                         maxPostsPerChannel: int.MaxValue, maxPagesPerChannel: int.MaxValue);
 
@@ -954,6 +987,85 @@ internal sealed partial class UnityAssetAutomationApp
             var index = 0;
             var stoppedEarly = false;
 
+            // Восстановлений вкладки подряд без единого нормально проверенного ассета. Больше MaxBrowserRecoveriesInRow —
+            // браузер на этой машине не держится (вероятнее всего, не хватает памяти), и гнать очередь дальше
+            // бессмысленно: каждый ассет стал бы ошибкой. Прогон останавливается, следующий продолжит с этого места.
+            var recoveriesInRow = 0;
+            async Task<bool> EnsureBrowserAliveAsync(string reason)
+            {
+                if (await keeper.IsAliveAsync())
+                {
+                    return true;
+                }
+
+                if (++recoveriesInRow > MaxBrowserRecoveriesInRow)
+                {
+                    _browserStopReason = $"браузер не держится: {MaxBrowserRecoveriesInRow} восстановления подряд, а ассеты всё равно не открываются";
+                    _logger.Error($"[Браузер] Прогон остановлен — {_browserStopReason}. Сделанное сохранено; следующий прогон продолжит с этого места.");
+                    return false;
+                }
+
+                var restartsBefore = keeper.BrowserRestarts;
+                var memory = MemoryProbe.Read();
+                var memoryNote = memory.AvailableMb is { } free
+                    ? $" Память сейчас: в системе доступно {free} МБ{(memory.SwapTotalMb is > 0 ? $", подкачка {memory.SwapUsedMb} из {memory.SwapTotalMb} МБ" : string.Empty)}."
+                    : string.Empty;
+                if (!await keeper.RecoverAsync(reason + memoryNote))
+                {
+                    _browserStopReason = "браузер не удалось ни восстановить, ни перезапустить";
+                    _logger.Error($"[Браузер] Прогон остановлен — {_browserStopReason}. Сделанное сохранено; следующий прогон продолжит с этого места.");
+                    return false;
+                }
+
+                if (keeper.BrowserRestarts != restartsBefore)
+                {
+                    // Новый браузер: вход проверяем заново, как при запуске программы.
+                    authenticated = null;
+                }
+
+                return true;
+            }
+
+            // «Кнопка нажата, но страница не показала ассет на аккаунте» решается не сразу, а по списку «My Assets» —
+            // одним запросом из страницы магазина, в конце пачки (ассет успевает дойти до библиотеки даже на медленном
+            // сервере). Есть в списке — добавлен. Нет — первая неудача («не подтверждено», следующий прогон попробует
+            // снова) или вторая («не добавляется», больше не открываем). Список не получен — тоже считается попыткой:
+            // если ассет на самом деле на аккаунте, следующий прогон увидит это на его странице.
+            var unclear = new List<ProcessResult>();
+            async Task ReconcileUnclearAsync()
+            {
+                if (unclear.Count == 0)
+                {
+                    return;
+                }
+
+                HashSet<string>? library = null;
+                try
+                {
+                    if (await EnsureBrowserAliveAsync("Вкладка браузера не отвечает перед сверкой с «My Assets»."))
+                    {
+                        var fetched = await MyAssetsLibrary.FetchOwnedIdsAsync(keeper.Page);
+                        if (fetched.Error is null && fetched.Ids.Count > 0)
+                        {
+                            library = fetched.Ids.ToHashSet(StringComparer.Ordinal);
+                            HealUnaddable(library);
+                        }
+                        else
+                        {
+                            _logger.Warn($"[Проверка] Список «My Assets» не получен ({fetched.Error ?? "пустой ответ"}) — неподтверждённые попробуем в следующем прогоне.");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn($"[Проверка] Список «My Assets» не получен ({ex.Message}) — неподтверждённые попробуем в следующем прогоне.");
+                }
+
+                newlyAddedCount += ApplyUnclearVerdicts(unclear, library, ownedCache, unconfirmedCache, unaddableCache, _logger.Info);
+                unclear.Clear();
+                SaveCaches();
+            }
+
             bool LimitReached() =>
                 (_options.MaxAddAttempts.HasValue && newlyAddedCount >= _options.MaxAddAttempts.Value) ||
                 (_options.MaxVisitedAssets.HasValue && index >= _options.MaxVisitedAssets.Value);
@@ -973,9 +1085,10 @@ internal sealed partial class UnityAssetAutomationApp
                         break;
                     }
 
-                    // Пачка проверена: что в ней добавилось, сразу идёт в каталог.
+                    // Пачка проверена: неподтверждённое сверяем с «My Assets», добавленное сразу идёт в каталог.
                     if (batchNo > 0)
                     {
+                        await ReconcileUnclearAsync();
                         await SaveCatalogProgressAsync(catalog, report);
                     }
 
@@ -1019,6 +1132,13 @@ internal sealed partial class UnityAssetAutomationApp
                     continue;
                 }
 
+                // Вкладка могла умереть на прошлом ассете или пока читались каналы.
+                if (!await EnsureBrowserAliveAsync("Вкладка браузера не отвечает."))
+                {
+                    stoppedEarly = true;
+                    break;
+                }
+
                 // Место, где проверенный вход впервые нужен. Не вошли — ассеты не трогаем, и
                 // «где остановились в каналах» не запоминаем: следующий прогон возьмёт их снова.
                 if (!await EnsureLoggedInAsync())
@@ -1038,12 +1158,43 @@ internal sealed partial class UnityAssetAutomationApp
                     promoCode = null;
                 }
 
-                var result = await ProcessAssetAsync(page, assetUrl, promoCode);
+                var result = await ProcessAssetAsync(keeper.Page, assetUrl, promoCode);
+
+                // Вкладка умерла посреди ассета — ошибка не про ассет. Восстанавливаемся и проверяем его ещё раз (в лимит
+                // страниц повтор не идёт). Умерла и на повторе — дело, видимо, в самом ассете: пишем ошибку и идём дальше.
+                if (result.Status == AssetProcessStatus.Failed && !await keeper.IsAliveAsync())
+                {
+                    if (!await EnsureBrowserAliveAsync($"Вкладка браузера умерла на ассете {assetUrl}."))
+                    {
+                        // Ассет не проверен и никуда не записан — следующий прогон возьмёт его снова.
+                        stoppedEarly = true;
+                        break;
+                    }
+
+                    if (!await EnsureLoggedInAsync())
+                    {
+                        return;
+                    }
+
+                    _logger.Info($"[{label}] Повтор после восстановления браузера: {assetUrl}");
+                    result = await ProcessAssetAsync(keeper.Page, assetUrl, promoCode);
+                    if (result.Status == AssetProcessStatus.Failed && !await keeper.IsAliveAsync())
+                    {
+                        result.Message = $"Вкладка браузера умирает на этом ассете (два раза подряд). {result.Message}";
+                    }
+                }
+
+                if (result.Status != AssetProcessStatus.Failed || await keeper.IsAliveAsync())
+                {
+                    recoveriesInRow = 0;
+                }
+
                 report.Items.Add(result);
 
                 if (result.Status is AssetProcessStatus.Added or AssetProcessStatus.AlreadyOwned)
                 {
                     ownedCache.Add(assetUrl);
+                    unconfirmedCache.Remove(assetUrl);
                 }
                 else if (result.Status == AssetProcessStatus.Deprecated)
                 {
@@ -1051,7 +1202,7 @@ internal sealed partial class UnityAssetAutomationApp
                 }
                 else if (result.Status == AssetProcessStatus.UnknownAfterClick)
                 {
-                    unaddableCache.Add(assetUrl);
+                    unclear.Add(result);
                 }
                 else if (result.Status == AssetProcessStatus.PromoNotApplied && promoCode != null)
                 {
@@ -1107,8 +1258,26 @@ internal sealed partial class UnityAssetAutomationApp
                 }
             }
 
+            await ReconcileUnclearAsync();
             SaveCaches();
-            await UpdateCatalogAfterRunAsync(page, catalog, report, EnsureLoggedInAsync);
+
+            // Каталог и сохранение входа — с живой вкладки (если браузер так и не восстановился, их просто пропускаем).
+            var browserAlive = _browserStopReason is null && await EnsureBrowserAliveAsync("Вкладка браузера не отвечает в конце прогона.");
+            if (browserAlive)
+            {
+                await UpdateCatalogAfterRunAsync(keeper.Page, catalog, report, EnsureLoggedInAsync);
+            }
+            else
+            {
+                // Добавленное — в каталог и без браузера (данные ассетов берутся запросом к магазину).
+                await SaveCatalogProgressAsync(catalog, report);
+            }
+
+            if (_browserStopReason is not null)
+            {
+                await NotifyAsync($"⚠️ Прогон остановлен (профиль {_profileName}): {_browserStopReason}. " +
+                                  "Сделанное сохранено, следующий прогон продолжит с этого места. Подробности — в сводке прогона.");
+            }
             _summarySkippedKnown = skippedKnown;
             _summarySkippedUnaddable = skippedUnaddable;
             _summarySkippedDeprecated = skippedDeprecated;
@@ -1134,9 +1303,9 @@ internal sealed partial class UnityAssetAutomationApp
 
             // За прогон магазин мог продлить cookies ещё раз — уходим со свежими.
             // Только если вход проверен: иначе в файл легли бы cookies гостя.
-            if (authenticated == true)
+            if (authenticated == true && browserAlive)
             {
-                await SaveSessionCookiesQuietlyAsync(page);
+                await SaveSessionCookiesQuietlyAsync(keeper.Page);
             }
             else
             {
@@ -1232,6 +1401,9 @@ internal sealed partial class UnityAssetAutomationApp
                 SkippedUnaddable = _summarySkippedUnaddable,
                 SkippedDeprecated = _summarySkippedDeprecated,
                 Memory = memoryText,
+                Browser = DescribeBrowserRecoveries(),
+                BrowserStopReason = _browserStopReason,
+                Names = SummaryNames(report),
                 CatalogCount = _summaryCatalogCount,
                 CatalogWithSources = _summaryCatalogWithSources,
                 RunLogPath = _logger.LogFilePath ?? string.Empty,
@@ -1260,6 +1432,38 @@ internal sealed partial class UnityAssetAutomationApp
         {
             _logger.Warn($"Сводку прогона записать не удалось: {ex.Message}");
         }
+    }
+
+    private string? DescribeBrowserRecoveries()
+    {
+        if (_browserKeeper is not { } k || k.TabsReplaced + k.BrowserRestarts == 0)
+        {
+            return null;
+        }
+
+        static string Times(int n) => n % 10 is >= 2 and <= 4 && n % 100 is < 12 or > 14 ? $"{n} раза" : $"{n} раз";
+        return $"вкладка умирала и заменялась новой {Times(k.TabsReplaced)}, браузер перезапускался {Times(k.BrowserRestarts)}";
+    }
+
+    /// <summary>Названия ассетов отчёта: из каталога, а у новых — из карточек каналов.</summary>
+    private Dictionary<string, string> SummaryNames(RunReport report)
+    {
+        var names = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var id in report.Items.Select(i => ExtractPackageId(i.Url)).OfType<string>().Distinct())
+        {
+            var name = _runCatalog?.Get(id)?.Name;
+            if (string.IsNullOrWhiteSpace(name) && _channelCards.TryGetValue(id, out var card))
+            {
+                name = card.Title;
+            }
+
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                names[id] = name;
+            }
+        }
+
+        return names;
     }
 
     private string DescribeRunMode()
@@ -2844,6 +3048,9 @@ internal sealed partial class UnityAssetAutomationApp
             return false;
         }
 
+        // Заодно: что считалось «не добавляется», а на самом деле есть на аккаунте, — исправляем.
+        HealUnaddable(library.Ids.ToHashSet(StringComparer.Ordinal));
+
         var now = DateTime.UtcNow;
         var toFetch = catalog.ApplyLibrary(library.Ids, now, refreshAll);
         _logger.Info($"[Каталог] В библиотеке аккаунта{(library.UserName is null ? "" : " " + library.UserName)}: {library.Ids.Count} ассетов. " +
@@ -2987,7 +3194,112 @@ internal sealed partial class UnityAssetAutomationApp
         _ownedCache?.Save();
         _deprecatedCache?.Save();
         _unaddableCache?.Save();
+        _unconfirmedCache?.Save();
         _rejectedPromoCache?.Save();
+    }
+
+    /// <summary>
+    /// Старый unaddable_assets.txt (до 1.32.0 ассет попадал туда после первой же неудачи) — его ассеты переходят в
+    /// «не подтверждено» и получают ещё одну попытку. Возвращает, сколько перенесено; повторный вызов ничего не меняет.
+    /// </summary>
+    internal static int MigrateLegacyUnaddable(OwnedAssetsCache unaddable, OwnedAssetsCache unconfirmed)
+    {
+        if (unaddable.Count == 0 || unaddable.LoadedTitle == UnaddableTitle)
+        {
+            return 0;
+        }
+
+        var legacy = unaddable.Items.ToList();
+        legacy.ForEach(unconfirmed.Add);
+        unaddable.Clear();
+        return legacy.Count;
+    }
+
+    /// <summary>
+    /// Решение по ассетам «кнопка нажата, добавление не подтвердилось» после сверки со списком «My Assets»
+    /// (library null — список не получен): есть в списке — добавлен; нет, и это уже вторая неудача — «не добавляется»
+    /// (больше не открываем); первая — «не подтверждено», следующий прогон попробует снова. Возвращает, сколько
+    /// оказалось добавленными.
+    /// </summary>
+    internal static int ApplyUnclearVerdicts(
+        IEnumerable<ProcessResult> unclear, IReadOnlySet<string>? library,
+        OwnedAssetsCache owned, OwnedAssetsCache unconfirmed, OwnedAssetsCache unaddable, Action<string> log)
+    {
+        var added = 0;
+        foreach (var item in unclear)
+        {
+            var id = ExtractPackageId(item.Url);
+            if (library is not null && id is not null && library.Contains(id))
+            {
+                item.Status = AssetProcessStatus.Added;
+                item.CountsTowardsAddLimit = true;
+                item.Message = "Добавлен: есть в списке «My Assets» (страница не успела это показать).";
+                owned.Add(item.Url);
+                unconfirmed.Remove(item.Url);
+                added++;
+                log($"[УСПЕХ] Подтверждён по списку «My Assets»: {item.Url}");
+            }
+            else if (unconfirmed.Contains(item.Url))
+            {
+                unconfirmed.Remove(item.Url);
+                unaddable.Add(item.Url);
+                item.Message = $"{item.Message} Не добавился и во второй раз — больше не открываем (unaddable_assets.txt).".Trim();
+                log($"[Проверка] Не добавился и во второй раз, больше не пробуем: {item.Url}");
+            }
+            else
+            {
+                unconfirmed.Add(item.Url);
+                item.Message = $"{item.Message} {(library is null ? string.Empty : "В «My Assets» его нет. ")}Попробуем ещё раз в следующем прогоне.".Trim();
+                log($"[Проверка] Не подтвердился с первого раза, следующий прогон попробует снова: {item.Url}");
+            }
+        }
+
+        return added;
+    }
+
+    /// <summary>
+    /// Ассеты из «не добавляется» и «не подтверждено», которые всё-таки есть в «My Assets» (страница на медленной
+    /// машине не успела это показать), — убираем оттуда и запоминаем как добавленные.
+    /// </summary>
+    private void HealUnaddable(IReadOnlySet<string> libraryIds)
+    {
+        var healed = new List<string>();
+        foreach (var cache in new[] { _unaddableCache, _unconfirmedCache })
+        {
+            if (cache is null)
+            {
+                continue;
+            }
+
+            foreach (var url in cache.Items.Where(u => ExtractPackageId(u) is { } id && libraryIds.Contains(id)).ToList())
+            {
+                cache.Remove(url);
+                _ownedCache?.Add(url);
+                healed.Add(url);
+            }
+        }
+
+        if (healed.Count > 0)
+        {
+            _logger.Info($"[Проверка] Есть в «My Assets», хотя считались не добавленными: {string.Join(", ", healed.Distinct().Select(u => ExtractPackageId(u)))} — исправили.");
+        }
+    }
+
+    /// <summary>Настройка каждой вкладки магазина (и новой — после смерти прежней): таймауты, без признаков автоматизации, диагностика.</summary>
+    private async Task PreparePageAsync(IBrowser browser, IPage page)
+    {
+        page.DefaultNavigationTimeout = _options.NavigationTimeoutMs;
+        page.DefaultTimeout = _options.NavigationTimeoutMs;
+
+        // Скрываем признаки Puppeteer (чтобы пускал Google OAuth)
+        await page.EvaluateFunctionOnNewDocumentAsync(@"() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            }");
+
+        var ua = await browser.GetUserAgentAsync();
+        await page.SetUserAgentAsync(ua.Replace("HeadlessChrome", "Chrome"));
+
+        AttachPageDiagnostics(page);
     }
 
     /// <summary>Пользователь нажал Ctrl+C — успеваем записать память профиля.</summary>
@@ -5654,6 +5966,8 @@ internal sealed partial class UnityAssetAutomationApp
                     return result;
                 }
 
+                // Ответ магазина на добавление слушаем с первого клика: он точнее страницы (см. AddToDownloadWatcher).
+                using var storeAnswer = new AddToDownloadWatcher(page, ExtractPackageId(page.Url) ?? ExtractPackageId(assetUrl));
                 var clicked = await TryClickAddButtonAsync(page);
 
                 // Главная кнопка иногда дорисовывается позже кнопок «похожих» ассетов (пока бледная заглушка):
@@ -5684,7 +5998,9 @@ internal sealed partial class UnityAssetAutomationApp
                 var postStatus = await VerifyPostAddStatusAsync(
                     page,
                     assetUrl,
-                    TimeSpan.FromMilliseconds(Math.Max(12000, Math.Min(_options.AssetUiTimeoutMs, 45000))));
+                    TimeSpan.FromMilliseconds(Math.Max(12000, Math.Min(_options.AssetUiTimeoutMs, 45000))),
+                    storeAnswer);
+                result.StoreAnswer = storeAnswer.Answer;
 
                 result.PurchasedOnText = postStatus.PurchasedOnText ?? result.PurchasedOnText;
                 result.DetectionSummary = string.IsNullOrWhiteSpace(postStatus.DetectionSummary)
@@ -5700,17 +6016,22 @@ internal sealed partial class UnityAssetAutomationApp
                     continue;
                 }
 
-                result.Status = (postStatus.HasOpenInUnity || postStatus.IsOwned)
+                result.Status = (postStatus.HasOpenInUnity || postStatus.IsOwned || result.StoreAnswer == StoreAddAnswer.Granted)
                     ? AssetProcessStatus.Added
                     : AssetProcessStatus.UnknownAfterClick;
 
                 if (result.Status == AssetProcessStatus.Added)
                 {
-                    _logger.Info($"[УСПЕХ] Ассет успешно добавлен на аккаунт: {assetUrl}");
+                    _logger.Info($"[УСПЕХ] Ассет успешно добавлен на аккаунт: {assetUrl}" +
+                                 (result.StoreAnswer == StoreAddAnswer.Granted && !postStatus.HasOpenInUnity ? " (магазин подтвердил ответом на запрос)" : string.Empty));
                 }
                 else
                 {
-                    _logger.Info($"[Внимание] Кнопка добавления была нажата, но статус добавления не подтвержден: {assetUrl} (Сигналы: {result.DetectionSummary})");
+                    // Окончательно решит сверка со списком «My Assets» в конце пачки.
+                    result.Message = result.StoreAnswer == StoreAddAnswer.Refused
+                        ? "Магазин ответил, что не добавил ассет (userEntitlement: null)."
+                        : "Кнопка нажата, но ни страница, ни ответ магазина не подтвердили добавление.";
+                    _logger.Info($"[Внимание] {result.Message} {assetUrl} (Сигналы: {result.DetectionSummary}). Сверим со списком «My Assets».");
                 }
                 return result;
             }
@@ -7631,17 +7952,32 @@ internal sealed partial class UnityAssetAutomationApp
         }
     }
 
-    private async Task<AssetStatusSnapshot> VerifyPostAddStatusAsync(IPage page, string assetUrl, TimeSpan timeout)
+    private async Task<AssetStatusSnapshot> VerifyPostAddStatusAsync(
+        IPage page, string assetUrl, TimeSpan timeout, AddToDownloadWatcher? storeAnswer = null)
     {
         var stopAt = DateTime.UtcNow.Add(timeout);
         AssetStatusSnapshot? lastStatus = null;
         var refreshAttempt = 0;
         var cycle = 0;
 
+        // Магазин уже выдал право на ассет — страницу перезагружать и ждать незачем (на сервере это 20–30 с).
+        bool Granted() => storeAnswer?.Answer == StoreAddAnswer.Granted;
+        AssetStatusSnapshot GrantedStatus() => new()
+        {
+            IsFree = true,
+            IsOwned = true,
+            DetectionSummary = "магазин выдал право на ассет (ответ AddToDownload: userEntitlement)"
+        };
+
         while (DateTime.UtcNow < stopAt)
         {
             cycle++;
             await Task.Delay(900);
+            if (Granted())
+            {
+                return GrantedStatus();
+            }
+
             await WaitForAssetSignalsAsync(page, TimeSpan.FromMilliseconds(Math.Min(_options.AssetUiTimeoutMs, 12000)));
             var current = await DetectStatusAsync(page);
             lastStatus = current;
@@ -7677,6 +8013,11 @@ internal sealed partial class UnityAssetAutomationApp
                 {
                     _logger.Debug($"PostAddCycle[{cycle}]: магазин показал «Added to My Assets», даём ему закончить и обновляем страницу.");
                     await Task.Delay(1500);
+                    if (Granted())
+                    {
+                        return GrantedStatus();
+                    }
+
                     refreshAttempt++;
                     await SafeGoToAsync(page, assetUrl);
                     await WaitForAssetSignalsAsync(page,
@@ -9782,6 +10123,9 @@ internal sealed class ProcessResult
 
     /// <summary>Fab: ассет получил человек в обычном окне (раздача, лицензия), а не программа.</summary>
     public bool AddedByHuman { get; set; }
+
+    /// <summary>Что магазин ответил на запрос добавления (None — ответа не видели или не добавляли).</summary>
+    public StoreAddAnswer StoreAnswer { get; set; }
 }
 
 internal sealed class AssetStatusSnapshot
