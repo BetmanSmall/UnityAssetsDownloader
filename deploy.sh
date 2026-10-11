@@ -497,7 +497,8 @@ else
     QUESTION="Запустить службу? Дальше она сама проверяет каналы раз в $INTERVAL."
 fi
 if ask_yes "$QUESTION" Y; then
-    "${DC[@]}" up -d --build || {
+    # Сборка — отдельно и с номером коммита (иначе в строке «Версия» службы его нет), потом запуск.
+    { "${DC[@]}" build "${BUILD_ARGS[@]}" && "${DC[@]}" up -d; } || {
         fail "Служба не запустилась. Если в выводе выше «port is already allocated» — порт $FAB_PORT занят: задайте другой (FAB_VNC_PORT=… в .env) и запустите ./deploy.sh снова."
         exit 1
     }

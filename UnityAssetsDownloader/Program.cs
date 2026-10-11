@@ -773,8 +773,8 @@ internal sealed partial class UnityAssetAutomationApp
             var catalog = AssetCatalog.Load(profileDirectory);
             _runCatalog = catalog;
 
-            // Ассеты, которые магазин не добавляет на аккаунт: на запрос добавления он отвечает без права на ассет
-            // (userEntitlement: null), хотя плашка «Added to My Assets» всё равно появляется. Две попытки — и хватит:
+            // Ассеты, которые магазин не добавляет на аккаунт: плашка «Added to My Assets» появляется, а в «My Assets» их
+            // нет (09.10 — шесть ассетов UnityAssets2D). Две попытки — и хватит:
             // первая неудача кладёт ассет в «не подтверждено», вторая (в следующем прогоне) — сюда. Оба раза ассета
             // нет в «My Assets» (ReconcileUnclearAsync).
             var unaddableCache = new OwnedAssetsCache(profileDirectory, "unaddable_assets.txt", UnaddableTitle);
@@ -6071,9 +6071,9 @@ internal sealed partial class UnityAssetAutomationApp
                 else
                 {
                     // Окончательно решит сверка со списком «My Assets» в конце пачки.
-                    result.Message = result.StoreAnswer == StoreAddAnswer.Refused
-                        ? "Магазин ответил без права на ассет (userEntitlement: null); так бывает и у добавленных — решит список «My Assets»."
-                        : "Кнопка нажата, но ни страница, ни ответ магазина не подтвердили добавление.";
+                    result.Message = result.StoreAnswer == StoreAddAnswer.Answered
+                        ? "Запрос на добавление дошёл до магазина, но страница не показала ассет на аккаунте."
+                        : "Кнопка нажата, но запроса на добавление не видно, и страница ассет на аккаунте не показала.";
                     _logger.Info($"[Внимание] {result.Message} {assetUrl} (Сигналы: {result.DetectionSummary}). Сверим со списком «My Assets».");
                 }
                 return result;

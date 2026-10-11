@@ -199,12 +199,13 @@ internal static class RunSummary
                           $"не добавляются магазином {d.SkippedUnaddable}, удалённых из магазина {d.SkippedDeprecated}");
         }
 
-        if (items.Count > 0 && duration.TotalSeconds >= 1)
+        // Скорость — по открытым страницам: ассеты, пропущенные без открытия, времени почти не берут (11.10 из-за них
+        // вышло «2,5 с на ассет», хотя страница шла ~26 с).
+        var opened = items.Count - d.SkippedKnown - d.SkippedDeprecated;
+        if (opened > 0 && duration.TotalSeconds >= 1)
         {
-            var perMinute = items.Count / duration.TotalMinutes;
-            var seconds = duration.TotalSeconds / items.Count;
             sb.AppendLine(string.Create(CultureInfo.InvariantCulture,
-                $"Скорость: {perMinute:0.0} ассета в минуту, в среднем {seconds:0.0} с на ассет (вместе с ожиданием и чтением каналов)"));
+                $"Скорость: открыто страниц {opened}, в среднем {duration.TotalSeconds / opened:0.0} с на страницу (вместе со входом, ожиданием и чтением каналов)"));
         }
     }
 

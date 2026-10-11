@@ -4,27 +4,28 @@ using PuppeteerSharp;
 /// <summary>Что магазин ответил на добавление ассета.</summary>
 internal enum StoreAddAnswer
 {
-    /// <summary>Ответа не видели: запрос не ушёл, оборвался или ещё идёт.</summary>
+    /// <summary>Ответа не видели: запрос на добавление не ушёл, оборвался или ещё идёт.</summary>
     None,
 
-    /// <summary>Магазин выдал право на ассет (userEntitlement с датой) — ассет на аккаунте.</summary>
+    /// <summary>Магазин выдал право на ассет (userEntitlement с датой) — ассет на аккаунте. На 11.10 вживую не встречалось.</summary>
     Granted,
 
     /// <summary>
-    /// Магазин ответил без права на ассет (userEntitlement: null). Это ещё не отказ: 11.10 на сервере style-reference-box
-    /// получил null, а следующий прогон нашёл его на аккаунте. Окончательно решает список «My Assets».
+    /// Магазин принял запрос и ответил без права на ассет (userEntitlement: null). Это **обычный** ответ: 11.10 на сервере
+    /// все 5 успешно добавленных ассетов получили именно его, а «выдан» не пришёл ни разу. Добавлен ли ассет, по этому
+    /// ответу не понять — решают страница и список «My Assets».
     /// </summary>
-    Refused
+    Answered
 }
 
 /// <summary>
-/// Слушает ответ магазина на кнопку «Add to My Assets». Сама страница шлёт мутацию GraphQL AddToDownload и получает
-/// в ответ userEntitlement: объект с grantTime — ассет выдан, null — магазин его не добавил (так 09.10 вели себя шесть
-/// ассетов UnityAssets2D: плашка «Added to My Assets» есть, а в «My Assets» их нет).
+/// Слушает ответ магазина на кнопку «Add to My Assets». Сама страница шлёт мутацию GraphQL AddToDownload; программа
+/// ничего не отправляет — только читает ответ на запрос страницы.
 ///
-/// Программа ничего не отправляет сама — только читает ответ на запрос, который сделала страница после клика. Так
-/// отличается «магазин отказал» от «на медленном сервере не дождались страницы», и не нужно ждать, пока ассет
-/// появится на странице, если магазин уже ответил «выдан».
+/// Что это даёт (проверено вживую 11.10): видно, дошёл ли запрос на добавление до магазина (Answered) или нет (None) —
+/// это пишется в отчёт по ассету (StoreAnswer) и в сообщение «не подтверждён». Сам ответ почти всегда
+/// userEntitlement: null — и у добавленных ассетов тоже (09.10 по нему ошибочно решили, что null — отказ). Если магазин
+/// когда-нибудь ответит правом с grantTime (Granted), проверка заканчивается сразу, без перезагрузок страницы.
 /// </summary>
 internal sealed class AddToDownloadWatcher : IDisposable
 {
@@ -61,7 +62,7 @@ internal sealed class AddToDownloadWatcher : IDisposable
             }
 
             var answer = Parse(await e.Response.TextAsync(), _packageId);
-            // «Выдан» окончательный: повторный клик после выдачи не должен превратить его в отказ.
+            // «Выдан» окончательный: ответ на повторный клик его не заменяет.
             if (answer != StoreAddAnswer.None && Answer != StoreAddAnswer.Granted)
             {
                 Volatile.Write(ref _answer, (int)answer);
@@ -110,7 +111,7 @@ internal sealed class AddToDownloadWatcher : IDisposable
 
                 if (entitlement.ValueKind == JsonValueKind.Null)
                 {
-                    result = StoreAddAnswer.Refused;
+                    result = StoreAddAnswer.Answered;
                 }
             }
 
