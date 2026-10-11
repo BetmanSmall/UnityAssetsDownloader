@@ -1222,8 +1222,16 @@ internal sealed partial class UnityAssetAutomationApp
 
                 if (_options.MaxVisitedAssets.HasValue && index >= _options.MaxVisitedAssets.Value)
                 {
-                    _logger.Warn(
-                        $"Достигнут лимит посещенных ассетов ({index}/{_options.MaxVisitedAssets.Value}). Обработка остановлена.");
+                    // Ночной добор: порция исчерпана — так и задумано, это не предупреждение (иначе оно в каждой сводке ночи).
+                    var limitText = $"Достигнут лимит посещенных ассетов ({index}/{_options.MaxVisitedAssets.Value}). Обработка остановлена.";
+                    if (_options.HistoryBackfill)
+                    {
+                        _logger.Info($"{limitText} Порция ночного добора выполнена, следующей ночью — дальше.");
+                    }
+                    else
+                    {
+                        _logger.Warn(limitText);
+                    }
                     stoppedEarly = true;
                     break;
                 }
@@ -3267,7 +3275,9 @@ internal sealed partial class UnityAssetAutomationApp
     /// </summary>
     private async Task NotifyRunSummaryAsync(RunReport report)
     {
-        if (_notifier is not { Enabled: true })
+        // Ночной добор молчит: сообщение в 1–2 часа ночи будило бы человека, а итог ночи и так строкой в суточной сводке
+        // (список добавленного — в logs/last-backfill-summary.txt и каталоге).
+        if (_notifier is not { Enabled: true } || _options.HistoryBackfill)
         {
             return;
         }
