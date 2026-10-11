@@ -44,6 +44,9 @@ internal sealed class BrowserKeeper : IAsyncDisposable
     /// <summary>«--user-data-dir=…» текущего браузера: по нему находятся его процессы, оставшиеся после убийства.</summary>
     private string? _profileArg;
 
+    /// <summary>Как именно вкладка не ответила на последней проверке («зависла», текст ошибки) — для лога.</summary>
+    private string? _lastProbeFailure;
+
     /// <summary>
     /// Запускает браузер и открывает вкладку. launch вызывается и при перезапуске — он должен сам снимать
     /// блокировку папки профиля, оставшуюся от убитого браузера. prepare настраивает каждую новую вкладку.
@@ -58,7 +61,12 @@ internal sealed class BrowserKeeper : IAsyncDisposable
     }
 
     /// <summary>Вкладка жива и отвечает: браузер на связи, вкладка не закрыта и выполняет скрипт.</summary>
-    public Task<bool> IsAliveAsync() => IsResponsiveAsync(Browser, Page);
+    public async Task<bool> IsAliveAsync()
+    {
+        var (alive, failure) = await ProbeAsync(Browser, Page);
+        _lastProbeFailure = failure;
+        return alive;
+    }
 
     /// <summary>
     /// Мёртвую вкладку заменяет новой; если не вышло — перезапускает браузер. true — есть живая вкладка.
@@ -66,7 +74,7 @@ internal sealed class BrowserKeeper : IAsyncDisposable
     /// </summary>
     public async Task<bool> RecoverAsync(string reason)
     {
-        _warn($"[Браузер] {reason}{(LastCrash is null ? string.Empty : $" Браузер сообщил: {LastCrash}.")}");
+        _warn($"[Браузер] {reason} Признак: {LastCrash ?? _lastProbeFailure ?? "не известен"}.");
         LastCrash = null;
 
         if (Browser.IsConnected)
@@ -75,7 +83,7 @@ internal sealed class BrowserKeeper : IAsyncDisposable
             try
             {
                 fresh = await WithTimeout(OpenPageAsync(Browser), TimeSpan.FromSeconds(30));
-                if (await IsResponsiveAsync(Browser, fresh))
+                if ((await ProbeAsync(Browser, fresh)).Alive)
                 {
                     var dead = Page;
                     Page = fresh;
@@ -155,20 +163,32 @@ internal sealed class BrowserKeeper : IAsyncDisposable
         };
     }
 
-    private static async Task<bool> IsResponsiveAsync(IBrowser browser, IPage? page)
+    /// <summary>Отвечает ли вкладка; если нет — как именно (для лога).</summary>
+    private static async Task<(bool Alive, string? Failure)> ProbeAsync(IBrowser browser, IPage? page)
     {
-        if (page is null || page.IsClosed || !browser.IsConnected)
+        if (!browser.IsConnected)
         {
-            return false;
+            return (false, "браузер отключился (процесс закрылся или упал)");
+        }
+
+        if (page is null || page.IsClosed)
+        {
+            return (false, "вкладка закрыта");
         }
 
         try
         {
-            return await WithTimeout(page.EvaluateExpressionAsync<int>("1 + 1"), ProbeTimeout) == 2;
+            return await WithTimeout(page.EvaluateExpressionAsync<int>("1 + 1"), ProbeTimeout) == 2
+                ? (true, null)
+                : (false, "вкладка отвечает неверно");
         }
-        catch
+        catch (TimeoutException)
         {
-            return false;
+            return (false, $"вкладка зависла — не ответила за {ProbeTimeout.TotalSeconds:0} с");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"вкладка не отвечает ({ex.GetType().Name}: {ex.Message})");
         }
     }
 
@@ -247,7 +267,7 @@ internal sealed class BrowserKeeper : IAsyncDisposable
 
             try
             {
-                if (!File.ReadAllText(Path.Combine(dir, "cmdline")).Split('\0').Contains(profileArg, StringComparer.Ordinal))
+                if (!CommandLineTokens(File.ReadAllText(Path.Combine(dir, "cmdline"))).Contains(profileArg, StringComparer.Ordinal))
                 {
                     continue;
                 }
@@ -266,13 +286,20 @@ internal sealed class BrowserKeeper : IAsyncDisposable
         return killed;
     }
 
+    /// <summary>
+    /// Слова командной строки из /proc/&lt;pid&gt;/cmdline. Chrome переписывает свою командную строку в одну строку через
+    /// пробелы, поэтому делим и по \0, и по пробелам (у своей папки профиля пробелов в пути нет).
+    /// </summary>
+    internal static string[] CommandLineTokens(string cmdline) =>
+        cmdline.Split(['\0', ' '], StringSplitOptions.RemoveEmptyEntries);
+
     /// <summary>«--user-data-dir=…» из командной строки процесса браузера (Linux), иначе null.</summary>
     private static string? ProfileArg(IBrowser browser)
     {
         try
         {
             return OperatingSystem.IsLinux() && browser.Process is { } process
-                ? File.ReadAllText($"/proc/{process.Id}/cmdline").Split('\0')
+                ? CommandLineTokens(File.ReadAllText($"/proc/{process.Id}/cmdline"))
                     .FirstOrDefault(a => a.StartsWith("--user-data-dir=", StringComparison.Ordinal))
                 : null;
         }

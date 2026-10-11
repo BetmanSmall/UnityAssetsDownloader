@@ -387,6 +387,11 @@ internal sealed partial class UnityAssetAutomationApp
     /// <summary>Каталог библиотеки этого прогона — названия ассетов для сводки.</summary>
     private AssetCatalog? _runCatalog;
 
+    /// <summary>Облегчённые страницы включены (LitePages); сколько запросов браузер не стал грузить; ошибка включения.</summary>
+    private bool _litePages;
+    private int _litePagesBlocked;
+    private string? _litePagesError;
+
     /// <summary>Почему прогон остановлен из-за браузера, или null.</summary>
     private string? _browserStopReason;
 
@@ -610,6 +615,14 @@ internal sealed partial class UnityAssetAutomationApp
                     browserArgs.Add("--ozone-platform=wayland");
                     _logger.Info("Экрана X11 нет, браузер запускается на Wayland.");
                 }
+            }
+
+            // Сервер: облегчённые страницы — меньше процессов Chrome и памяти (LitePages, LITE_PAGES в .env).
+            _litePages = LitePages.IsEnabled();
+            if (_litePages)
+            {
+                browserArgs.AddRange(LitePages.ChromeArgs);
+                _logger.Info("Облегчённые страницы магазина: без картинок, видео, шрифтов и аналитики (выключить — LITE_PAGES=0).");
             }
 
             if (_options.ProxyHost != null && _options.ProxyPort.HasValue)
@@ -991,9 +1004,15 @@ internal sealed partial class UnityAssetAutomationApp
             // браузер на этой машине не держится (вероятнее всего, не хватает памяти), и гнать очередь дальше
             // бессмысленно: каждый ассет стал бы ошибкой. Прогон останавливается, следующий продолжит с этого места.
             var recoveriesInRow = 0;
-            async Task<bool> EnsureBrowserAliveAsync(string reason)
+            async Task<bool> EnsureBrowserAliveAsync(string reason, bool knownDead = false)
             {
-                if (await keeper.IsAliveAsync())
+                if (_browserStopReason is not null)
+                {
+                    // Уже сдались — больше не пробуем и не пишем об этом снова.
+                    return false;
+                }
+
+                if (!knownDead && await keeper.IsAliveAsync())
                 {
                     return true;
                 }
@@ -1164,7 +1183,7 @@ internal sealed partial class UnityAssetAutomationApp
                 // страниц повтор не идёт). Умерла и на повторе — дело, видимо, в самом ассете: пишем ошибку и идём дальше.
                 if (result.Status == AssetProcessStatus.Failed && !await keeper.IsAliveAsync())
                 {
-                    if (!await EnsureBrowserAliveAsync($"Вкладка браузера умерла на ассете {assetUrl}."))
+                    if (!await EnsureBrowserAliveAsync($"Вкладка браузера умерла на ассете {assetUrl}.", knownDead: true))
                     {
                         // Ассет не проверен и никуда не записан — следующий прогон возьмёт его снова.
                         stoppedEarly = true;
@@ -1401,7 +1420,7 @@ internal sealed partial class UnityAssetAutomationApp
                 SkippedUnaddable = _summarySkippedUnaddable,
                 SkippedDeprecated = _summarySkippedDeprecated,
                 Memory = memoryText,
-                Browser = DescribeBrowserRecoveries(),
+                Browser = DescribeBrowser(),
                 BrowserStopReason = _browserStopReason,
                 Names = SummaryNames(report),
                 CatalogCount = _summaryCatalogCount,
@@ -1434,15 +1453,24 @@ internal sealed partial class UnityAssetAutomationApp
         }
     }
 
-    private string? DescribeBrowserRecoveries()
+    /// <summary>Строка «Браузер:» сводки: облегчённые страницы и восстановления вкладки, или null, если сказать нечего.</summary>
+    private string? DescribeBrowser()
     {
-        if (_browserKeeper is not { } k || k.TabsReplaced + k.BrowserRestarts == 0)
+        var parts = new List<string>();
+        if (_litePages)
         {
-            return null;
+            parts.Add(_litePagesError is null
+                ? $"облегчённые страницы (не загружено картинок, видео, шрифтов и счётчиков: {_litePagesBlocked})"
+                : $"облегчённые страницы не включились ({_litePagesError})");
         }
 
-        static string Times(int n) => n % 10 is >= 2 and <= 4 && n % 100 is < 12 or > 14 ? $"{n} раза" : $"{n} раз";
-        return $"вкладка умирала и заменялась новой {Times(k.TabsReplaced)}, браузер перезапускался {Times(k.BrowserRestarts)}";
+        if (_browserKeeper is { } k && k.TabsReplaced + k.BrowserRestarts > 0)
+        {
+            static string Times(int n) => n % 10 is >= 2 and <= 4 && n % 100 is < 12 or > 14 ? $"{n} раза" : $"{n} раз";
+            parts.Add($"вкладка умирала и заменялась новой {Times(k.TabsReplaced)}, браузер перезапускался {Times(k.BrowserRestarts)}");
+        }
+
+        return parts.Count == 0 ? null : string.Join("; ", parts);
     }
 
     /// <summary>Названия ассетов отчёта: из каталога, а у новых — из карточек каналов.</summary>
@@ -3300,6 +3328,18 @@ internal sealed partial class UnityAssetAutomationApp
         await page.SetUserAgentAsync(ua.Replace("HeadlessChrome", "Chrome"));
 
         AttachPageDiagnostics(page);
+
+        if (_litePages)
+        {
+            if (await LitePages.ApplyAsync(page) is { } error)
+            {
+                // Не включилось (другая версия Chrome) — страницы грузятся целиком, как раньше; прогону это не мешает.
+                _litePagesError = error;
+                _logger.Warn($"[Браузер] Облегчённые страницы не включились: {error}. Страницы грузятся целиком.");
+            }
+
+            LitePages.CountBlocked(page, () => Interlocked.Increment(ref _litePagesBlocked));
+        }
     }
 
     /// <summary>Пользователь нажал Ctrl+C — успеваем записать память профиля.</summary>
