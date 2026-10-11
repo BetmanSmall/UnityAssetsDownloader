@@ -1457,7 +1457,8 @@ internal sealed partial class UnityAssetAutomationApp
     private string? DescribeBrowser()
     {
         var parts = new List<string>();
-        if (_litePages)
+        // Страниц магазина не открывали (служба: новых постов нет) — про облегчение сказать нечего.
+        if (_litePages && (_litePagesError is not null || _runReport?.Items.Count > 0))
         {
             parts.Add(_litePagesError is null
                 ? $"облегчённые страницы (не загружено картинок, видео, шрифтов и счётчиков: {_litePagesBlocked})"

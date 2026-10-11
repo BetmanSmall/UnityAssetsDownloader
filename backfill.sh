@@ -13,7 +13,8 @@
 # в фоне (SSH можно закрыть), после прогона ВСЕГДА запускает службу обратно. Деньги не списываются никогда:
 # оплата нажимается только при итоге 0 (как и у службы).
 #
-# Итог — короткая сводка: logs/last-run-summary.txt (и файлом в бот). Её и присылайте, полный лог не нужен.
+# Итог — короткая сводка: logs/last-backfill-summary.txt (и файлом в бот). Её и присылайте, полный лог не нужен.
+# (logs/last-run-summary.txt не годится: служба, которую скрипт возвращает, сразу делает свой прогон и перезаписывает его.)
 # Если сервер перезагрузили посреди прогона, службу вернёт ./deploy.sh или docker compose up -d.
 
 set -u
@@ -120,10 +121,10 @@ if [ "$MODE" = status ]; then
         echo "  Последние шаги:"
         grep -E '\[пачка [0-9]+:|Пачка №|ИТОГИ|Сводка прогона|\[Лимит\]' "$LOG" | tail -n 5 | cut -c1-200 | sed 's/^/    /'
     fi
-    if [ -f logs/last-run-summary.txt ]; then
+    if [ -f logs/last-backfill-summary.txt ]; then
         echo
-        echo "  Сводка последнего завершённого прогона ($(date -r logs/last-run-summary.txt '+%F %T')):"
-        echo "    cat logs/last-run-summary.txt"
+        echo "  Сводка последнего прогона по истории ($(date -r logs/last-backfill-summary.txt '+%F %T')) — её и присылайте:"
+        echo "    cat logs/last-backfill-summary.txt"
     fi
     exit 0
 fi
@@ -182,7 +183,8 @@ if [ "$MODE" = inner ]; then
 
     SUMMARY=$(ls logs/run-summary-*.txt 2>/dev/null | sort | tail -n 1)
     if [ -n "$SUMMARY" ] && [ "$SUMMARY" != "$BEFORE" ]; then
-        say "Сводка прогона: $SUMMARY"
+        say "Сводка прогона: $SUMMARY (копия — logs/last-backfill-summary.txt)"
+        cp "$SUMMARY" logs/last-backfill-summary.txt
         { echo; cat "$SUMMARY"; } >> "$LOGFILE"
     else
         say "Сводки нет (прогон остановили или он упал до её записи). Хвост вывода: logs/backfill-$STAMP.tail.txt, ошибки: logs/errors.log"
@@ -233,5 +235,5 @@ cat <<EOF
   Остановить:     ./backfill.sh --stop
   Ход скрипта:    cat logs/backfill-$STAMP.log
   Живой лог:      tail -f \$(ls -t logs/run-log-*.log | head -n 1)
-  Итог:           придёт файлом в бот и ляжет сюда: logs/last-run-summary.txt — его и присылайте
+  Итог:           придёт файлом в бот и ляжет сюда: logs/last-backfill-summary.txt — его и присылайте
 EOF
