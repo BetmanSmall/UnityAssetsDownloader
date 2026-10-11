@@ -10,7 +10,10 @@ internal enum StoreAddAnswer
     /// <summary>Магазин выдал право на ассет (userEntitlement с датой) — ассет на аккаунте.</summary>
     Granted,
 
-    /// <summary>Магазин ответил без права на ассет (userEntitlement: null) — не добавил.</summary>
+    /// <summary>
+    /// Магазин ответил без права на ассет (userEntitlement: null). Это ещё не отказ: 11.10 на сервере style-reference-box
+    /// получил null, а следующий прогон нашёл его на аккаунте. Окончательно решает список «My Assets».
+    /// </summary>
     Refused
 }
 

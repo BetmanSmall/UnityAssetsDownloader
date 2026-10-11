@@ -390,6 +390,7 @@ internal sealed partial class UnityAssetAutomationApp
     /// <summary>Облегчённые страницы включены (LitePages); сколько запросов браузер не стал грузить; ошибка включения.</summary>
     private bool _litePages;
     private int _litePagesBlocked;
+    private int _storePagesOpened;
     private string? _litePagesError;
 
     /// <summary>Почему прогон остановлен из-за браузера, или null.</summary>
@@ -1166,6 +1167,7 @@ internal sealed partial class UnityAssetAutomationApp
                 }
 
                 index++;
+                _storePagesOpened = index;
                 _logger.Info($"[{label}] {assetUrl}");
 
                 assetPromocodes.TryGetValue(assetUrl, out var promoCode);
@@ -1458,7 +1460,7 @@ internal sealed partial class UnityAssetAutomationApp
     {
         var parts = new List<string>();
         // Страниц магазина не открывали (служба: новых постов нет) — про облегчение сказать нечего.
-        if (_litePages && (_litePagesError is not null || _runReport?.Items.Count > 0))
+        if (_litePages && (_litePagesError is not null || _storePagesOpened > 0))
         {
             parts.Add(_litePagesError is null
                 ? $"облегчённые страницы (не загружено картинок, видео, шрифтов и счётчиков: {_litePagesBlocked})"
@@ -6070,7 +6072,7 @@ internal sealed partial class UnityAssetAutomationApp
                 {
                     // Окончательно решит сверка со списком «My Assets» в конце пачки.
                     result.Message = result.StoreAnswer == StoreAddAnswer.Refused
-                        ? "Магазин ответил, что не добавил ассет (userEntitlement: null)."
+                        ? "Магазин ответил без права на ассет (userEntitlement: null); так бывает и у добавленных — решит список «My Assets»."
                         : "Кнопка нажата, но ни страница, ни ответ магазина не подтвердили добавление.";
                     _logger.Info($"[Внимание] {result.Message} {assetUrl} (Сигналы: {result.DetectionSummary}). Сверим со списком «My Assets».");
                 }
