@@ -29,6 +29,9 @@ internal sealed class RunStats
     public int DownloadAssetsFree { get; set; }
     public int DownloadAssetsPaid { get; set; }
 
+    /// <summary>Чтение истории: платных по цене магазина, страницы не открывались.</summary>
+    public int PaidByPrice { get; set; }
+
     /// <summary>Сколько постов прочитано в каждом канале и в каких номерах: для сводки прогона.</summary>
     public Dictionary<string, ChannelPostsInfo> Channels { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -130,6 +133,7 @@ internal sealed class RunStats
         DownloadPosts += result.DownloadPosts;
         DownloadAssetsFree += result.DownloadAssetsFree;
         DownloadAssetsPaid += result.DownloadAssetsPaid;
+        PaidByPrice += result.PaidByPrice;
 
         foreach (var post in result.AllPosts)
         {
@@ -189,6 +193,9 @@ internal sealed class DailyDigest
     /// <summary>Что сказать о Fab отдельной строкой (например «ждёт вас»). В файл не пишется.</summary>
     [System.Text.Json.Serialization.JsonIgnore]
     public string? FabNote { get; set; }
+
+    /// <summary>Строка о ночном доборе истории каналов (NightBackfillState.Describe) или null.</summary>
+    public string? NightNote { get; set; }
 
     public static DailyDigest Load(string path)
     {
@@ -330,6 +337,11 @@ internal sealed class DailyDigest
         {
             // Без FAB=on сервер Fab не открывает — ассеты забирает Deck или ПК.
             sb.AppendLine("Fab на аккаунт Epic: на Deck или ПК пункт F в меню");
+        }
+
+        if (!string.IsNullOrWhiteSpace(NightNote))
+        {
+            sb.AppendLine(NightNote);
         }
 
         if (!string.IsNullOrWhiteSpace(FabNote))

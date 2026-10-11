@@ -164,6 +164,11 @@ internal static class RunSummary
                           $"платных пропущено {s.DownloadAssetsPaid} (файлы из бота не берём, ссылки на бота не храним)");
         }
 
+        if (s.PaidByPrice > 0)
+        {
+            sb.AppendLine($"Платные по цене магазина (страницы не открывались): {s.PaidByPrice}");
+        }
+
         if (s.FabPosts + s.ItchPosts + s.OtherPosts > 0)
         {
             sb.AppendLine($"Постов без ссылки на магазин: Fab {s.FabPosts}, itch.io {s.ItchPosts}, прочие {s.OtherPosts}");

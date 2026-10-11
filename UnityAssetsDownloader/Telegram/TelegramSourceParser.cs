@@ -23,6 +23,15 @@ internal sealed class TelegramSourceParser
     /// null — спрашиваем магазин по GraphQL.
     /// </summary>
     private readonly Func<IReadOnlyList<string>, Task<Dictionary<string, bool>>>? _freeLookupAsync;
+
+    /// <summary>
+    /// Проверять цену у всех новых ассетов без промокода, а не только у раздач через бота, и платные не брать в очередь.
+    /// Только для чтения истории канала (backfill.sh, ночной добор): старые посты не про свежие раздачи, а без этой
+    /// проверки каждый проход истории заново открывал бы страницы всех платных ассетов (~10 с каждая), и ночная порция
+    /// уходила бы на них. Служба на новых постах цену заранее не проверяет — там важно не пропустить свежую раздачу.
+    /// </summary>
+    private readonly bool _checkPriceOfAll;
+
     // Страница канала отдаёт около 20 постов. При чтении за один раз десяти страниц
     // (~200 постов) хватает: старые раздачи давно закончились. Пачками читается без предела.
     public const int MaxPagesPerChannel = 10;
@@ -59,7 +68,8 @@ internal sealed class TelegramSourceParser
         int postLimit = 50,
         bool screenshotOnNoLinks = true,
         Func<string, Task<string?>>? fetchHtmlAsync = null,
-        Func<IReadOnlyList<string>, Task<Dictionary<string, bool>>>? freeLookupAsync = null)
+        Func<IReadOnlyList<string>, Task<Dictionary<string, bool>>>? freeLookupAsync = null,
+        bool checkPriceOfAll = false)
     {
         _browser = browser;
         _logger = logger;
@@ -69,6 +79,7 @@ internal sealed class TelegramSourceParser
         _screenshotOnNoLinks = screenshotOnNoLinks;
         _fetchHtmlAsync = fetchHtmlAsync;
         _freeLookupAsync = freeLookupAsync;
+        _checkPriceOfAll = checkPriceOfAll;
     }
 
     /// <summary>
@@ -131,6 +142,11 @@ internal sealed class TelegramSourceParser
                 {
                     var channelResult = await ReadPageWithRetryAsync(OpenPageAsync, cursor, maxPostsPerChannel);
                     await ResolveDownloadAssetsAsync(channelResult);
+                    if (_checkPriceOfAll)
+                    {
+                        await DropPaidAssetsAsync(channelResult,
+                            url => isWanted(url) && !channelResult.AssetPromocodes.ContainsKey(url) && !result.AssetPromocodes.ContainsKey(url));
+                    }
 
                     result.GitLinks.AddRange(channelResult.GitLinks);
                     result.Promocodes.AddRange(channelResult.Promocodes);
@@ -140,6 +156,7 @@ internal sealed class TelegramSourceParser
                     result.DownloadPosts += channelResult.DownloadPosts;
                     result.DownloadAssetsFree += channelResult.DownloadAssetsFree;
                     result.DownloadAssetsPaid += channelResult.DownloadAssetsPaid;
+                    result.PaidByPrice += channelResult.PaidByPrice;
                     foreach (var card in channelResult.Cards)
                     {
                         result.Cards.TryAdd(card.Key, card.Value);
@@ -186,6 +203,11 @@ internal sealed class TelegramSourceParser
         }
 
         result.GitLinks = result.GitLinks.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+        if (result.PaidByPrice > 0)
+        {
+            _logger.Info($"[Telegram] Платных в магазине (цена проверена заранее, страницы не открываем): {result.PaidByPrice}.");
+        }
 
         if (result.DownloadPosts > 0)
         {
@@ -577,6 +599,47 @@ internal sealed class TelegramSourceParser
         channelResult.DownloadAssets.Clear();
     }
 
+    /// <summary>
+    /// Чтение истории: у новых ассетов без промокода (canDrop) спрашиваем цену пачкой и платные убираем из очереди — их
+    /// страницы не открываются. Магазин не ответил — ничего не убираем: страница сама покажет цену.
+    /// </summary>
+    private async Task DropPaidAssetsAsync(TelegramChannelResult channelResult, Func<string, bool> canDrop)
+    {
+        var candidates = channelResult.AssetUrls
+            .Where(canDrop)
+            .Select(url => (Url: url, Id: UnityAssetAutomationApp.ExtractPackageId(url)))
+            .Where(x => x.Id is not null)
+            .ToList();
+        if (candidates.Count == 0)
+        {
+            return;
+        }
+
+        Dictionary<string, bool> verdicts;
+        try
+        {
+            verdicts = await (_freeLookupAsync ?? LookUpFreeInStoreAsync)(candidates.Select(x => x.Id!).Distinct().ToList());
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[Telegram] Цены ассетов не проверились: {ex.Message}. Берём их в очередь, цену покажет страница.");
+            return;
+        }
+
+        var paid = candidates
+            .Where(x => verdicts.TryGetValue(x.Id!, out var free) && !free)
+            .Select(x => x.Url)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (paid.Count == 0)
+        {
+            return;
+        }
+
+        channelResult.AssetUrls.RemoveAll(paid.Contains);
+        channelResult.PaidByPrice += paid.Count;
+        _logger.Debug($"[Telegram] Платные по цене магазина, страницы не открываем: {string.Join(", ", paid)}");
+    }
+
     private async Task<Dictionary<string, bool>> LookUpFreeInStoreAsync(IReadOnlyList<string> ids)
     {
         using var api = new AssetStoreProductApi(msg => _logger.Debug(msg));
@@ -803,6 +866,9 @@ internal sealed class TelegramParseResult
 
     /// <summary>И платных ассетов: они мимо.</summary>
     public int DownloadAssetsPaid { get; set; }
+
+    /// <summary>Чтение истории: ассеты обычных постов, платные по цене магазина, — страницы не открывались.</summary>
+    public int PaidByPrice { get; set; }
 }
 
 internal sealed class TelegramChannelResult
@@ -819,6 +885,7 @@ internal sealed class TelegramChannelResult
     public int DownloadPosts { get; set; }
     public int DownloadAssetsFree { get; set; }
     public int DownloadAssetsPaid { get; set; }
+    public int PaidByPrice { get; set; }
 
     /// <summary>Ассеты из постов-раздач по номеру: ждут проверки цены в магазине.</summary>
     public Dictionary<string, DownloadPostAsset> DownloadAssets { get; set; } = new(StringComparer.Ordinal);

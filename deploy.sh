@@ -328,6 +328,25 @@ while :; do
     [[ "$INTERVAL" =~ ^([0-9]+[dhms])+$ || "$INTERVAL" =~ ^[0-9]+$ ]] && break
     fail "Не понял. Примеры: 30m — полчаса, 6h — 6 часов, 1d — раз в сутки."
 done
+echo
+echo "  Ночью служба может сама понемногу проходить ИСТОРИЮ каналов (старые посты, которые обычные"
+echo "  прогоны не читают): каждую ночь порция одного канала — до 100 страниц ассетов (~40 минут),"
+echo "  с 1:00 до 6:00. История канала пройдена — берётся следующий. Итог ночи — в суточной сводке бота."
+echo "  Каналы через запятую по порядку; «-» — выключить. (Порция и часы: NIGHT_BACKFILL_PAGES, NIGHT_BACKFILL_HOURS в .env.)"
+if grep -qE '^NIGHT_BACKFILL_CHANNELS=' "$ENV_FILE" 2>/dev/null; then
+    NIGHT_DEFAULT=$(env_get NIGHT_BACKFILL_CHANNELS); NIGHT_DEFAULT=${NIGHT_DEFAULT:--}
+else
+    # Впервые: два канала-ленты, в истории которых больше всего бесплатного (разбор 09–10.10, Plan.md «Очередь каналов»).
+    NIGHT_DEFAULT="UnityAssetsTools,UnityAssetsNewFree"
+fi
+while :; do
+    ask NIGHT_CHANNELS "Каналы для ночного добора истории" "$NIGHT_DEFAULT"
+    NIGHT_CHANNELS=$(printf '%s' "$NIGHT_CHANNELS" | tr -d ' ')
+    case "$NIGHT_CHANNELS" in -|off|нет) NIGHT_CHANNELS="" ;; esac
+    [[ "$NIGHT_CHANNELS" =~ ^[A-Za-z0-9_,]*$ ]] && break
+    fail "Только имена каналов (латиница, цифры, _) через запятую, или «-»."
+done
+[ -n "$NIGHT_CHANNELS" ] && ok "Ночной добор истории: $NIGHT_CHANNELS" || ok "Ночной добор истории выключен."
 bold "6. Fab (fab.com, аккаунт Epic Games): окно для входа"
 echo "  Чтобы войти в Epic на сервере, программа показывает окно браузера в вашем браузере"
 echo "  через SSH-туннель (порт слушает только localhost сервера). Пароль окна — чтобы им не"
@@ -371,6 +390,7 @@ umask 077
     echo "TELEGRAM_CHAT_ID=$(env_quote "$CHAT_ID")"
     echo "TELEGRAM_CHANNELS=$(env_quote "$CHANNELS_VALUE")"
     echo "WATCH_INTERVAL=$INTERVAL"
+    echo "NIGHT_BACKFILL_CHANNELS=$(env_quote "$NIGHT_CHANNELS")"
     echo "SOURCES=$SOURCES_VALUE"
     echo "TOP_FREE_EVERY=$TOP_FREE_EVERY"
     echo "FAB=$FAB_VALUE"
@@ -380,7 +400,7 @@ umask 077
     # Настройки, о которых deploy.sh не спрашивает (TELEGRAM_PROXY, BOT_DIGEST и другие,
     # вписанные руками), переносим как есть — раньше они молча пропадали.
     if [ -f "$ENV_FILE" ]; then
-        grep -vE '^(#|[[:space:]]*$|(UNITY_EMAIL|UNITY_PASSWORD|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_CHANNELS|WATCH_INTERVAL|SOURCES|TOP_FREE_EVERY|FAB|FAB_VNC_PASSWORD|PROFILE|TZ)=)' "$ENV_FILE" || true
+        grep -vE '^(#|[[:space:]]*$|(UNITY_EMAIL|UNITY_PASSWORD|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_CHANNELS|WATCH_INTERVAL|NIGHT_BACKFILL_CHANNELS|SOURCES|TOP_FREE_EVERY|FAB|FAB_VNC_PASSWORD|PROFILE|TZ)=)' "$ENV_FILE" || true
     fi
 } > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
 chmod 600 "$ENV_FILE"

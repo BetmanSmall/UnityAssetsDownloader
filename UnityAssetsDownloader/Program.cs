@@ -102,10 +102,18 @@ async Task<int> RunOnceAsync(string[] runArgs)
 // Режим сервера: прогон, пауза до следующего, снова прогон — пока службу не остановят.
 // Каждый прогон начинается с чистого листа: параметры читаются заново (после первого
 // входа профиль переименовывается), браузер и лог — новые.
+// Ночью (NIGHT_BACKFILL_*) служба ещё и добирает историю каналов — порцию за ночь, см. NightBackfill.cs.
 async Task RunWatchLoopAsync()
 {
     var interval = options.WatchInterval;
     Console.WriteLine($"[Сервер] Режим наблюдения: прогон раз в {DescribeInterval(interval)}. Остановить: Ctrl+C, docker stop или systemctl stop.");
+
+    var night = NightBackfillSettings.FromEnvironment(Console.WriteLine);
+    var nightStatePath = Path.Combine(options.DataDirectory, "night_backfill.json");
+    Console.WriteLine(night.Enabled
+        ? $"[Сервер] Ночной добор истории: {string.Join(", ", night.Channels)} — до {night.PagesPerNight} страниц за ночь, " +
+          $"с {night.StartHour}:00 до {night.EndHour}:00 (NIGHT_BACKFILL_* в .env)."
+        : "[Сервер] Ночной добор истории каналов выключен (NIGHT_BACKFILL_CHANNELS пуст).");
 
     using var stop = new CancellationTokenSource();
     UnityAssetAutomationApp? current = null;
@@ -122,9 +130,57 @@ async Task RunWatchLoopAsync()
         stop.Cancel();
     });
 
+    var nextRegular = DateTime.Now;
     while (!stop.IsCancellationRequested)
     {
-        var startedAt = DateTime.Now;
+        if (DateTime.Now >= nextRegular)
+        {
+            // Расписание от начала прогона: «раз в сутки» значит в одно и то же время.
+            var startedAt = DateTime.Now;
+            await RunRegularCycleAsync();
+            nextRegular = startedAt + interval;
+            if (nextRegular <= DateTime.Now)
+            {
+                nextRegular = DateTime.Now + TimeSpan.FromMinutes(1);
+            }
+        }
+
+        if (!stop.IsCancellationRequested && NightBackfillState.Load(nightStatePath).IsDue(night, DateTime.Now))
+        {
+            await RunNightBackfillAsync();
+        }
+
+        var wake = nextRegular;
+        var nightWake = NightBackfillState.Load(nightStatePath).NextWake(night, DateTime.Now);
+        if (nightWake is { } nw && nw < wake)
+        {
+            // Не чаще раза в минуту, даже если файл добора не записался и «пора» не снимается.
+            wake = nw > DateTime.Now ? nw : DateTime.Now + TimeSpan.FromMinutes(1);
+            Console.WriteLine($"[Сервер] Ночной добор истории: {wake:yyyy-MM-dd HH:mm}. Следующий обычный прогон: {nextRegular:yyyy-MM-dd HH:mm}.");
+        }
+        else
+        {
+            Console.WriteLine($"[Сервер] Следующий прогон: {nextRegular:yyyy-MM-dd HH:mm}.");
+        }
+
+        // Время уже прошло (долгий добор) — сразу на следующий круг. Отрицательную паузу Task.Delay не берёт, а ровно −1 мс
+        // для него значит «ждать вечно».
+        var pause = wake - DateTime.Now;
+        if (pause > TimeSpan.Zero)
+        {
+            try
+            {
+                await Task.Delay(pause, stop.Token);
+            }
+            catch (TaskCanceledException)
+            {
+                break;
+            }
+        }
+    }
+
+    async Task RunRegularCycleAsync()
+    {
         var cycleOptions = CliOptions.Parse(args);
         var crashed = false;
         current = null;
@@ -161,35 +217,62 @@ async Task RunWatchLoopAsync()
 
         try
         {
-            await SendDigestIfDueAsync(cycleOptions, current, crashed);
+            await SendDigestIfDueAsync(cycleOptions, current, crashed,
+                NightBackfillState.Load(nightStatePath).Describe(night));
         }
         catch (Exception digestEx)
         {
             Console.Error.WriteLine($"[Сервер] Сводка не отправлена: {digestEx.Message}");
         }
+    }
 
-        // Расписание от начала прогона: «раз в сутки» значит в одно и то же время.
-        var next = startedAt + interval;
-        if (next <= DateTime.Now)
+    // Порция истории одного канала: тот же прогон, что ./backfill.sh <канал> --limit, только по числу страниц.
+    // Ночь отмечается до прогона: упавший прогон не повторяется до следующей ночи (та продолжит с того же места).
+    async Task RunNightBackfillAsync()
+    {
+        var state = NightBackfillState.Load(nightStatePath);
+        var channel = state.NextChannel(night);
+        if (channel is null)
         {
-            next = DateTime.Now + TimeSpan.FromMinutes(1);
+            return;
         }
 
-        Console.WriteLine($"[Сервер] Следующий прогон: {next:yyyy-MM-dd HH:mm}.");
+        state.MarkStarted(night, DateTime.Now);
+        state.Save(nightStatePath);
+        Console.WriteLine($"[Сервер] Ночной добор истории: канал {channel}, не больше {night.PagesPerNight} страниц ассетов.");
+
+        var backfillOptions = CliOptions.Parse(NightBackfillSettings.BackfillArgs(args, channel, night.PagesPerNight));
+        UnityAssetAutomationApp? app = null;
+        var crashed = false;
         try
         {
-            await Task.Delay(next - DateTime.Now, stop.Token);
+            running = true;
+            Environment.ExitCode = 0;
+            current = app = new UnityAssetAutomationApp(backfillOptions);
+            await app.RunAsync();
         }
-        catch (TaskCanceledException)
+        catch (Exception ex)
         {
-            break;
+            crashed = true;
+            await ReportCrashAsync(ex, backfillOptions);
         }
+        finally
+        {
+            running = false;
+        }
+
+        var finished = !crashed && app is { HistoryPassFinished: true };
+        state = NightBackfillState.Load(nightStatePath);
+        state.Record(channel, app?.Stats.Added ?? 0, app?.PagesOpened ?? 0, finished, crashed, DateTime.Now);
+        state.Save(nightStatePath);
+        Console.WriteLine($"[Сервер] Ночной добор: {channel} — добавлено {app?.Stats.Added ?? 0}, открыто страниц {app?.PagesOpened ?? 0}" +
+                          (crashed ? ", прогон упал." : finished ? ", история канала пройдена." : "."));
     }
 }
 
 // Суточная сводка: копим итоги прогонов и раз в BOT_DIGEST шлём боту, даже если
 // ничего не добавлено, — чтобы молчание бота значило «сломалось», а не «нечего было».
-async Task SendDigestIfDueAsync(CliOptions cycleOptions, UnityAssetAutomationApp? app, bool crashed)
+async Task SendDigestIfDueAsync(CliOptions cycleOptions, UnityAssetAutomationApp? app, bool crashed, string? nightNote = null)
 {
     if (cycleOptions.DigestInterval is not { } period)
     {
@@ -205,6 +288,7 @@ async Task SendDigestIfDueAsync(CliOptions cycleOptions, UnityAssetAutomationApp
     {
         digest.FabOnServer = cycleOptions.FabOnServer;
         digest.FabNote = app.FabPendingNote();
+        digest.NightNote = nightNote;
         var text = digest.Describe(app.ProfileName, period, now);
         Console.WriteLine($"[Сервер] Сводка боту:{Environment.NewLine}{text}");
         await app.NotifyAsync(text);
@@ -386,6 +470,12 @@ internal sealed partial class UnityAssetAutomationApp
 
     /// <summary>Каталог библиотеки этого прогона — названия ассетов для сводки.</summary>
     private AssetCatalog? _runCatalog;
+
+    /// <summary>История каналов прочитана и проверена до конца (ночной добор: канал пройден).</summary>
+    public bool HistoryPassFinished { get; private set; }
+
+    /// <summary>Сколько страниц ассетов открыто в магазине за прогон.</summary>
+    public int PagesOpened => _storePagesOpened;
 
     /// <summary>Облегчённые страницы включены (LitePages); сколько запросов браузер не стал грузить; ошибка включения.</summary>
     private bool _litePages;
@@ -1263,6 +1353,10 @@ internal sealed partial class UnityAssetAutomationApp
                 await Task.Delay(TimeSpan.FromMilliseconds(_options.DelayMs));
             }
 
+            // Ночной добор: история канала пройдена целиком — всё прочитано и проверено, лимит не остановил.
+            HistoryPassFinished = telegramCursors is { Count: > 0 } && telegramCursors.All(c => c.Exhausted) && !stoppedEarly &&
+                                  !_options.DryRun && queue.Count == 0 && telegramPending.Count == 0;
+
             // Запоминаем, до какого поста дочитали. Только если каналы прочитаны до конца
             // и все собранные ассеты проверены: иначе часть новых постов потерялась бы.
             if (telegramCursors is not null && !stoppedEarly && !_options.DryRun && queue.Count == 0 && telegramPending.Count == 0)
@@ -1436,10 +1530,14 @@ internal sealed partial class UnityAssetAutomationApp
             var path = Path.Combine(_logsDirectory, $"run-summary-{_startedLocal:yyyyMMdd-HHmmss}.txt");
             await File.WriteAllTextAsync(path, text);
             await File.WriteAllTextAsync(Path.Combine(_logsDirectory, "last-run-summary.txt"), text);
+            if (_options.HistoryBackfill)
+            {
+                await File.WriteAllTextAsync(Path.Combine(_logsDirectory, "last-backfill-summary.txt"), text);
+            }
             RunSummary.Prune(_logsDirectory, keep: 60);
             _logger.Info($"Сводка прогона (коротко, её и присылайте): {path}");
 
-            if (!_options.Watch && _notifier is { Enabled: true } && (report.Items.Count > 0 || _runCrashed))
+            if (!_options.Watch && !_options.HistoryBackfill && _notifier is { Enabled: true } && (report.Items.Count > 0 || _runCrashed))
             {
                 var added = report.Items.Count(i => i.Status is AssetProcessStatus.Added or AssetProcessStatus.WouldAddInDryRun);
                 var bad = report.Items.Count(i => i.Status is AssetProcessStatus.Failed or AssetProcessStatus.UnknownAfterClick);
@@ -1501,7 +1599,9 @@ internal sealed partial class UnityAssetAutomationApp
     {
         var kind = _options.Watch
             ? $"служба (прогон раз в {RunSummary.FormatDuration(_options.WatchInterval)})"
-            : "разовый прогон";
+            : _options.HistoryBackfill
+                ? "служба: ночной добор истории канала"
+                : "разовый прогон";
         var reading = _options.TelegramChannels.Count == 0
             ? "каналы не заданы"
             : _options.TelegramOnlyNew
@@ -2122,7 +2222,8 @@ internal sealed partial class UnityAssetAutomationApp
                     _options.NavigationTimeoutMs,
                     _options.TelegramPostLimit,
                     _options.TelegramScreenshotOnNoLinks,
-                    fetchHtml);
+                    fetchHtml,
+                    checkPriceOfAll: !_options.TelegramOnlyNew);
 
                 return await parser.ReadAsync(channels, want, isWanted, maxPostsPerChannel, maxPagesPerChannel);
             }
@@ -2174,6 +2275,7 @@ internal sealed partial class UnityAssetAutomationApp
         total.DownloadPosts += partial.DownloadPosts;
         total.DownloadAssetsFree += partial.DownloadAssetsFree;
         total.DownloadAssetsPaid += partial.DownloadAssetsPaid;
+        total.PaidByPrice += partial.PaidByPrice;
         foreach (var card in partial.Cards)
         {
             total.Cards.TryAdd(card.Key, card.Value);
@@ -8935,6 +9037,12 @@ internal sealed class CliOptions
     /// <summary>Режим сервера: прогон, пауза WatchInterval, снова прогон — пока не остановят.</summary>
     public bool Watch { get; init; }
 
+    /// <summary>
+    /// Ночной добор истории канала (служба запускает такой прогон сама, --history-backfill): сводка пишется и в
+    /// last-backfill-summary.txt, файлом боту не отправляется — итог ночи идёт строкой в суточную сводку.
+    /// </summary>
+    public bool HistoryBackfill { get; init; }
+
     public TimeSpan WatchInterval { get; init; } = TimeSpan.FromHours(24);
 
     /// <summary>
@@ -9125,6 +9233,7 @@ internal sealed class CliOptions
         var cliRenderCatalog = false;
         string? cliCatalogDir = null;
         var cliWatch = false;
+        var cliHistoryBackfill = false;
         var cliNotifyTest = false;
         string? cliWatchInterval = null;
         var cliTelegramOnlyNew = false;
@@ -9244,6 +9353,9 @@ internal sealed class CliOptions
                     break;
                 case "--watch":
                     cliWatch = true;
+                    break;
+                case "--history-backfill":
+                    cliHistoryBackfill = true;
                     break;
                 case "--notify-test":
                     cliNotifyTest = true;
@@ -9746,6 +9858,7 @@ internal sealed class CliOptions
             CheckLoginPage = cliCheckLoginPage,
             CheckTelegram = cliCheckTelegram,
             Watch = watch,
+            HistoryBackfill = cliHistoryBackfill,
             NotifyTest = cliNotifyTest,
             WatchInterval = watchInterval,
             DigestInterval = digestInterval,
@@ -9756,7 +9869,7 @@ internal sealed class CliOptions
             CatalogRefresh = catalogRefresh,
             ListSourcesEvery = listSourcesEvery,
             BotCatalog = botCatalog,
-            TelegramOnlyNew = watch || cliTelegramOnlyNew || (config?.Telegram?.OnlyNew ?? false),
+            TelegramOnlyNew = !cliHistoryBackfill && (watch || cliTelegramOnlyNew || (config?.Telegram?.OnlyNew ?? false)),
             NotifyBotToken = FirstNonEmpty(cliNotifyBotToken, Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN"), config?.Notify?.TelegramBotToken),
             NotifyChatId = FirstNonEmpty(cliNotifyChatId, Environment.GetEnvironmentVariable("TELEGRAM_CHAT_ID"), config?.Notify?.TelegramChatId),
             SplitScreen = !watch && (cliSplitScreen ?? config?.SplitScreen ?? true),
