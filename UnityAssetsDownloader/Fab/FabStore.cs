@@ -1335,6 +1335,12 @@ internal sealed partial class FabStore
                         await _notify!(text);
                     }
                 }
+                else if (attempt > 1 && notify && _notify is not null)
+                {
+                    // 13.10: после первого окна Fab снова попросил проверку — с телефона без этой строки не видно, что окно открылось опять.
+                    await _notify($"🔁 Fab снова просит: {title.ToLowerInvariant()}. Окно открыто ещё раз — та же ссылка" +
+                                  (ask is not null ? ", кнопка «✅ Готово» — в сообщении выше." : "."));
+                }
 
                 _lastHandOverClosedByHuman = await _browser.HandOverToHumanAsync(url, timeout, ask?.WaitDoneAsync);
                 _logger.Info(_lastHandOverClosedByHuman

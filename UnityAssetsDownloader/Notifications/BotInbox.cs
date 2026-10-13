@@ -32,6 +32,15 @@ internal sealed class BotInbox : IAsyncDisposable
     /// <summary>Сообщения владельца старше этого при запуске (пока служба перезапускалась) — уже не команды.</summary>
     private static readonly TimeSpan StaleText = TimeSpan.FromMinutes(10);
 
+    /// <summary>
+    /// Сколько секунд Telegram держит опрос, если писать нечего. 13.10 на сервере 50 с не доживали: молчащее соединение
+    /// где-то по дороге обрывается; прежнее ожидание кода входа по 25 с там работало с сентября.
+    /// </summary>
+    internal const int PollSeconds = 25;
+
+    /// <summary>Сколько опрос может не удаваться подряд, прежде чем сказать об этом в лог (дальше — раз в столько же).</summary>
+    private static readonly TimeSpan SilenceWarnAfter = TimeSpan.FromMinutes(5);
+
     private static readonly JsonSerializerOptions Json = new();
 
     /// <summary>Приёмник этого процесса (служба) или null.</summary>
@@ -198,12 +207,14 @@ internal sealed class BotInbox : IAsyncDisposable
 
         long offset = 0;
         var pause = TimeSpan.FromSeconds(10);
+        DateTime? silentSince = null;
+        var silenceWarned = DateTime.MinValue;
         while (!stop.IsCancellationRequested)
         {
             JsonElement? updates;
             try
             {
-                updates = await _bot.GetUpdatesAsync(offset, 50);
+                updates = await _bot.GetUpdatesAsync(offset, PollSeconds);
             }
             catch (Exception ex)
             {
@@ -218,7 +229,16 @@ internal sealed class BotInbox : IAsyncDisposable
 
             if (updates is not { } list)
             {
-                // Нет связи или опрашивает кто-то ещё (409) — подождём, не долбим Telegram.
+                // Нет связи или опрашивает кто-то ещё (409) — подождём, не долбим Telegram. Один сорвавшийся опрос — обычное
+                // дело; в лог — только если молчание затянулось.
+                silentSince ??= DateTime.UtcNow;
+                if (DateTime.UtcNow - silentSince >= SilenceWarnAfter && DateTime.UtcNow - silenceWarned >= SilenceWarnAfter)
+                {
+                    silenceWarned = DateTime.UtcNow;
+                    _log($"[Бот] Не слышу Telegram уже {(DateTime.UtcNow - silentSince.Value).TotalMinutes:0} мин — команды и кнопки " +
+                         "пока не доходят (сообщения бот отправляет как обычно).");
+                }
+
                 try
                 {
                     await Task.Delay(pause, stop);
@@ -232,6 +252,12 @@ internal sealed class BotInbox : IAsyncDisposable
                 continue;
             }
 
+            if (silentSince is { } since && DateTime.UtcNow - since >= SilenceWarnAfter)
+            {
+                _log("[Бот] Связь с Telegram снова есть — команды доходят.");
+            }
+
+            silentSince = null;
             pause = TimeSpan.FromSeconds(10);
             foreach (var update in list.EnumerateArray())
             {

@@ -319,13 +319,17 @@ internal sealed class TelegramNotifier
         return false;
     }
 
-    /// <summary>Одна порция обновлений (длинный опрос до waitSeconds). null — не дошло или Telegram отказал (409: опрашивает другой).</summary>
+    /// <summary>
+    /// Одна порция обновлений (длинный опрос до waitSeconds). null — не дошло или Telegram отказал (409: опрашивает другой).
+    /// Неудачу пишет в лог тихо (Debug): опрос идёт постоянно, а за долгим молчанием следит сам BotInbox.
+    /// </summary>
     internal async Task<JsonElement?> GetUpdatesAsync(long offset, int waitSeconds)
     {
         var updates = await CallAsync(
             "getUpdates",
-            new Dictionary<string, object> { ["offset"] = offset, ["timeout"] = waitSeconds },
-            TimeSpan.FromSeconds(waitSeconds + 15));
+            () => JsonContent.Create(new Dictionary<string, object> { ["offset"] = offset, ["timeout"] = waitSeconds }),
+            TimeSpan.FromSeconds(waitSeconds + 15),
+            quiet: true);
         return updates is { ValueKind: JsonValueKind.Array } ? updates : null;
     }
 
@@ -583,7 +587,8 @@ internal sealed class TelegramNotifier
         CallAsync(method, () => JsonContent.Create(payload), timeout);
 
     /// <param name="content">Тело запроса. Фабрика — потому что на каждом пути нужно новое: отправленное не переиспользуется.</param>
-    private async Task<JsonElement?> CallAsync(string method, Func<HttpContent> content, TimeSpan? timeout = null)
+    /// <param name="quiet">Не предупреждать в лог, если ни один путь не сработал (постоянный опрос бота службы).</param>
+    private async Task<JsonElement?> CallAsync(string method, Func<HttpContent> content, TimeSpan? timeout = null, bool quiet = false)
     {
         var routes = BuildRoutes();
         Exception? lastError = null;
@@ -644,6 +649,12 @@ internal sealed class TelegramNotifier
 
         // Путь, который работал, мог перестать: пусть следующий вызов начнёт перебор заново.
         _route = null;
+        if (quiet)
+        {
+            _logger.Debug($"[Бот] Telegram не ответил ({method}), путей: {routes.Count}: {lastError?.Message}");
+            return null;
+        }
+
         _logger.Warn($"[Бот] Telegram не отвечает ({method}). Пробовали путей: {routes.Count}. Последняя ошибка: {lastError?.Message}");
 
         if (!_unreachableWarned)
