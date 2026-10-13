@@ -236,8 +236,8 @@ async Task RunWatchLoopAsync()
         }
     }
 
-    // /fab и кнопка «Открыть окно» (из потока бота).
-    string RequestFab()
+    // /fab, /phone и кнопки «Открыть окно», «📱 С телефона» (из потока бота).
+    string RequestFab(bool phone)
     {
         if (!options.FabOnServer)
         {
@@ -249,8 +249,14 @@ async Task RunWatchLoopAsync()
             return "⚠ FAB_VNC_PASSWORD не задан — окно открыть нельзя. Запустите на сервере ./deploy.sh: он создаст пароль.";
         }
 
-        var reply = status.RequestFab();
-        Console.WriteLine($"[Сервер] Просьба открыть окно Fab: {reply}");
+        if (phone && !PhoneLinkSettings.FromEnvironment(_ => { }).Enabled)
+        {
+            return "Ссылка для телефона без туннеля выключена (FAB_PHONE_LINK в .env — включается в ./deploy.sh). Пришлите /fab: " +
+                   "окно откроется по туннелю (компьютер: tools/fab-window; iPhone: Termius).";
+        }
+
+        var reply = status.RequestFab(phone);
+        Console.WriteLine($"[Сервер] Просьба открыть окно Fab{(phone ? " (с телефона)" : string.Empty)}: {reply}");
         return reply;
     }
 
@@ -270,7 +276,11 @@ async Task RunWatchLoopAsync()
             lines.Add($"⚠ Зависаний с последней сводки: {stalls} (служба перезапускалась сама).");
         }
 
-        lines.Add("Команды: /fab — окно Fab, /status — это сообщение.");
+        var phoneLink = PhoneLinkSettings.FromEnvironment(_ => { });
+        lines.Add(phoneLink.Enabled
+            ? $"Окно с телефона: {(phoneLink.Mode == PhoneLinkMode.Https ? "https" : "http (без шифрования)")}://{phoneLink.PublicHost}:{phoneLink.PublicPort}."
+            : "Окно с телефона без туннеля выключено (FAB_PHONE_LINK).");
+        lines.Add("Команды: /fab — окно Fab, /phone — окно с телефона, /status — это сообщение.");
         return string.Join("\n", lines);
     }
 
@@ -282,8 +292,8 @@ async Task RunWatchLoopAsync()
             return;
         }
 
-        Console.WriteLine("[Сервер] Окно Fab по просьбе человека.");
-        var fabOptions = CliOptions.Parse(ServiceArgs.FabOnCall(args));
+        Console.WriteLine($"[Сервер] Окно Fab по просьбе человека{(status.LastRequestPhone ? " (с телефона)" : string.Empty)}.");
+        var fabOptions = CliOptions.Parse(ServiceArgs.FabOnCall(args, status.LastRequestPhone));
         UnityAssetAutomationApp? app = null;
         var crashed = false;
         try
@@ -9425,6 +9435,12 @@ internal sealed class CliOptions
     public bool FabOnCall { get; init; }
 
     /// <summary>
+    /// --fab-phone (с --fab-on-call): человек попросил окно с телефона (/phone, «📱 С телефона») — ссылку без туннеля
+    /// прислать сразу, как откроется окно, не дожидаясь второго нажатия.
+    /// </summary>
+    public bool FabPhoneNow { get; init; }
+
+    /// <summary>
     /// Разведка (--fab-recon https://www.fab.com/listings/…): открыть ассет в окне, где вы сами получите
     /// его с записью сети (DevTools → HAR). Нужна, чтобы научить программу получать раздачи со скидкой 100 %.
     /// </summary>
@@ -9571,6 +9587,7 @@ internal sealed class CliOptions
         var cliFabLogin = false;
         var cliFabServer = false;
         var cliFabOnCall = false;
+        var cliFabPhone = false;
         string? cliFabRecon = null;
         var cliFabGiveaway = false;
         var cliFabUrls = new List<string>();
@@ -9706,6 +9723,9 @@ internal sealed class CliOptions
                 case "--fab-on-call":
                     cliFabOnCall = true;
                     cliFabServer = true;
+                    break;
+                case "--fab-phone":
+                    cliFabPhone = true;
                     break;
                 case "--fab-giveaway":
                     cliFabGiveaway = true;
@@ -10213,6 +10233,7 @@ internal sealed class CliOptions
             FabLoginOnly = cliFabLogin,
             FabServerOnce = cliFabServer,
             FabOnCall = cliFabOnCall,
+            FabPhoneNow = cliFabPhone && cliFabOnCall,
             FabReconUrl = cliFabRecon,
             FabGiveaway = cliFabGiveaway,
             FabUrls = cliFabUrls,

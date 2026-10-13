@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 
@@ -99,6 +100,7 @@ internal sealed class RemoteWindow : IAsyncDisposable
     private readonly Process _xvfb;
     private Process? _vnc;
     private Process? _web;
+    private PhoneGateway? _phone;
     private Queue<string>? _vncErrors;
     private Queue<string>? _webErrors;
     private string? _passwordFile;
@@ -132,7 +134,7 @@ internal sealed class RemoteWindow : IAsyncDisposable
     /// не уходит; noVNC берёт параметры и из «#». Не подставился (старый noVNC) — noVNC просто спросит пароль.
     /// </summary>
     public static string Link(string port, string? password) =>
-        $"http://127.0.0.1:{port}/vnc.html?autoconnect=true&resize=scale" +
+        $"http://127.0.0.1:{port}/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=3000" +
         (string.IsNullOrEmpty(password) ? string.Empty : "#password=" + Uri.EscapeDataString(password.Length > 8 ? password[..8] : password));
 
     private string HintText(bool withPassword)
@@ -314,6 +316,74 @@ internal sealed class RemoteWindow : IAsyncDisposable
     }
 
     /// <summary>Закрывает удалённый доступ и стирает файл с паролем. Виртуальный экран остаётся.</summary>
+    /// <summary>
+    /// Открывает вход в окно с телефона (кнопка «📱 С телефона» в боте) и возвращает ссылку с паролем окна после «#» — только
+    /// для сообщения бота, в лог её не писать. Уже открыт — та же ссылка. Warning — сертификат скоро кончается.
+    /// Бросает, если открыть нельзя (нет сертификата, порт занят) — причину человеку пишет бот.
+    /// </summary>
+    public async Task<(string Link, string? Warning)> StartPhoneAsync(PhoneLinkSettings phone)
+    {
+        if (!phone.Enabled)
+        {
+            throw new InvalidOperationException("ссылка с телефона выключена (FAB_PHONE_LINK в .env, ./deploy.sh)");
+        }
+
+        if (!ViewerRunning)
+        {
+            await StartViewerAsync();
+        }
+
+        string? warning = null;
+        if (_phone is not { IsOpen: true })
+        {
+            if (_phone is not null)
+            {
+                await _phone.DisposeAsync();
+            }
+
+            SslStreamCertificateContext? tls = null;
+            if (phone.Mode == PhoneLinkMode.Https)
+            {
+                (_, tls, warning) = phone.LoadCertificate(DateTime.UtcNow);
+            }
+
+            _phone = PhoneGateway.Start(PhoneLinkSettings.InternalPort, tls, _settings.NoVncDir, _settings.VncPort, phone.Lifetime, _logger.Info);
+            _logger.Info($"[Окно] Вход с телефона открыт: {(phone.Mode == PhoneLinkMode.Https ? "https" : "http")}://{phone.PublicHost}:{phone.PublicPort}, " +
+                         $"на {phone.Lifetime.TotalMinutes:0} мин, по одноразовой ссылке.");
+            if (warning is not null)
+            {
+                _logger.Warn($"[Окно] {warning}");
+            }
+        }
+
+        var link = _phone.Link(phone.Mode == PhoneLinkMode.Https ? "https" : "http", phone.PublicHost!, phone.PublicPort);
+        // Пароль окна — как в обычной ссылке: после «#», и только если это не выключено (FAB_VNC_LINK_PASSWORD=off).
+        var password = !_settings.PasswordInLink ? null : _settings.Password is { Length: > 8 } p ? p[..8] : _settings.Password;
+        return (string.IsNullOrEmpty(password) ? link : link + "#password=" + Uri.EscapeDataString(password), warning);
+    }
+
+    /// <summary>Закрывает вход с телефона (окно закрылось, «Готово», ссылка устарела). Повторный вызов ничего не делает.</summary>
+    public async Task StopPhoneAsync()
+    {
+        if (_phone is null)
+        {
+            return;
+        }
+
+        var wasOpen = _phone.IsOpen;
+        await _phone.DisposeAsync();
+        _phone = null;
+        if (wasOpen)
+        {
+            _logger.Info("[Окно] Вход с телефона закрыт.");
+        }
+    }
+
+    /// <summary>
+    /// Вход с телефона здесь не закрывается: между первой и повторной просьбой Fab окно перезапускается, а ссылка у человека
+    /// должна остаться той же (noVNC переподключится сам — reconnect в ссылке). Закрывает его конец просьбы (StopPhoneAsync)
+    /// и DisposeAsync.
+    /// </summary>
     public async Task StopViewerAsync()
     {
         var wasRunning = _web is not null || _vnc is not null;
@@ -342,6 +412,7 @@ internal sealed class RemoteWindow : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        await StopPhoneAsync();
         await StopViewerAsync();
         await StopAsync(_xvfb);
         _xvfb.Dispose();

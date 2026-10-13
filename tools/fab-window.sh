@@ -10,7 +10,7 @@
 # На сервере и на этом компьютере ничего не меняет. Лог — tools/logs/fab-window.log (пароль туда не пишется).
 
 set -u
-VERSION="1.0.0"
+VERSION="1.0.1"
 HERE="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")" && pwd)"
 SETTINGS="$HERE/fab-window.local.conf"
 LOG_DIR="$HERE/logs"
@@ -119,7 +119,7 @@ open_window() {
     fi
 
     # Пароль окна — после «#»: остаётся в браузере, по сети не уходит; в лог не пишется.
-    open_url "http://127.0.0.1:$local_port/vnc.html?autoconnect=true&resize=scale#password=$WIN_PASSWORD"
+    open_url "http://127.0.0.1:$local_port/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=3000#password=$WIN_PASSWORD"
     log "browser opened: http://127.0.0.1:$local_port/vnc.html (password in #)"
     echo
     echo "В окне: поставьте галочку (или войдите, если просит). Потом нажмите «✅ Готово» в сообщении бота"

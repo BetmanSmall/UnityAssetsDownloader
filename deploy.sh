@@ -128,6 +128,54 @@ env_get() {
 
 mask() { [ -n "$1" ] && printf '%s' "${1:0:3}…(${#1} симв.)" || printf 'не задан'; }
 
+# Для /etc/letsencrypt и certbot нужен root; не под root — через sudo.
+SUDO=""
+[ "$(id -u)" -ne 0 ] && SUDO="sudo"
+# Папка Let's Encrypt (меняется только для проверки скрипта в песочнице).
+LE_DIR=${LE_DIR:-/etc/letsencrypt}
+
+# Сертификат Let's Encrypt для окна с телефона. Порт 80 на сервере может занимать другой проект (на нашем — nginx
+# smartvan): Let's Encrypt проверяет домен, запрашивая файл по http://<домен>/.well-known/acme-challenge/, поэтому
+# файл кладётся в ту папку, которую этот сервер отдаёт по такому адресу. Сначала своя проба, потом certbot.
+# Продлевать будет certbot сервера сам (certbot.timer), с той же папкой.
+issue_phone_cert() {
+    local domain=$1 detected="" webroot token got c
+    if ! command -v certbot >/dev/null 2>&1; then
+        warn "certbot не установлен — сертификат не выпустить. Установите (apt install certbot) и запустите ./deploy.sh снова."
+        return
+    fi
+    echo "  Let's Encrypt проверит домен, запросив файл по http://$domain/.well-known/acme-challenge/…"
+    echo "  Порт 80 здесь отвечает тот, кто его занимает, — файл кладём в его папку проверок."
+    for c in $(docker ps --format '{{.Names}}' 2>/dev/null); do
+        detected=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/www/certbot"}}{{.Source}}{{end}}{{end}}' "$c" 2>/dev/null)
+        [ -n "$detected" ] && break
+    done
+    [ -z "$detected" ] && [ -d /var/www/certbot ] && detected=/var/www/certbot
+    ask webroot "Папка, которую сервер на порту 80 отдаёт по /.well-known/acme-challenge/" "$detected"
+    if [ -z "$webroot" ] || ! $SUDO test -d "$webroot"; then
+        fail "Папки «$webroot» нет — сертификат не выпущен."
+        return
+    fi
+    token="uad-check-$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 12)"
+    $SUDO mkdir -p "$webroot/.well-known/acme-challenge"
+    printf '%s' "$token" | $SUDO tee "$webroot/.well-known/acme-challenge/$token" >/dev/null
+    got=$(curl -s -m 10 "http://$domain/.well-known/acme-challenge/$token" 2>/dev/null || true)
+    $SUDO rm -f "$webroot/.well-known/acme-challenge/$token"
+    if [ "$got" != "$token" ]; then
+        fail "По http://$domain/.well-known/acme-challenge/ отдаётся не эта папка (или домен смотрит не сюда) — Let's Encrypt домен не проверит."
+        return
+    fi
+    ok "Проба прошла: порт 80 отдаёт файлы из $webroot для $domain."
+    ask_yes "Выпустить сертификат Let's Encrypt для $domain (это согласие с условиями Let's Encrypt)?" Y || return
+    local extra=()
+    $SUDO sh -c "ls $LE_DIR/accounts/*/directory/* >/dev/null 2>&1" || extra=(--register-unsafely-without-email)
+    if $SUDO certbot certonly --webroot -w "$webroot" -d "$domain" --non-interactive --agree-tos --keep-until-expiring "${extra[@]}"; then
+        ok "Сертификат выпущен."
+    else
+        fail "certbot не выпустил сертификат — причина выше."
+    fi
+}
+
 # Имя канала из «@name», «t.me/name», «https://t.me/s/name» и т. п.
 normalize_channel() {
     local c=$1
@@ -369,6 +417,89 @@ esac
 if ask_yes "Забирать ассеты Fab на сервере сам (FAB=on)?" "$FAB_DEFAULT"; then FAB_VALUE=on; else FAB_VALUE=off; fi
 ok "Fab на сервере: $FAB_VALUE"
 
+bold "6б. Окно Fab с телефона, без туннеля"
+echo "  Когда Fab нужна галочка, окно можно открыть прямо с телефона по ссылке из бота — без SSH."
+echo "  Ссылка появляется, только когда вы сами нажмёте «📱 С телефона» (или /phone), живёт 15 минут,"
+echo "  после первого входа открывается только на вашем устройстве; пароль окна тоже нужен (он в ссылке)."
+echo "  1 — выключено: окно только через SSH-туннель (tools/fab-window, Termius)."
+echo "  2 — HTTP по адресу сервера: просто, но без шифрования — только для галочки, пароль Epic там не вводить."
+echo "  3 — HTTPS через ваш домен: настоящий сертификат Let's Encrypt (запись A домена → этот сервер)."
+PHONE_HOST_OLD=$(env_get FAB_PHONE_HOST)
+case "$(env_get FAB_PHONE_LINK)" in http) PHONE_DEFAULT=2 ;; https) PHONE_DEFAULT=3 ;; *) PHONE_DEFAULT=1 ;; esac
+while :; do
+    ask PHONE_CHOICE "Выберите 1, 2 или 3" "$PHONE_DEFAULT"
+    case "$PHONE_CHOICE" in 1|2|3) break ;; *) fail "Нужно 1, 2 или 3." ;; esac
+done
+PHONE_LINK=off
+PHONE_HOST=""
+PHONE_CERT_LIVE=""
+PHONE_CERT_ARCHIVE=""
+PHONE_PORT=$(env_get FAB_PHONE_PORT)
+PHONE_PORT=${PHONE_PORT:-7443}
+if [ "$PHONE_CHOICE" != 1 ]; then
+    PUBLIC_IP=$(curl -s -m 6 https://api.ipify.org 2>/dev/null || true)
+    while :; do
+        ask PHONE_PORT "Порт для ссылки (откроется наружу)" "$PHONE_PORT"
+        [[ "$PHONE_PORT" =~ ^[0-9]+$ ]] && [ "$PHONE_PORT" -ge 1024 ] && [ "$PHONE_PORT" -le 65535 ] && break
+        fail "Номер порта от 1024 до 65535."
+    done
+    # Порт не должен быть занят чужим (наш контейнер при повторной настройке держит его сам).
+    if ss -ltnH "( sport = :$PHONE_PORT )" 2>/dev/null | grep -q . &&
+       ! docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep -q "^unity-assets-downloader .*:$PHONE_PORT->"; then
+        warn "Порт $PHONE_PORT уже занят другой программой — служба не запустится. Выберите другой (./deploy.sh снова)."
+    fi
+fi
+if [ "$PHONE_CHOICE" = 2 ]; then
+    DEF_HOST=$PHONE_HOST_OLD
+    [[ "$DEF_HOST" =~ ^[0-9.]+$ ]] || DEF_HOST=$PUBLIC_IP
+    while :; do
+        ask PHONE_HOST "Адрес сервера для ссылки" "$DEF_HOST"
+        [[ "$PHONE_HOST" =~ ^[A-Za-z0-9.-]+$ ]] && break
+        fail "Нужен адрес (например 203.0.113.5) или имя сервера."
+    done
+    PHONE_LINK=http
+    ok "Окно с телефона: http://$PHONE_HOST:$PHONE_PORT/… — без шифрования, только для галочки."
+elif [ "$PHONE_CHOICE" = 3 ]; then
+    DEF_HOST=$PHONE_HOST_OLD
+    [[ "$DEF_HOST" =~ ^[0-9.]+$ ]] && DEF_HOST=""
+    while :; do
+        ask PHONE_HOST "Домен для окна (например fab.example.ru)" "$DEF_HOST"
+        [[ "$PHONE_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] && break
+        fail "Нужен домен, например fab.example.ru."
+    done
+    RESOLVED=$(getent ahostsv4 "$PHONE_HOST" 2>/dev/null | awk 'NR==1{print $1}')
+    if [ -z "$RESOLVED" ]; then
+        warn "Домен $PHONE_HOST не находится в DNS — добавьте запись A → ${PUBLIC_IP:-адрес сервера} и запустите ./deploy.sh снова."
+    elif [ -n "$PUBLIC_IP" ] && [ "$RESOLVED" != "$PUBLIC_IP" ]; then
+        warn "Домен $PHONE_HOST указывает на $RESOLVED, а у сервера адрес $PUBLIC_IP — поправьте запись A."
+    else
+        ok "Домен $PHONE_HOST указывает на этот сервер ($RESOLVED)."
+    fi
+    CERT_DIR="$LE_DIR/live/$PHONE_HOST"
+    if ! $SUDO test -f "$CERT_DIR/fullchain.pem" && [ -n "$RESOLVED" ]; then
+        issue_phone_cert "$PHONE_HOST"
+    fi
+    if $SUDO test -f "$CERT_DIR/fullchain.pem"; then
+        PHONE_LINK=https
+        # Подключаем в контейнер только папки этого домена и только когда сертификат уже есть: иначе Docker создал бы
+        # пустую папку live/<домен>, и certbot потом отказался бы её заполнять.
+        PHONE_CERT_LIVE=$CERT_DIR
+        PHONE_CERT_ARCHIVE="$LE_DIR/archive/$PHONE_HOST"
+        CERT_END=$($SUDO openssl x509 -enddate -noout -in "$CERT_DIR/fullchain.pem" 2>/dev/null | cut -d= -f2)
+        ok "Сертификат для $PHONE_HOST есть${CERT_END:+ (до $CERT_END)}; продлевать будет certbot сервера."
+        systemctl is-active certbot.timer >/dev/null 2>&1 ||
+            warn "certbot.timer не активен — сертификат сам не продлится (за 2 недели до конца программа напишет в бот)."
+        ok "Окно с телефона: https://$PHONE_HOST:$PHONE_PORT/…"
+    else
+        warn "Сертификата для $PHONE_HOST нет — окно с телефона пока выключено. Будет сертификат — запустите ./deploy.sh снова."
+    fi
+fi
+if [ "$PHONE_LINK" = off ]; then
+    # Домен или адрес не забываем: включите снова — он будет предложен по умолчанию.
+    [ -z "$PHONE_HOST" ] && PHONE_HOST=$PHONE_HOST_OLD
+    ok "Окно с телефона без туннеля: выключено."
+fi
+
 DEFAULT_TZ=$(env_get TZ)
 [ -z "$DEFAULT_TZ" ] && DEFAULT_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || true)
 ask TZ_VALUE "Часовой пояс для логов" "${DEFAULT_TZ:-Europe/Moscow}"
@@ -395,12 +526,19 @@ umask 077
     echo "TOP_FREE_EVERY=$TOP_FREE_EVERY"
     echo "FAB=$FAB_VALUE"
     echo "FAB_VNC_PASSWORD=$(env_quote "$FAB_VNC_PASSWORD")"
+    echo "FAB_PHONE_LINK=$PHONE_LINK"
+    echo "FAB_PHONE_HOST=$(env_quote "$PHONE_HOST")"
+    echo "FAB_PHONE_PORT=$PHONE_PORT"
+    # Наружу порт открывается только при включённой ссылке; иначе он слушает лишь localhost сервера.
+    if [ "$PHONE_LINK" = off ]; then echo "FAB_PHONE_BIND=127.0.0.1"; else echo "FAB_PHONE_BIND=0.0.0.0"; fi
+    echo "FAB_PHONE_CERT_LIVE=$(env_quote "$PHONE_CERT_LIVE")"
+    echo "FAB_PHONE_CERT_ARCHIVE=$(env_quote "$PHONE_CERT_ARCHIVE")"
     echo "PROFILE=$PROFILE"
     echo "TZ=$TZ_VALUE"
     # Настройки, о которых deploy.sh не спрашивает (TELEGRAM_PROXY, BOT_DIGEST и другие,
     # вписанные руками), переносим как есть — раньше они молча пропадали.
     if [ -f "$ENV_FILE" ]; then
-        grep -vE '^(#|[[:space:]]*$|(UNITY_EMAIL|UNITY_PASSWORD|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_CHANNELS|WATCH_INTERVAL|NIGHT_BACKFILL_CHANNELS|SOURCES|TOP_FREE_EVERY|FAB|FAB_VNC_PASSWORD|PROFILE|TZ)=)' "$ENV_FILE" || true
+        grep -vE '^(#|[[:space:]]*$|(UNITY_EMAIL|UNITY_PASSWORD|TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|TELEGRAM_CHANNELS|WATCH_INTERVAL|NIGHT_BACKFILL_CHANNELS|SOURCES|TOP_FREE_EVERY|FAB|FAB_VNC_PASSWORD|FAB_PHONE_LINK|FAB_PHONE_HOST|FAB_PHONE_PORT|FAB_PHONE_BIND|FAB_PHONE_CERT_LIVE|FAB_PHONE_CERT_ARCHIVE|PROFILE|TZ)=)' "$ENV_FILE" || true
     fi
 } > "$ENV_FILE.tmp" && mv "$ENV_FILE.tmp" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
@@ -533,7 +671,8 @@ cat <<EOF
     обновить программу: git pull && ./deploy.sh
     остановить:         ${DC[*]} down
 
-  Окно Fab (галочка, вход в Epic): проще всего — /fab в боте или кнопка «Открыть окно» в его сообщении.
+  Окно Fab (галочка, вход в Epic): проще всего — /fab в боте или кнопка «Открыть окно» в его сообщении;
+  с телефона без туннеля — /phone или «📱 С телефона» (если включено в разделе 6б).
   Или вручную — один раз, между прогонами (в логе «Следующий прогон»):
     ${DC[*]} exec -it unity-assets dotnet UnityAssetsDownloader.dll --logs-dir /app/logs --data-dir /app/data --profile $PROFILE --fab-login
     затем на своём компьютере: tools/fab-window (Windows: tools\\fab-window.cmd) — туннель и браузер одним кликом,

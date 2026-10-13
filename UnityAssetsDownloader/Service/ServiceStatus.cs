@@ -23,6 +23,11 @@ internal sealed class ServiceStatus
     /// <summary>Сеанс Fab по просьбе идёт.</summary>
     public bool FabRunning { get; private set; }
 
+    /// <summary>В последней принятой просьбе человек просил ссылку для телефона (/phone, «📱 С телефона»).</summary>
+    public bool LastRequestPhone { get; private set; }
+
+    private bool _phoneRequested;
+
     public void SetBusy(string activity)
     {
         lock (_sync)
@@ -49,14 +54,18 @@ internal sealed class ServiceStatus
     /// Человек просит окно Fab (/fab или кнопка). Возвращает ответ ему; спящую службу будит. Повторные нажатия, пока
     /// просьба в очереди или сеанс идёт, ничего не добавляют.
     /// </summary>
-    public string RequestFab()
+    public string RequestFab(bool phone = false)
     {
         lock (_sync)
         {
             if (FabRunning)
             {
-                return "Окно Fab уже открывается или открыто — ссылка придёт (или уже пришла) отдельным сообщением.";
+                return phone
+                    ? "Окно Fab уже открывается. Понадобится галочка — нажмите «📱 С телефона» под сообщением с окном."
+                    : "Окно Fab уже открывается или открыто — ссылка придёт (или уже пришла) отдельным сообщением.";
             }
+
+            _phoneRequested |= phone;
 
             if (FabRequested)
             {
@@ -88,6 +97,8 @@ internal sealed class ServiceStatus
             }
 
             FabRequested = false;
+            LastRequestPhone = _phoneRequested;
+            _phoneRequested = false;
             FabRunning = true;
             Activity = "окно Fab по вашей просьбе";
             Since = DateTime.Now;

@@ -28,6 +28,9 @@ internal sealed partial class UnityAssetAutomationApp
 
     private FabOnCallOutcome? _fabOnCallOutcome;
 
+    /// <summary>Окно сервера этого запуска Fab (для входа с телефона) или null.</summary>
+    private RemoteWindow? _fabRemote;
+
     /// <summary>
     /// Сервер: сколько последних постов канала читаем в первый раз. Старые ссылки Fab к тому времени уже
     /// разобрали на ПК и Deck (пункт F), а читать всю историю — сотни страниц и заходов на Fab.
@@ -128,6 +131,7 @@ internal sealed partial class UnityAssetAutomationApp
                 try
                 {
                     remote = await RemoteWindow.StartAsync(_logger, RemoteWindow.Settings.FromEnvironment(_options.FabVncPassword, _logger.Warn));
+                    _fabRemote = remote;
                 }
                 catch (Exception ex)
                 {
@@ -152,6 +156,7 @@ internal sealed partial class UnityAssetAutomationApp
             if (remote is not null)
             {
                 await remote.DisposeAsync();
+                _fabRemote = null;
             }
 
             if (server && _options.FabOnCall)
@@ -184,15 +189,79 @@ internal sealed partial class UnityAssetAutomationApp
         }
 
         var data = "fab-done:" + Guid.NewGuid().ToString("N")[..12];
-        var messageId = await notifier.SendWithButtonsAsync(text, [("✅ Готово", data)]);
+        // Вход с телефона без туннеля (этап C): кнопка — только если он включён и бота слушает служба (её приёмник ловит нажатие).
+        var phone = PhoneLinkSettings.FromEnvironment(_logger.Warn);
+        var remote = _fabRemote;
+        var inbox = BotInbox.Active;
+        var canPhone = phone.Enabled && remote is not null && inbox is not null;
+        var phoneData = "fab-phone:" + Guid.NewGuid().ToString("N")[..12];
+        var messageId = await notifier.SendWithButtonsAsync(text,
+            canPhone ? [("✅ Готово", data), ("📱 С телефона", phoneData)] : [("✅ Готово", data)]);
         if (messageId is not { } id)
         {
             return null;
         }
 
+        var phoneWait = new CancellationTokenSource();
+        if (canPhone)
+        {
+            async Task OpenPhoneAsync()
+            {
+                try
+                {
+                    var (link, warning) = await remote!.StartPhoneAsync(phone);
+                    await notifier.SendAsync(
+                        $"📱 Окно для телефона — ссылка на {phone.Lifetime.TotalMinutes:0} мин, только для вас (после первого входа — только с этого " +
+                        $"устройства):\n{link}" +
+                        (phone.Mode == PhoneLinkMode.Http
+                            ? "\nБез шифрования: здесь только галочка. Пароль Epic в этом окне не вводите — вход в Epic только с компьютера (туннель)."
+                            : string.Empty) +
+                        "\nСделали — «✅ Готово» в сообщении выше." + (warning is null ? string.Empty : $"\n⚠ {warning}"));
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn($"[Окно] Вход с телефона не открылся: {ex.Message}");
+                    await notifier.SendAsync($"⚠ Вход с телефона не открылся: {ex.Message}. Окно доступно по туннелю (ссылка выше).");
+                }
+            }
+
+            // Сам человек просил с телефона (/phone, «📱 С телефона» в «Fab ждёт вас») — ссылку сразу. Иначе — по кнопке; можно
+            // нажать ещё раз (ссылка устарела, телефон сменился). Ждём, пока открыто окно.
+            if (_options.FabPhoneNow)
+            {
+                await OpenPhoneAsync();
+            }
+
+            _ = Task.Run(async () =>
+            {
+                while (!phoneWait.IsCancellationRequested)
+                {
+                    var pressed = await inbox!.WaitAsync(
+                        e => e.IsButton ? e.Text == phoneData || e.Text == BotInbox.FabOpenPhoneButton : BotInbox.CommandOf(e.Text) == "phone",
+                        "Открываю вход с телефона…", timeout, phoneWait.Token);
+                    if (pressed is null)
+                    {
+                        break;
+                    }
+
+                    await OpenPhoneAsync();
+                }
+            });
+        }
+
         return new HumanAsk(
             cancel => notifier.WaitForButtonAsync(data, ["готово", "done"], timeout, cancel),
-            () => notifier.ClearButtonsAsync(id));
+            async () =>
+            {
+                await phoneWait.CancelAsync();
+                phoneWait.Dispose();
+                if (remote is not null)
+                {
+                    await remote.StopPhoneAsync();
+                }
+
+                await notifier.ClearButtonsAsync(id);
+            });
     }
 
     /// <summary>
@@ -206,12 +275,17 @@ internal sealed partial class UnityAssetAutomationApp
             return;
         }
 
+        var phone = PhoneLinkSettings.FromEnvironment(_logger.Warn).Enabled;
         await notifier.SendWithButtonsAsync(
             $"⏳ Fab ждёт вас: {title.ToLowerInvariant()}.\n" +
             "Окно сразу не держу — на сервере мало памяти. Будете готовы — нажмите «🔓 Открыть окно» (или пришлите /fab): сервер " +
-            "откроет Fab и, если понадобится, пришлёт ссылку на окно и кнопку «Готово». Компьютер: tools/fab-window; iPhone: Termius.\n" +
+            "откроет Fab и, если понадобится, пришлёт ссылку на окно и кнопку «Готово». Компьютер: tools/fab-window" +
+            (phone ? "; телефон — «📱 С телефона» (или /phone): ссылка придёт сразу, без туннеля.\n" : "; iPhone: Termius.\n") +
             "До этого сервер на Fab не заходит; не откликнетесь — позову снова через сутки.",
-            [("🔓 Открыть окно", BotInbox.FabOpenButton)], silent: QuietHours.Now());
+            phone
+                ? [("🔓 Открыть окно", BotInbox.FabOpenButton), ("📱 С телефона", BotInbox.FabOpenPhoneButton)]
+                : [("🔓 Открыть окно", BotInbox.FabOpenButton)],
+            silent: QuietHours.Now());
     }
 
     /// <summary>Короткий итог сеанса по просьбе человека: он нажал кнопку и ждёт ответа, даже если делать было нечего.</summary>

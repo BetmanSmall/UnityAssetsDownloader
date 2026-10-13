@@ -29,6 +29,10 @@ services:
     # http://127.0.0.1:6085/vnc.html (именно 127.0.0.1, не localhost: localhost может уйти в IPv6). Внутри контейнера порт открывается только на время просьбы к человеку.
     ports:
       - "127.0.0.1:${FAB_VNC_PORT:-6085}:6085"
+      # Окно Fab с телефона без туннеля (FAB_PHONE_LINK=http|https, ./deploy.sh). Пока режим выключен — только localhost;
+      # включён — deploy.sh пишет FAB_PHONE_BIND=0.0.0.0. Внутри порт слушается только во время входа по кнопке
+      # «📱 С телефона» (одноразовая ссылка на 15 мин), в остальное время соединение сразу отклоняется.
+      - "${FAB_PHONE_BIND:-127.0.0.1}:${FAB_PHONE_PORT:-7443}:7443"
     # Вывод службы (docker compose logs) не должен съесть диск: храним до 3 файлов по 10 МБ —
     # это несколько месяцев прогонов.
     logging:
@@ -57,3 +61,7 @@ services:
       # Общий список каналов: читается всегда, вместе с TELEGRAM_CHANNELS из .env (тем, что добавлено
       # только на этом сервере). Правка файла подхватывается в следующем прогоне.
       - ./telegram_sources.txt:/app/telegram_sources.txt:ro
+      # Сертификат домена для окна с телефона (HTTPS): только папки этого домена из /etc/letsencrypt и только для чтения;
+      # пути те же, что на сервере, — иначе ссылки live → archive не сработают. Без HTTPS — пустые папки в data/.
+      - "${FAB_PHONE_CERT_LIVE:-./data/no-phone-cert/live}:${FAB_PHONE_CERT_LIVE:-/opt/no-phone-cert/live}:ro"
+      - "${FAB_PHONE_CERT_ARCHIVE:-./data/no-phone-cert/archive}:${FAB_PHONE_CERT_ARCHIVE:-/opt/no-phone-cert/archive}:ro"

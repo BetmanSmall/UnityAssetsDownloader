@@ -26,6 +26,9 @@ internal sealed class BotInbox : IAsyncDisposable
     /// <summary>Данные кнопки «Открыть окно» (Fab по просьбе человека).</summary>
     public const string FabOpenButton = "fab-open";
 
+    /// <summary>Данные кнопки «📱 С телефона» в сообщении «Fab ждёт вас»: окно и сразу ссылка для телефона (без туннеля).</summary>
+    public const string FabOpenPhoneButton = "fab-open-phone";
+
     /// <summary>Сколько чужих сообщений в час пересылать владельцу; остальные — одной строкой «ещё N».</summary>
     public const int ForwardsPerHour = 10;
 
@@ -71,8 +74,8 @@ internal sealed class BotInbox : IAsyncDisposable
         _journalPath = Path.Combine(bot.DataDirectory, JournalFileName);
     }
 
-    /// <summary>Что ответить на /fab и кнопку «Открыть окно».</summary>
-    public Func<string>? OnFab { get; init; }
+    /// <summary>Что ответить на /fab и кнопку «Открыть окно»; аргумент true — /phone и «📱 С телефона» (ссылка без туннеля).</summary>
+    public Func<bool, string>? OnFab { get; init; }
 
     /// <summary>Что ответить на /status.</summary>
     public Func<string>? OnStatus { get; init; }
@@ -81,7 +84,7 @@ internal sealed class BotInbox : IAsyncDisposable
     /// Запускает приёмник службы. null — бот не настроен, чат владельца неизвестен (тогда команды не нужны: некому их
     /// слать) или журнал уже держит другой процесс.
     /// </summary>
-    public static async Task<BotInbox?> StartAsync(TelegramNotifier bot, Action<string> log, Func<string>? onFab, Func<string>? onStatus)
+    public static async Task<BotInbox?> StartAsync(TelegramNotifier bot, Action<string> log, Func<bool, string>? onFab, Func<string>? onStatus)
     {
         if (!bot.Enabled)
         {
@@ -200,10 +203,11 @@ internal sealed class BotInbox : IAsyncDisposable
     {
         await _bot.SetCommandsAsync([
             ("fab", "Открыть окно Fab: галочка Cloudflare, вход в Epic"),
+            ("phone", "Окно Fab с телефона, без туннеля (если включено)"),
             ("status", "Что сейчас делает служба"),
             ("help", "Что умеет бот")
         ]);
-        _log("[Бот] Служба слушает бота: /fab, /status, кнопка «Открыть окно»; чужие сообщения пересылаются вам.");
+        _log("[Бот] Служба слушает бота: /fab, /phone, /status, кнопки «Открыть окно»; чужие сообщения пересылаются вам.");
 
         long offset = 0;
         var pause = TimeSpan.FromSeconds(10);
@@ -304,9 +308,9 @@ internal sealed class BotInbox : IAsyncDisposable
             return;
         }
 
-        if (data == FabOpenButton)
+        if (data is FabOpenButton or FabOpenPhoneButton)
         {
-            var reply = OnFab?.Invoke() ?? "Окно Fab здесь открыть нельзя.";
+            var reply = OnFab?.Invoke(data == FabOpenPhoneButton) ?? "Окно Fab здесь открыть нельзя.";
             await _bot.AnswerCallbackAsync(callbackId, Shorten(reply, 190));
             await _bot.SendAsync(reply);
             return;
@@ -359,7 +363,8 @@ internal sealed class BotInbox : IAsyncDisposable
         switch (CommandOf(text))
         {
             case "fab":
-                await _bot.SendAsync(OnFab?.Invoke() ?? "Окно Fab здесь открыть нельзя.");
+            case "phone":
+                await _bot.SendAsync(OnFab?.Invoke(CommandOf(text) == "phone") ?? "Окно Fab здесь открыть нельзя.");
                 break;
             case "status":
                 await _bot.SendAsync(OnStatus?.Invoke() ?? "Служба работает.");
@@ -379,7 +384,8 @@ internal sealed class BotInbox : IAsyncDisposable
 
     internal const string HelpText =
         "Команды:\n/fab — открыть окно Fab (галочка Cloudflare, вход в Epic): сервер откроет Fab и, если понадобится, пришлёт " +
-        "ссылку на окно и кнопку «Готово»;\n/status — что сейчас делает служба.\nКнопка «🔓 Открыть окно» в сообщениях — то же, что /fab.";
+        "ссылку на окно и кнопку «Готово»;\n/phone — то же, но сразу со ссылкой для телефона без туннеля (если она включена);\n" +
+        "/status — что сейчас делает служба.\nКнопки «🔓 Открыть окно» и «📱 С телефона» в сообщениях — то же, что /fab и /phone.";
 
     /// <summary>«/fab», «/fab@UnityAssetsTGBot» → «fab»; не команда — null.</summary>
     internal static string? CommandOf(string text)

@@ -10,7 +10,7 @@
 # На сервере и на этом компьютере ничего не меняет. Лог — tools\logs\fab-window.log (пароль туда не пишется).
 
 $ErrorActionPreference = 'Continue'
-$Version = '1.0.0'
+$Version = '1.0.1'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -130,7 +130,7 @@ function Open-Window($s) {
     }
 
     # Пароль окна — после «#»: остаётся в браузере, по сети не уходит; в лог не пишется.
-    $url = "http://127.0.0.1:$local/vnc.html?autoconnect=true&resize=scale#password=$([Uri]::EscapeDataString($w.Password))"
+    $url = "http://127.0.0.1:$local/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=3000#password=$([Uri]::EscapeDataString($w.Password))"
     Start-Process $url
     Write-Log "browser opened: http://127.0.0.1:$local/vnc.html (password in #)"
     Write-Host ''
