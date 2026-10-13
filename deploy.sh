@@ -535,8 +535,9 @@ cat <<EOF
 
   Войти в Fab (аккаунт Epic Games) — один раз, между прогонами (в логе «Следующий прогон»):
     ${DC[*]} exec -it unity-assets dotnet UnityAssetsDownloader.dll --logs-dir /app/logs --data-dir /app/data --profile $PROFILE --fab-login
-    затем на своём компьютере: ssh -L 127.0.0.1:${FAB_PORT}:127.0.0.1:${FAB_PORT} <ваш сервер>
-    и в браузере: http://127.0.0.1:${FAB_PORT}/vnc.html?autoconnect=true&resize=scale  (пароль окна — FAB_VNC_PASSWORD в .env)
+    затем на своём компьютере: tools/fab-window (Windows: tools\\fab-window.cmd) — туннель и браузер одним кликом,
+    или вручную: ssh -L 127.0.0.1:${FAB_PORT}:127.0.0.1:${FAB_PORT} <ваш сервер> и ссылка из сообщения бота
+    (или http://127.0.0.1:${FAB_PORT}/vnc.html?autoconnect=true&resize=scale, пароль окна — FAB_VNC_PASSWORD в .env)
 
   Раздачу Fab «Limited-Time Free» (−100 %) сервер сам не берёт: на оформлении Epic просит капчу. Два способа:
     на ПК или Deck:     ./run.sh → F (с домашнего адреса капча проходит надёжнее)

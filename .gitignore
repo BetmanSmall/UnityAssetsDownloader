@@ -424,3 +424,6 @@ uad-diag-*
 
 # Сборки для класса (publish-class.sh)
 dist/
+
+# Скрипт окна Fab (tools/fab-window.*): адрес сервера и папка — у каждого свои
+tools/fab-window.local.*

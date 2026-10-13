@@ -163,6 +163,204 @@ internal sealed class TelegramNotifier
     }
 
     /// <summary>
+    /// Сообщение с кнопками под ним. Возвращает номер сообщения (чтобы потом убрать кнопки) или null — не ушло.
+    /// Нажатие ждёт WaitForButtonAsync. Ошибки не пробрасывает.
+    /// </summary>
+    public async Task<long?> SendWithButtonsAsync(string text, IReadOnlyList<(string Text, string Data)> buttons, bool silent = false)
+    {
+        if (!Enabled)
+        {
+            return null;
+        }
+
+        try
+        {
+            var chat = await ResolveChatIdAsync();
+            if (chat is null)
+            {
+                return null;
+            }
+
+            var payload = new Dictionary<string, object>
+            {
+                ["chat_id"] = chat,
+                ["text"] = text.Length > 4000 ? text[..4000] + "…" : text,
+                ["disable_web_page_preview"] = true,
+                ["reply_markup"] = new Dictionary<string, object>
+                {
+                    ["inline_keyboard"] = new[]
+                    {
+                        buttons.Select(b => new Dictionary<string, string> { ["text"] = b.Text, ["callback_data"] = b.Data }).ToArray()
+                    }
+                }
+            };
+            if (silent)
+            {
+                payload["disable_notification"] = true;
+            }
+
+            if (await CallAsync("sendMessage", payload) is { } sent && sent.TryGetProperty("message_id", out var id))
+            {
+                _logger.Info($"[Бот] Сообщение с кнопками отправлено: {text.Split('\n', 2)[0].Trim()}");
+                return id.GetInt64();
+            }
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[Бот] Не удалось отправить сообщение с кнопками: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Ждёт, пока владелец чата нажмёт кнопку с данными data или напишет одно из words. Чужие чаты не считаются; старая
+    /// кнопка (другие данные) получает ответ «уже не действует»; слово, написанное раньше начала ожидания, — тоже не ответ.
+    /// У каждой просьбы свои data, поэтому непрочитанные нажатия прошлых просьб с ней не спутать. Прочитанное подтверждается
+    /// Telegram при выходе — иначе следующее ожидание увидело бы то же «готово» снова. true — нажали; false — время вышло
+    /// или ожидание отменили. Ошибки не пробрасывает.
+    /// </summary>
+    public async Task<bool> WaitForButtonAsync(string data, IReadOnlyCollection<string> words, TimeSpan timeout, CancellationToken cancel)
+    {
+        if (!Enabled)
+        {
+            return false;
+        }
+
+        long offset = 0;
+        try
+        {
+            var chat = await ResolveChatIdAsync();
+            if (chat is null)
+            {
+                return false;
+            }
+
+            var notBefore = DateTimeOffset.UtcNow.AddSeconds(-5).ToUnixTimeSeconds();
+            var stopAt = DateTime.UtcNow.Add(timeout);
+            while (DateTime.UtcNow < stopAt && !cancel.IsCancellationRequested)
+            {
+                var updates = await CallAsync(
+                    "getUpdates",
+                    new Dictionary<string, object> { ["offset"] = offset, ["timeout"] = 25 },
+                    TimeSpan.FromSeconds(40));
+
+                if (updates is not { ValueKind: JsonValueKind.Array } list)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5), cancel);
+                    continue;
+                }
+
+                foreach (var update in list.EnumerateArray())
+                {
+                    offset = update.GetProperty("update_id").GetInt64() + 1;
+                    if (update.TryGetProperty("callback_query", out var callback))
+                    {
+                        if (!callback.TryGetProperty("message", out var cbMessage) || ChatIdOf(cbMessage) != chat ||
+                            !callback.TryGetProperty("id", out var callbackId))
+                        {
+                            continue;
+                        }
+
+                        var pressed = callback.TryGetProperty("data", out var d) ? d.GetString() : null;
+                        if (pressed == data)
+                        {
+                            await AnswerCallbackAsync(callbackId.GetString(), "Закрываю окно, продолжаю.");
+                            _logger.Info("[Бот] Нажата кнопка «Готово».");
+                            return true;
+                        }
+
+                        await AnswerCallbackAsync(callbackId.GetString(), "Эта кнопка уже не действует.");
+                    }
+                    else if (update.TryGetProperty("message", out var message) && ChatIdOf(message) == chat &&
+                             message.TryGetProperty("text", out var textElement) &&
+                             (!message.TryGetProperty("date", out var date) || date.GetInt64() >= notBefore) &&
+                             words.Contains((textElement.GetString() ?? string.Empty).Trim(), StringComparer.OrdinalIgnoreCase))
+                    {
+                        _logger.Info("[Бот] Ответ «готово» получен.");
+                        return true;
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Окно закрыли крестиком — ждать кнопку больше незачем.
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[Бот] Ожидание кнопки прервалось: {ex.Message}");
+        }
+        finally
+        {
+            await ConfirmUpdatesAsync(offset);
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Подтвердить Telegram прочитанные обновления (getUpdates с offset): до следующего вызова с большим offset он отдаёт
+    /// их снова. Без этого «готово», на котором ожидание закончилось, увидело бы и следующее ожидание.
+    /// </summary>
+    private async Task ConfirmUpdatesAsync(long offset)
+    {
+        if (offset <= 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await CallAsync("getUpdates", new Dictionary<string, object> { ["offset"] = offset, ["timeout"] = 0 }, TimeSpan.FromSeconds(15));
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"[Бот] Прочитанное не подтвердилось: {ex.Message}");
+        }
+    }
+
+    /// <summary>Убирает кнопки под сообщением (просьба выполнена или время вышло). Ошибки не пробрасывает.</summary>
+    public async Task ClearButtonsAsync(long messageId)
+    {
+        try
+        {
+            var chat = await ResolveChatIdAsync();
+            if (chat is not null)
+            {
+                await CallAsync("editMessageReplyMarkup", new Dictionary<string, object>
+                {
+                    ["chat_id"] = chat,
+                    ["message_id"] = messageId,
+                    ["reply_markup"] = new Dictionary<string, object> { ["inline_keyboard"] = Array.Empty<object>() }
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"[Бот] Кнопки не убрались: {ex.Message}");
+        }
+    }
+
+    private async Task AnswerCallbackAsync(string? callbackId, string text)
+    {
+        if (string.IsNullOrEmpty(callbackId))
+        {
+            return;
+        }
+
+        try
+        {
+            await CallAsync("answerCallbackQuery", new Dictionary<string, object> { ["callback_query_id"] = callbackId, ["text"] = text });
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"[Бот] Ответ на нажатие не ушёл: {ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// Ждёт от пользователя сообщение, подходящее под pattern (например, код из цифр).
     /// Сообщения, пришедшие раньше вызова, ответом не считаются.
     /// Возвращает совпавший текст или null, если за timeout ответа не было.

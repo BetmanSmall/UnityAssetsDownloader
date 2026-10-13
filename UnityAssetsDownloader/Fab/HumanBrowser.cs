@@ -36,6 +36,12 @@ internal sealed class HumanBrowser : IAsyncDisposable
         /// <summary>Положение и размер окна. null — обычное окно 1280×900.</summary>
         public (int X, int Y, int Width, int Height)? Window { get; init; }
 
+        /// <summary>
+        /// Окно для человека, если оно не такое, как окно программы (сервер: узкое, под телефон — RemoteWindow.HumanWindow).
+        /// null — как Window.
+        /// </summary>
+        public (int X, int Y, int Width, int Height)? HumanWindow { get; init; }
+
         /// <summary>Только для стенда на макетах: fab.com невидимый браузер не пускает.</summary>
         public bool Headless { get; init; }
 
@@ -192,7 +198,7 @@ internal sealed class HumanBrowser : IAsyncDisposable
             }
         }
 
-        if (_settings.Window is { } w)
+        if ((!debug && _settings.HumanWindow is { } hw ? hw : _settings.Window) is { } w)
         {
             args.Add($"--window-position={w.X},{w.Y}");
             args.Add($"--window-size={w.Width},{w.Height}");
@@ -364,7 +370,11 @@ internal sealed class HumanBrowser : IAsyncDisposable
     /// открывает окно программы — с тем же профилем, где уже пройдена проверка или выполнен вход.
     /// true — человек закрыл окно сам.
     /// </summary>
-    public async Task<bool> HandOverToHumanAsync(string url, TimeSpan timeout)
+    /// <param name="humanDone">
+    /// Сигнал «человек закончил» помимо закрытия окна (сервер: кнопка «✅ Готово» в боте — с телефона крестик окна мелкий).
+    /// true — окно закрывается программой, как будто его закрыл человек.
+    /// </param>
+    public async Task<bool> HandOverToHumanAsync(string url, TimeSpan timeout, Func<CancellationToken, Task<bool>>? humanDone = null)
     {
         var candidate = _candidate ?? (await FindCandidatesAsync(_settings, _logger)).FirstOrDefault()
             ?? throw new CdpException("не найден браузер для окна человека", disconnected: true);
@@ -403,12 +413,29 @@ internal sealed class HumanBrowser : IAsyncDisposable
                 }
                 else
                 {
-                    closedByHuman = await WaitForExitAsync(human, timeout);
+                    var exited = WaitForExitAsync(human, timeout);
+                    var byButton = false;
+                    if (humanDone is not null)
+                    {
+                        using var stopSignal = new CancellationTokenSource();
+                        var signal = humanDone(stopSignal.Token);
+                        if (await Task.WhenAny(exited, signal) == signal && await signal)
+                        {
+                            _logger.Info("[Браузер] Человек нажал «Готово» — закрываем окно сами.");
+                            byButton = true;
+                            await CloseGracefullyAsync(human, candidate);
+                        }
+
+                        stopSignal.Cancel();
+                        _ = signal.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                    }
+
+                    closedByHuman = byButton || await exited;
                     if (!closedByHuman)
                     {
                         await CloseGracefullyAsync(human, candidate);
                     }
-                    else if (opened.Elapsed < TimeSpan.FromSeconds(3))
+                    else if (!byButton && opened.Elapsed < TimeSpan.FromSeconds(3))
                     {
                         _logger.Warn("[Браузер] Обычное окно закрылось сразу — возможно, Chrome с этой папкой ещё не закрылся.");
                     }

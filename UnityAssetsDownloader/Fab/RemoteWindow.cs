@@ -39,7 +39,60 @@ internal sealed class RemoteWindow : IAsyncDisposable
         public string? HostPort { get; init; }
 
         public TimeSpan StartTimeout { get; init; } = TimeSpan.FromSeconds(15);
+
+        /// <summary>
+        /// Окно человека и видимая ему часть экрана (FAB_VNC_SIZE). По умолчанию 640×900 — узкое, чтобы галочку было удобно
+        /// нажать и с телефона: noVNC растягивает видимую часть на экран, и чем она уже, тем крупнее. null — весь экран 1280×900.
+        /// Окно программы не меняется: у Fab в узком окне другая вёрстка.
+        /// </summary>
+        public (int Width, int Height)? ViewSize { get; init; } = DefaultViewSize;
+
+        /// <summary>
+        /// Пароль окна — в ссылке из сообщения бота (FAB_VNC_LINK_PASSWORD, по умолчанию on): после «#», поэтому по сети он
+        /// не уходит, а noVNC подставляет его сам. Чат — только ваш; окно доступно лишь через туннель. В лог ссылка — без пароля.
+        /// </summary>
+        public bool PasswordInLink { get; init; } = true;
+
+        public static readonly (int Width, int Height) DefaultViewSize = (640, 900);
+
+        /// <summary>Настройки сервера: пароль и FAB_VNC_SIZE, FAB_VNC_LINK_PASSWORD из окружения.</summary>
+        public static Settings FromEnvironment(string? password, Action<string> warn) => new()
+        {
+            Password = password,
+            ViewSize = ParseViewSize(Environment.GetEnvironmentVariable("FAB_VNC_SIZE"), warn),
+            PasswordInLink = !(Environment.GetEnvironmentVariable("FAB_VNC_LINK_PASSWORD") is { } v &&
+                               (v.Trim().Equals("off", StringComparison.OrdinalIgnoreCase) || v.Trim() == "0"))
+        };
+
+        /// <summary>Пусто — 640×900; full / off — весь экран; «ШxВ» в пределах экрана 1280×900 (ширина не меньше 500).</summary>
+        internal static (int Width, int Height)? ParseViewSize(string? value, Action<string> warn)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return DefaultViewSize;
+            }
+
+            var v = value.Trim();
+            if (v.Equals("full", StringComparison.OrdinalIgnoreCase) || v.Equals("off", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            var m = System.Text.RegularExpressions.Regex.Match(v, @"^(\d{3,4})\s*[xх×]\s*(\d{3,4})$");
+            if (m.Success && int.Parse(m.Groups[1].Value) is var w and >= 500 and <= ScreenWidth &&
+                int.Parse(m.Groups[2].Value) is var h and >= 400 and <= ScreenHeight)
+            {
+                return (w, h);
+            }
+
+            warn($"[Окно] Не понял FAB_VNC_SIZE='{value}' (пример: 640x900, full — весь экран {ScreenWidth}x{ScreenHeight}). Берём 640x900.");
+            return DefaultViewSize;
+        }
     }
+
+    /// <summary>Виртуальный экран сервера.</summary>
+    internal const int ScreenWidth = 1280;
+    internal const int ScreenHeight = 900;
 
     private readonly AppLogger _logger;
     private readonly Settings _settings;
@@ -64,17 +117,33 @@ internal sealed class RemoteWindow : IAsyncDisposable
     /// <summary>Удалённый доступ сейчас открыт.</summary>
     public bool ViewerRunning => _web is { HasExited: false };
 
-    /// <summary>Что человеку сделать, чтобы увидеть окно.</summary>
-    public string Hint
+    /// <summary>Что человеку сделать, чтобы увидеть окно, — для лога (без пароля).</summary>
+    public string Hint => HintText(withPassword: false);
+
+    /// <summary>То же для сообщения бота: ссылка с паролем окна, если это не выключено (FAB_VNC_LINK_PASSWORD=off).</summary>
+    public string BotHint => HintText(withPassword: true);
+
+    /// <summary>Окно Chrome человека: в левом верхнем углу, размером с видимую ему часть экрана; null — обычное окно.</summary>
+    public (int X, int Y, int Width, int Height)? HumanWindow =>
+        _settings.ViewSize is { } v ? (0, 0, v.Width, v.Height) : null;
+
+    /// <summary>
+    /// Ссылка на окно (адрес на компьютере человека — через туннель). Пароль — после «#»: в браузере он остаётся, по сети
+    /// не уходит; noVNC берёт параметры и из «#». Не подставился (старый noVNC) — noVNC просто спросит пароль.
+    /// </summary>
+    public static string Link(string port, string? password) =>
+        $"http://127.0.0.1:{port}/vnc.html?autoconnect=true&resize=scale" +
+        (string.IsNullOrEmpty(password) ? string.Empty : "#password=" + Uri.EscapeDataString(password.Length > 8 ? password[..8] : password));
+
+    private string HintText(bool withPassword)
     {
-        get
-        {
-            var port = HostPort(_settings);
-            return $"Откройте окно: на своём компьютере выполните «ssh -L 127.0.0.1:{port}:127.0.0.1:{port} <ваш сервер>», " +
-                   $"затем в браузере откройте http://127.0.0.1:{port}/vnc.html?autoconnect=true&resize=scale " +
-                   "(пароль окна — FAB_VNC_PASSWORD в .env на сервере). " +
-                   "Закрыть окно Chrome — Ctrl+Shift+W: на виртуальном экране кнопок окна нет.";
-        }
+        var port = HostPort(_settings);
+        var inLink = withPassword && _settings.PasswordInLink && !string.IsNullOrEmpty(_settings.Password);
+        return $"Окно: {Link(port, inLink ? _settings.Password : null)}" +
+               (inLink ? string.Empty : " (пароль окна — FAB_VNC_PASSWORD в .env на сервере)") + "\n" +
+               $"Компьютер: tools/fab-window (туннель и браузер одним кликом) или «ssh -L 127.0.0.1:{port}:127.0.0.1:{port} <сервер>» " +
+               $"и ссылка выше. iPhone: Termius с пробросом порта {port}, затем ссылка.\n" +
+               "Сделали — нажмите «✅ Готово» под сообщением бота или закройте окно Chrome крестиком.";
     }
 
     /// <summary>
@@ -135,7 +204,7 @@ internal sealed class RemoteWindow : IAsyncDisposable
         var errors = new Queue<string>();
         // -displayfd 1: сервер сам выбирает свободный экран и сообщает его номер — старые
         // блокировки после аварийной остановки не мешают.
-        var xvfb = Spawn(settings.Xvfb, ["-displayfd", "1", "-screen", "0", "1280x900x24", "-nolisten", "tcp"], errors, readStdoutLater: true);
+        var xvfb = Spawn(settings.Xvfb, ["-displayfd", "1", "-screen", "0", $"{ScreenWidth}x{ScreenHeight}x24", "-nolisten", "tcp"], errors, readStdoutLater: true);
         try
         {
             using var cts = new CancellationTokenSource(settings.StartTimeout);
@@ -204,11 +273,7 @@ internal sealed class RemoteWindow : IAsyncDisposable
             }
 
             _vncErrors = new Queue<string>();
-            _vnc = Spawn(_settings.X11Vnc,
-            [
-                "-display", Display, "-localhost", "-noipv6", "-rfbport", _settings.VncPort.ToString(),
-                "-passwdfile", _passwordFile, "-forever", "-shared", "-quiet"
-            ], _vncErrors);
+            _vnc = Spawn(_settings.X11Vnc, X11VncArgs(Display, _settings, _passwordFile), _vncErrors);
             if (!await WaitForPortAsync(_settings.VncPort, _vnc))
             {
                 throw new InvalidOperationException($"x11vnc не открыл порт {_settings.VncPort}. {Tail(_vncErrors)}");
@@ -230,6 +295,22 @@ internal sealed class RemoteWindow : IAsyncDisposable
 
         _logger.Info("[Окно] Удалённый доступ к окну открыт.");
         _logger.Info($"[Окно] {Hint}");
+    }
+
+    /// <summary>Ключи x11vnc: только 127.0.0.1, пароль из файла; узкое окно человека — видна только его часть экрана (-clip).</summary>
+    internal static List<string> X11VncArgs(string display, Settings settings, string passwordFile)
+    {
+        var args = new List<string>
+        {
+            "-display", display, "-localhost", "-noipv6", "-rfbport", settings.VncPort.ToString(),
+            "-passwdfile", passwordFile, "-forever", "-shared", "-quiet"
+        };
+        if (settings.ViewSize is { } v)
+        {
+            args.AddRange(["-clip", $"{v.Width}x{v.Height}+0+0"]);
+        }
+
+        return args;
     }
 
     /// <summary>Закрывает удалённый доступ и стирает файл с паролем. Виртуальный экран остаётся.</summary>

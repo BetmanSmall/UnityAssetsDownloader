@@ -61,6 +61,15 @@ internal sealed partial class FabStore
     /// </summary>
     public string? HumanWindowHint { get; init; }
 
+    /// <summary>То же для сообщения бота — ссылка с паролем окна (в лог идёт HumanWindowHint без него).</summary>
+    public string? HumanWindowBotHint { get; init; }
+
+    /// <summary>
+    /// Сервер с ботом: отправить просьбу с кнопкой «✅ Готово» (текст, сколько ждём). null в ответе — сообщение не ушло.
+    /// Не задано — обычное сообщение _notify, закончить можно только закрыв окно.
+    /// </summary>
+    public Func<string, TimeSpan, Task<HumanAsk?>>? AskHumanByBot { get; init; }
+
     /// <summary>
     /// Сервер: ассеты, которые получает только человек (раздача −100 %), не ждут окна — результат
     /// NeedsHuman, программа идёт дальше. Окно человека — только для входа, галочки и лицензии.
@@ -1261,64 +1270,85 @@ internal sealed partial class FabStore
         HumanAsks++;
         OnHumanAsked?.Invoke(title);
 
-        for (var attempt = 1; attempt <= attempts; attempt++)
+        HumanAsk? ask = null;
+        try
         {
-            _logger.Info("============================================================");
-            _logger.Info($" {title}{(attempt > 1 ? " (ещё раз)" : string.Empty)}");
-            foreach (var line in lines)
+            for (var attempt = 1; attempt <= attempts; attempt++)
             {
-                _logger.Info($" {line}");
-            }
-
-            if (!string.IsNullOrWhiteSpace(HumanWindowHint))
-            {
-                _logger.Info($" {HumanWindowHint}");
-            }
-
-            _logger.Info($" Программа ждёт до {timeout.TotalMinutes:0} мин.");
-            _logger.Info("============================================================");
-
-            if (attempt == 1 && _notify is not null && notify)
-            {
-                await _notify($"⏳ Fab ждёт вас: {title.ToLowerInvariant()}. " +
-                              (string.IsNullOrWhiteSpace(HumanWindowHint) ? "Окно Chrome открыто на компьютере." : HumanWindowHint) +
-                              $" Окно ждёт до {timeout.TotalMinutes:0} мин." +
-                              (DeferManualAdds
-                                  ? " Не успели — войдите вручную командой --fab-login (она в конце вывода ./deploy.sh): после неё сервер снова заходит на Fab сам."
-                                  : string.Empty));
-            }
-
-            _lastHandOverClosedByHuman = await _browser.HandOverToHumanAsync(url, timeout);
-            _logger.Info(_lastHandOverClosedByHuman
-                ? "[Fab] Окно закрыто — продолжаем в окне программы."
-                : $"[Fab] За {timeout.TotalMinutes:0} мин окно не закрыли — закрыли сами, проверяем, что успели.");
-
-            try
-            {
-                await _browser.NavigateAsync(url, _navigationTimeout);
-            }
-            catch (InvalidOperationException ex)
-            {
-                _logger.Warn($"[Fab] {ex.Message}");
-            }
-
-            // Страница может ещё секунды догружаться или пройти короткую проверку сама.
-            var sw = Stopwatch.StartNew();
-            while (sw.Elapsed < TimeSpan.FromSeconds(20))
-            {
-                if (await done())
+                _logger.Info("============================================================");
+                _logger.Info($" {title}{(attempt > 1 ? " (ещё раз)" : string.Empty)}");
+                foreach (var line in lines)
                 {
-                    _logger.Info("[Fab] Готово, спасибо.");
-                    HumanResolved++;
-                    return true;
+                    _logger.Info($" {line}");
                 }
 
-                await Task.Delay(1500);
-            }
+                if (!string.IsNullOrWhiteSpace(HumanWindowHint))
+                {
+                    _logger.Info($" {HumanWindowHint}");
+                }
 
-            if (!_lastHandOverClosedByHuman)
+                _logger.Info($" Программа ждёт до {timeout.TotalMinutes:0} мин.");
+                _logger.Info("============================================================");
+
+                if (attempt == 1 && notify && (AskHumanByBot is not null || _notify is not null))
+                {
+                    var hint = HumanWindowBotHint ?? HumanWindowHint;
+                    var text = $"⏳ Fab ждёт вас: {title.ToLowerInvariant()}.\n" +
+                               (string.IsNullOrWhiteSpace(hint) ? "Окно Chrome открыто на компьютере." : hint) +
+                               $"\nОкно ждёт до {timeout.TotalMinutes:0} мин." +
+                               (DeferManualAdds
+                                   ? " Не успели — войдите вручную командой --fab-login (она в конце вывода ./deploy.sh): после неё сервер снова заходит на Fab сам."
+                                   : string.Empty);
+                    if (AskHumanByBot is not null)
+                    {
+                        ask = await AskHumanByBot(text, timeout);
+                    }
+                    else
+                    {
+                        await _notify!(text);
+                    }
+                }
+
+                _lastHandOverClosedByHuman = await _browser.HandOverToHumanAsync(url, timeout, ask?.WaitDoneAsync);
+                _logger.Info(_lastHandOverClosedByHuman
+                    ? "[Fab] Окно закрыто — продолжаем в окне программы."
+                    : $"[Fab] За {timeout.TotalMinutes:0} мин окно не закрыли — закрыли сами, проверяем, что успели.");
+
+                try
+                {
+                    await _browser.NavigateAsync(url, _navigationTimeout);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    _logger.Warn($"[Fab] {ex.Message}");
+                }
+
+                // Страница может ещё секунды догружаться или пройти короткую проверку сама.
+                var sw = Stopwatch.StartNew();
+                while (sw.Elapsed < TimeSpan.FromSeconds(20))
+                {
+                    if (await done())
+                    {
+                        _logger.Info("[Fab] Готово, спасибо.");
+                        HumanResolved++;
+                        return true;
+                    }
+
+                    await Task.Delay(1500);
+                }
+
+                if (!_lastHandOverClosedByHuman)
+                {
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            // Кнопка «Готово» больше не нужна: окно закрыто, сделано или время вышло.
+            if (ask is not null)
             {
-                break;
+                await ask.FinishAsync();
             }
         }
 
@@ -1339,3 +1369,6 @@ internal sealed partial class FabStore
 
     private static string Shorten(string text, int max) => text.Length <= max ? text : text[..max] + "…";
 }
+
+/// <summary>Просьба к человеку через бота: ждать нажатия «✅ Готово» и убрать кнопку, когда окно закрылось.</summary>
+internal sealed record HumanAsk(Func<CancellationToken, Task<bool>> WaitDoneAsync, Func<Task> FinishAsync);

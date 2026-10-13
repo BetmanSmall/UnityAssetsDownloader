@@ -119,7 +119,7 @@ internal sealed partial class UnityAssetAutomationApp
             {
                 try
                 {
-                    remote = await RemoteWindow.StartAsync(_logger, new RemoteWindow.Settings { Password = _options.FabVncPassword });
+                    remote = await RemoteWindow.StartAsync(_logger, RemoteWindow.Settings.FromEnvironment(_options.FabVncPassword, _logger.Warn));
                 }
                 catch (Exception ex)
                 {
@@ -157,6 +157,29 @@ internal sealed partial class UnityAssetAutomationApp
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Просьба к человеку через бота с кнопкой «✅ Готово»: с телефона крестик окна Chrome мелкий, кнопкой проще. Данные
+    /// кнопки у каждой просьбы свои — нажатие старой кнопки эту просьбу не закроет. Ответ словом «готово» тоже подходит.
+    /// </summary>
+    private async Task<HumanAsk?> AskHumanByBotAsync(string text, TimeSpan timeout)
+    {
+        if (_notifier is not { Enabled: true } notifier)
+        {
+            return null;
+        }
+
+        var data = "fab-done:" + Guid.NewGuid().ToString("N")[..12];
+        var messageId = await notifier.SendWithButtonsAsync(text, [("✅ Готово", data)]);
+        if (messageId is not { } id)
+        {
+            return null;
+        }
+
+        return new HumanAsk(
+            cancel => notifier.WaitForButtonAsync(data, ["готово", "done"], timeout, cancel),
+            () => notifier.ClearButtonsAsync(id));
     }
 
     private async Task RunFabOnScreenAsync(bool loginOnly, Func<Task<RemoteWindow?>>? startRemote, bool server)
@@ -321,6 +344,7 @@ internal sealed partial class UnityAssetAutomationApp
                 ExplicitBrowser = _options.FabBrowser,
                 DownloadDir = CliOptions.IsSingleFileApp ? Path.Combine(_options.DataDirectory, "browser") : null,
                 Window = window,
+                HumanWindow = remote?.HumanWindow,
                 Display = remote?.Display,
                 BeforeHumanWindow = remote is null ? null : remote.StartViewerAsync,
                 // Раздача по очереди: окно удалённого доступа не закрываем между ассетами, чтобы не подключаться заново.
@@ -363,6 +387,8 @@ internal sealed partial class UnityAssetAutomationApp
                 _notifier is { Enabled: true } ? text => NotifyAsync(text) : null, TimeSpan.FromMilliseconds(_options.NavigationTimeoutMs))
             {
                 HumanWindowHint = remote?.Hint,
+                HumanWindowBotHint = remote?.BotHint,
+                AskHumanByBot = _notifier is { Enabled: true } ? AskHumanByBotAsync : null,
                 DeferManualAdds = server,
                 LoginWait = server ? FabServerHumanWait : FabStore.DefaultLoginWait,
                 ChallengeWait = server ? FabServerHumanWait : FabStore.DefaultChallengeWait,
