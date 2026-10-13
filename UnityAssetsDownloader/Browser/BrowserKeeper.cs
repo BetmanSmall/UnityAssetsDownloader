@@ -192,7 +192,11 @@ internal sealed class BrowserKeeper : IAsyncDisposable
         }
     }
 
-    private static async Task CloseQuietlyAsync(IPage? page)
+    /// <summary>
+    /// Закрывает вкладку, которая может не ответить: не дольше 10 с, ошибки глотаются (незакрытая уйдёт вместе с браузером).
+    /// DisposeAsync после неё не зовите — он закрывает вкладку ещё раз и ждёт подтверждения так же без срока.
+    /// </summary>
+    internal static async Task CloseQuietlyAsync(IPage? page)
     {
         if (page is null || page.IsClosed)
         {
@@ -208,6 +212,14 @@ internal sealed class BrowserKeeper : IAsyncDisposable
             // Мёртвую вкладку закрыть не всегда можно — она уйдёт вместе с браузером.
         }
     }
+
+    /// <summary>
+    /// Закрывает браузер, который может не ответить: 10 с на вежливое закрытие, потом его процесс и оставшиеся процессы
+    /// убиваются. 12.10 на сервере браузер Telegram (бесплатный прокси умер посреди истории) не закрыл вкладку, а
+    /// PuppeteerSharp ждёт подтверждения закрытия без срока — служба простояла 27 ч. DisposeAsync после него не нужен.
+    /// </summary>
+    internal static Task ShutDownQuietlyAsync(IBrowser browser, Action<string> warn) =>
+        KillQuietlyAsync(browser, ProfileArg(browser), warn);
 
     private static async Task KillQuietlyAsync(IBrowser browser, string? profileArg, Action<string> warn)
     {

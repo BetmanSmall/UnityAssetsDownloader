@@ -360,7 +360,7 @@ internal sealed partial class UnityAssetAutomationApp
         await using (browser)
         {
             var fab = new FabStore(browser, _logger, _logsDirectory, _options.FabBaseUrl, _options.Interactive || server || reconUid is not null || giveaway,
-                _notifier is { Enabled: true } ? NotifyAsync : null, TimeSpan.FromMilliseconds(_options.NavigationTimeoutMs))
+                _notifier is { Enabled: true } ? text => NotifyAsync(text) : null, TimeSpan.FromMilliseconds(_options.NavigationTimeoutMs))
             {
                 HumanWindowHint = remote?.Hint,
                 DeferManualAdds = server,

@@ -197,6 +197,14 @@ internal sealed class DailyDigest
     /// <summary>Строка о ночном доборе истории каналов (NightBackfillState.Describe) или null.</summary>
     public string? NightNote { get; set; }
 
+    /// <summary>Сколько раз сторож службы признал прогон зависшим (служба перезапускалась сама) и последний случай.</summary>
+    public int Stalls { get; set; }
+
+    public string? LastStall { get; set; }
+
+    /// <summary>Когда о зависании писали боту отдельным сообщением (не чаще RunStallWatchdog.NotifyEvery). Сводка не сбрасывает.</summary>
+    public DateTime? StallNotifiedUtc { get; set; }
+
     public static DailyDigest Load(string path)
     {
         try
@@ -286,15 +294,33 @@ internal sealed class DailyDigest
 
     public bool IsDue(TimeSpan period, DateTime nowUtc) => nowUtc - SinceUtc >= period;
 
+    /// <summary>Запомнить зависание; true — пора написать о нём боту отдельно (прошлое сообщение было давно или не было).</summary>
+    public bool AddStall(string note, DateTime nowUtc)
+    {
+        Stalls++;
+        LastStall = note;
+        if (StallNotifiedUtc is { } at && nowUtc - at < RunStallWatchdog.NotifyEvery)
+        {
+            return false;
+        }
+
+        StallNotifiedUtc = nowUtc;
+        return true;
+    }
+
     public string Describe(string profile, TimeSpan period, DateTime nowUtc)
     {
         var t = Total;
-        var problems = Crashes > 0 || t.LoginFailed || t.ChannelsFailed > 0 || t.Failed > 0 ||
+        var problems = Crashes > 0 || Stalls > 0 || t.LoginFailed || t.ChannelsFailed > 0 || t.Failed > 0 ||
                        (FabOnServer && (t.FabFailed > 0 || t.FabHumanUnresolved > 0));
         var sb = new StringBuilder();
 
         sb.AppendLine($"{(problems ? "🟡" : "🟢")} Сводка за {DescribePeriod(nowUtc - SinceUtc, period)} — профиль {profile}");
         sb.AppendLine($"Прогонов: {Runs}{(Crashes > 0 ? $", из них упало: {Crashes}" : string.Empty)}");
+        if (Stalls > 0)
+        {
+            sb.AppendLine($"⚠ Зависаний: {Stalls} — служба перезапускалась сама. Последнее: {LastStall}");
+        }
         sb.AppendLine($"Новых постов в каналах: {t.PostsRead}");
 
         if (t.AssetStoreLinks > 0)
@@ -407,6 +433,8 @@ internal sealed class DailyDigest
         SinceUtc = nowUtc;
         Runs = 0;
         Crashes = 0;
+        Stalls = 0;
+        LastStall = null;
         Total = new RunStats();
     }
 

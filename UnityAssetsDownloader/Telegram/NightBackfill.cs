@@ -141,6 +141,8 @@ internal sealed class NightBackfillSettings
 /// Что ночной добор уже сделал (data/night_backfill.json): какая ночь отработана, какие каналы пройдены, итог прошлой ночи.
 /// Ночь отмечается в начале прогона: упавший или прерванный прогон не повторяется до следующей ночи, а следующая
 /// продолжает с того же места (уже проверенное пропускается по памяти профиля и каталогу) — повторный запуск безопасен.
+/// Пока прогон идёт, в файле лежит Running: если служба поднялась, а отметка осталась, — прогон прервали снаружи
+/// (перезапуск контейнера, перезагрузка, нехватка памяти), и это видно в сводке, а не итог прошлой ночи как последний.
 /// </summary>
 internal sealed class NightBackfillState
 {
@@ -153,6 +155,9 @@ internal sealed class NightBackfillState
 
     /// <summary>Итог последнего прогона добора — для суточной сводки.</summary>
     public NightRunResult? Last { get; set; }
+
+    /// <summary>Прогон, который сейчас идёт (канал и начало); null — не идёт.</summary>
+    public NightRunStart? Running { get; set; }
 
     public static NightBackfillState Load(string path)
     {
@@ -222,16 +227,19 @@ internal sealed class NightBackfillState
         return null;
     }
 
-    public void MarkStarted(NightBackfillSettings settings, DateTime local) => LastNight = Key(settings.NightOf(local));
-
-    /// <summary>Итог ночи: сколько добавлено и страниц открыто; finished — история канала пройдена до конца.</summary>
-    public void Record(string channel, int added, int pages, bool finished, bool crashed, DateTime local)
+    public void MarkStarted(NightBackfillSettings settings, DateTime local, string channel)
     {
-        if (!Channels.TryGetValue(channel, out var progress))
-        {
-            Channels[channel] = progress = new NightChannelProgress();
-        }
+        LastNight = Key(settings.NightOf(local));
+        Running = new NightRunStart { Channel = channel, StartedAt = Stamp(local) };
+    }
 
+    /// <summary>
+    /// Итог ночи: сколько добавлено и страниц открыто; finished — история канала пройдена до конца; hung — прогон завис,
+    /// и сторож службы перезапустил её (числа — сколько успели).
+    /// </summary>
+    public void Record(string channel, int added, int pages, bool finished, bool crashed, DateTime local, bool hung = false)
+    {
+        var progress = ProgressOf(channel);
         progress.Nights++;
         progress.Added += added;
         progress.Pages += pages;
@@ -243,9 +251,38 @@ internal sealed class NightBackfillState
 
         Last = new NightRunResult
         {
-            Channel = channel, Added = added, Pages = pages, Finished = finished, Crashed = crashed,
-            At = local.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)
+            Channel = channel, Added = added, Pages = pages, Finished = finished, Crashed = crashed, Hung = hung,
+            At = Stamp(local)
         };
+        Running = null;
+    }
+
+    /// <summary>
+    /// Прогон прервали снаружи: служба поднялась, а отметка «идёт» осталась. Записывает его как прерванный (итог не
+    /// известен; канал продолжит следующая ночь) и возвращает строку для лога; отметки нет — null. Повторно ничего не делает.
+    /// </summary>
+    public string? ResolveInterrupted()
+    {
+        if (Running is not { } run)
+        {
+            return null;
+        }
+
+        ProgressOf(run.Channel).Nights++;
+        Last = new NightRunResult { Channel = run.Channel, Interrupted = true, At = run.StartedAt };
+        Running = null;
+        return $"Ночной добор {run.StartedAt} ({run.Channel}) был прерван — служба перезапускалась, итог не записан. " +
+               "Канал продолжит следующая ночь.";
+    }
+
+    private NightChannelProgress ProgressOf(string channel)
+    {
+        if (!Channels.TryGetValue(channel, out var progress))
+        {
+            Channels[channel] = progress = new NightChannelProgress();
+        }
+
+        return progress;
     }
 
     /// <summary>Строка для суточной сводки бота или null, если добор выключен.</summary>
@@ -258,16 +295,24 @@ internal sealed class NightBackfillState
 
         var done = settings.Channels.Count(c => Channels.TryGetValue(c, out var p) && p.Done);
         var next = NextChannel(settings);
-        var last = Last is { } l
-            ? $"{l.At}: {l.Channel} — добавлено {l.Added}, открыто страниц {l.Pages}" +
-              (l.Crashed ? ", прогон упал" : l.Finished ? ", канал пройден" : string.Empty) + ". "
-            : string.Empty;
+        var last = Last switch
+        {
+            null => string.Empty,
+            { Interrupted: true } l => $"{l.At}: {l.Channel} — прогон прерван (служба перезапускалась), итог не записан. ",
+            var l => $"{l.At}: {l.Channel} — добавлено {l.Added}, открыто страниц {l.Pages}" +
+                     (l.Crashed ? ", прогон упал"
+                         : l.Hung ? ", прогон завис — служба перезапустилась сама"
+                         : l.Finished ? ", канал пройден"
+                         : string.Empty) + ". "
+        };
         return next is null
             ? $"Ночной добор: {last}все каналы пройдены ({string.Join(", ", settings.Channels)})."
             : $"Ночной добор: {last}Пройдено каналов {done} из {settings.Channels.Count}, дальше — {next}.";
     }
 
     private static string Key(DateOnly night) => night.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+
+    private static string Stamp(DateTime local) => local.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
 }
 
 internal sealed class NightChannelProgress
@@ -286,5 +331,18 @@ internal sealed class NightRunResult
     public int Pages { get; set; }
     public bool Finished { get; set; }
     public bool Crashed { get; set; }
+
+    /// <summary>Прогон завис, сторож службы её перезапустил (Added и Pages — сколько успели).</summary>
+    public bool Hung { get; set; }
+
+    /// <summary>Прогон прервали снаружи (служба перезапускалась): итог не известен, Added и Pages — 0.</summary>
+    public bool Interrupted { get; set; }
+
     public string At { get; set; } = string.Empty;
+}
+
+internal sealed class NightRunStart
+{
+    public string Channel { get; set; } = string.Empty;
+    public string StartedAt { get; set; } = string.Empty;
 }

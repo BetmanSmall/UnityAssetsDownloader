@@ -115,9 +115,32 @@ async Task RunWatchLoopAsync()
           $"с {night.StartHour}:00 до {night.EndHour}:00 (NIGHT_BACKFILL_* в .env)."
         : "[Сервер] Ночной добор истории каналов выключен (NIGHT_BACKFILL_CHANNELS пуст).");
 
+    var stallLimit = RunStallWatchdog.LimitFromEnvironment(Console.WriteLine);
+    Console.WriteLine(stallLimit is { } sl
+        ? $"[Сервер] Сторож прогона: если служба занята, а в лог {sl.TotalMinutes:0} мин не пишется ни строки, прогон считается " +
+          "зависшим — служба записывает, что успела, и перезапускается (RUN_STALL_MINUTES в .env)."
+        : "[Сервер] Сторож прогона выключен (RUN_STALL_MINUTES=0).");
+
     using var stop = new CancellationTokenSource();
     UnityAssetAutomationApp? current = null;
     var running = false;
+    // Служба чем-то занята (прогон, добор, сводка боту), а не спит до следующего прогона: только тогда сторож следит за логом.
+    var busy = false;
+    // Канал ночного добора, пока он идёт, — сторожу (записать зависшую ночь).
+    string? nightChannel = null;
+
+    // Прошлый процесс оборвался посреди ночного добора (перезапуск контейнера, перезагрузка, нехватка памяти).
+    var leftover = NightBackfillState.Load(nightStatePath);
+    if (leftover.ResolveInterrupted() is { } interruptedNote)
+    {
+        leftover.Save(nightStatePath);
+        Console.WriteLine($"[Сервер] {interruptedNote}");
+    }
+
+    if (stallLimit is { } limit)
+    {
+        _ = Task.Run(() => WatchForStallAsync(limit));
+    }
 
     // docker stop / systemctl stop присылают SIGTERM. Между прогонами выходим штатно,
     // посреди прогона — сохраняем память профиля и завершаемся сразу: ждать конца
@@ -133,6 +156,10 @@ async Task RunWatchLoopAsync()
     var nextRegular = DateTime.Now;
     while (!stop.IsCancellationRequested)
     {
+        // После долгого сна отсчёт тишины начинается заново.
+        AppLogger.Touch();
+        Volatile.Write(ref busy, true);
+
         if (DateTime.Now >= nextRegular)
         {
             // Расписание от начала прогона: «раз в сутки» значит в одно и то же время.
@@ -162,6 +189,8 @@ async Task RunWatchLoopAsync()
         {
             Console.WriteLine($"[Сервер] Следующий прогон: {nextRegular:yyyy-MM-dd HH:mm}.");
         }
+
+        Volatile.Write(ref busy, false);
 
         // Время уже прошло (долгий добор) — сразу на следующий круг. Отрицательную паузу Task.Delay не берёт, а ровно −1 мс
         // для него значит «ждать вечно».
@@ -237,8 +266,9 @@ async Task RunWatchLoopAsync()
             return;
         }
 
-        state.MarkStarted(night, DateTime.Now);
+        state.MarkStarted(night, DateTime.Now, channel);
         state.Save(nightStatePath);
+        nightChannel = channel;
         Console.WriteLine($"[Сервер] Ночной добор истории: канал {channel}, не больше {night.PagesPerNight} страниц ассетов.");
 
         var backfillOptions = CliOptions.Parse(NightBackfillSettings.BackfillArgs(args, channel, night.PagesPerNight));
@@ -265,8 +295,84 @@ async Task RunWatchLoopAsync()
         state = NightBackfillState.Load(nightStatePath);
         state.Record(channel, app?.Stats.Added ?? 0, app?.PagesOpened ?? 0, finished, crashed, DateTime.Now);
         state.Save(nightStatePath);
+        nightChannel = null;
         Console.WriteLine($"[Сервер] Ночной добор: {channel} — добавлено {app?.Stats.Added ?? 0}, открыто страниц {app?.PagesOpened ?? 0}" +
                           (crashed ? ", прогон упал." : finished ? ", история канала пройдена." : "."));
+    }
+
+    // Сторож: раз в минуту смотрит, когда лог писал последнюю строку (RunStallWatchdog).
+    async Task WatchForStallAsync(TimeSpan stall)
+    {
+        while (!stop.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromMinutes(1), stop.Token);
+            }
+            catch (TaskCanceledException)
+            {
+                return;
+            }
+
+            var lastWrite = AppLogger.LastWriteUtc;
+            if (Volatile.Read(ref busy) && RunStallWatchdog.IsStalled(lastWrite, DateTime.UtcNow, stall))
+            {
+                await HandleStallAsync(DateTime.UtcNow - lastWrite);
+                return;
+            }
+        }
+    }
+
+    // Зависший прогон изнутри не прервать (он ждёт ответа, который не придёт): записываем, что успели, и выходим с ошибкой —
+    // Docker (restart: unless-stopped) или systemd (Restart=on-failure) поднимают службу заново.
+    async Task HandleStallAsync(TimeSpan silent)
+    {
+        // Что бы ни случилось ниже, через 2 минуты процесс завершится.
+        new Thread(() =>
+        {
+            Thread.Sleep(TimeSpan.FromMinutes(2));
+            Process.GetCurrentProcess().Kill();
+        }) { IsBackground = true }.Start();
+
+        var app = current;
+        var channel = nightChannel;
+        var lastLine = AppLogger.LastLine;
+        var what = channel is null ? "Прогон" : $"Ночной добор ({channel})";
+        var reason = RunStallWatchdog.Describe(what, silent, lastLine);
+        Console.WriteLine($"[Сервер] {reason}");
+
+        try
+        {
+            if (channel is not null)
+            {
+                var nightState = NightBackfillState.Load(nightStatePath);
+                nightState.Record(channel, app?.AddedSoFar ?? 0, app?.PagesOpened ?? 0, finished: false, crashed: false,
+                    DateTime.Now, hung: true);
+                nightState.Save(nightStatePath);
+            }
+
+            if (app is not null)
+            {
+                await RunStallWatchdog.WithinAsync(() => Task.Run(() => app.RecordStall(reason)), TimeSpan.FromSeconds(25));
+            }
+
+            var digestPath = Path.Combine(options.DataDirectory, "bot_digest.json");
+            var digest = DailyDigest.Load(digestPath);
+            var noteWhat = channel is null ? "прогон" : $"ночной добор ({channel})";
+            var notify = digest.AddStall(RunStallWatchdog.Note(noteWhat, DateTime.Now, lastLine), DateTime.UtcNow);
+            digest.Save(digestPath);
+            if (notify && app is not null)
+            {
+                await RunStallWatchdog.WithinAsync(() => app.NotifyAsync($"⚠️ {reason}", silent: true), TimeSpan.FromSeconds(60));
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Сервер] Сторож: не всё записалось перед выходом: {ex.Message}");
+        }
+
+        Console.WriteLine($"[Сервер] Выходим с кодом {RunStallWatchdog.ExitCode}: служба поднимется заново и начнёт с обычного прогона.");
+        Environment.Exit(RunStallWatchdog.ExitCode);
     }
 }
 
@@ -476,6 +582,25 @@ internal sealed partial class UnityAssetAutomationApp
 
     /// <summary>Сколько страниц ассетов открыто в магазине за прогон.</summary>
     public int PagesOpened => _storePagesOpened;
+
+    /// <summary>Сколько добавлено к этому моменту (Stats.Added заполняется в конце прогона) — для сторожа службы.</summary>
+    public int AddedSoFar
+    {
+        get
+        {
+            try
+            {
+                return _runReport?.Items.Count(i => i.Status == AssetProcessStatus.Added) ?? Stats.Added;
+            }
+            catch (InvalidOperationException)
+            {
+                return Stats.Added;
+            }
+        }
+    }
+
+    /// <summary>Сторож службы признал прогон зависшим (RunStallWatchdog): причина — в сводку вместо «прерван».</summary>
+    private string? _stallReason;
 
     /// <summary>Облегчённые страницы включены (LitePages); сколько запросов браузер не стал грузить; ошибка включения.</summary>
     private bool _litePages;
@@ -1526,6 +1651,7 @@ internal sealed partial class UnityAssetAutomationApp
                 Memory = memoryText,
                 Browser = DescribeBrowser(),
                 BrowserStopReason = _browserStopReason,
+                StallReason = _stallReason,
                 Names = SummaryNames(report),
                 CatalogCount = _summaryCatalogCount,
                 CatalogWithSources = _summaryCatalogWithSources,
@@ -2117,8 +2243,7 @@ internal sealed partial class UnityAssetAutomationApp
 
                     if (ownBrowser is not null)
                     {
-                        await ownBrowser.CloseAsync();
-                        await ownBrowser.DisposeAsync();
+                        await BrowserKeeper.ShutDownQuietlyAsync(ownBrowser, _logger.Warn);
                         ownBrowser = null;
                     }
 
@@ -2238,10 +2363,10 @@ internal sealed partial class UnityAssetAutomationApp
         }
         finally
         {
+            // Браузер через умерший прокси может не закрыться (12.10 — 27 ч ожидания): не дольше 10 с, потом убиваем.
             if (ownBrowser is not null)
             {
-                await ownBrowser.CloseAsync();
-                await ownBrowser.DisposeAsync();
+                await BrowserKeeper.ShutDownQuietlyAsync(ownBrowser, _logger.Warn);
             }
         }
     }
@@ -3030,12 +3155,12 @@ internal sealed partial class UnityAssetAutomationApp
     /// <summary>Запись в памяти отвергнутых промокодов: адрес ассета и код через пробел.</summary>
     private static string PromoCacheKey(string assetUrl, string promoCode) => $"{assetUrl} {promoCode}";
 
-    /// <summary>Сообщение через Telegram-бота, если он настроен.</summary>
-    public async Task NotifyAsync(string text)
+    /// <summary>Сообщение через Telegram-бота, если он настроен. silent — без звука.</summary>
+    public async Task NotifyAsync(string text, bool silent = false)
     {
         if (_notifier is { Enabled: true })
         {
-            await _notifier.SendAsync(text);
+            await _notifier.SendAsync(text, silent);
         }
     }
 
@@ -3312,6 +3437,26 @@ internal sealed partial class UnityAssetAutomationApp
 
     /// <summary>Сохранить память профиля перед остановкой службы (docker stop, systemctl stop).</summary>
     public void SaveCachesOnExit() => SaveCaches();
+
+    /// <summary>
+    /// Прогон завис (сторож службы, RunStallWatchdog): причина — в лог прогона и errors.log, память профиля и сводка с
+    /// пометкой «завис». Вызывается из другого потока, пока прогон стоит; ждёт не дольше ~20 с и ничего не бросает.
+    /// </summary>
+    public void RecordStall(string reason)
+    {
+        _stallReason = reason;
+        try
+        {
+            // Лог берёт свою блокировку: если на ней и висит прогон, не ждём.
+            Task.Run(() => _logger.Error($"[Сервер] {reason}")).Wait(TimeSpan.FromSeconds(5));
+        }
+        catch
+        {
+            // Запись не удалась — причина всё равно уйдёт в сводку и боту.
+        }
+
+        WriteSummaryOnExit();
+    }
 
     /// <summary>
     /// Остановка разового прогона (SIGTERM или Ctrl+C): память профиля и сводка с пометкой «прерван».
@@ -8845,6 +8990,18 @@ internal sealed class AppLogger : IDisposable
     /// <summary>Файл полного лога этого прогона (null — лог в файл не пишется).</summary>
     public string? LogFilePath { get; }
 
+    // Когда любой лог этого процесса написал последнюю строку и какую: по ним сторож службы узнаёт зависший прогон
+    // (RunStallWatchdog). Общие на процесс: в службе прогоны идут по одному, у каждого свой лог.
+    private static long _lastWriteTicks = DateTime.UtcNow.Ticks;
+    private static string? _lastLine;
+
+    public static DateTime LastWriteUtc => new(Interlocked.Read(ref _lastWriteTicks), DateTimeKind.Utc);
+
+    public static string? LastLine => Volatile.Read(ref _lastLine);
+
+    /// <summary>Начать отсчёт тишины заново (служба берётся за работу после долгого сна).</summary>
+    public static void Touch() => Interlocked.Exchange(ref _lastWriteTicks, DateTime.UtcNow.Ticks);
+
     public AppLogger(bool verbose, bool traceNetwork, string? logFilePath, string? errorsFilePath = null)
     {
         LogFilePath = string.IsNullOrWhiteSpace(logFilePath) ? null : logFilePath;
@@ -8904,6 +9061,8 @@ internal sealed class AppLogger : IDisposable
         lock (_sync)
         {
             Console.WriteLine(line);
+            Volatile.Write(ref _lastLine, line);
+            Touch();
 
             // Лог не должен ронять программу. После Dispose (прогон закончился, а сообщение
             // о падении ещё уходит боту) пишем только в консоль. 19–21.09 на сервере запись

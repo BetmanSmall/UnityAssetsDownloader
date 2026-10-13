@@ -16,6 +16,7 @@ services:
     container_name: unity-assets-downloader
     # Постоянное имя: по нему браузер узнаёт свою блокировку папки после перезапуска.
     hostname: unity-assets
+    # Ещё и сторож прогона (RUN_STALL_MINUTES): зависшая служба выходит с кодом 3, и Docker поднимает её заново.
     restart: unless-stopped
     # init убирает зависшие процессы браузера, если он упадёт посреди работы.
     init: true

@@ -55,6 +55,9 @@ internal sealed class RunSummaryData
     /// <summary>Почему прогон остановлен раньше времени из-за браузера, или пусто.</summary>
     public string? BrowserStopReason { get; init; }
 
+    /// <summary>Прогон завис, и сторож службы его оборвал (RunStallWatchdog.Describe) — вместо строки «прерван».</summary>
+    public string? StallReason { get; init; }
+
     /// <summary>Названия ассетов по номерам (каталог, карточки каналов) — чтобы в списках были не голые номера.</summary>
     public IReadOnlyDictionary<string, string> Names { get; init; } = new Dictionary<string, string>();
 
@@ -94,7 +97,11 @@ internal static class RunSummary
             sb.AppendLine($"‼ ПРОГОН ОСТАНОВЛЕН: {d.BrowserStopReason}. Сделанное сохранено; следующий прогон продолжит с этого места.");
         }
 
-        if (d.Interrupted)
+        if (!string.IsNullOrWhiteSpace(d.StallReason))
+        {
+            sb.AppendLine($"‼ ПРОГОН ЗАВИС. {d.StallReason}");
+        }
+        else if (d.Interrupted)
         {
             sb.AppendLine("⏹ ПРОГОН ПРЕРВАН (остановка или Ctrl+C). Сделанное сохранено в памяти профиля; следующий прогон не будет проверять это заново.");
         }

@@ -66,8 +66,11 @@ internal sealed class TelegramNotifier
 
     public bool Enabled => !string.IsNullOrWhiteSpace(_token);
 
-    /// <summary>Отправляет сообщение. Ошибки не пробрасывает: оповещение не должно ронять программу.</summary>
-    public async Task<bool> SendAsync(string text)
+    /// <summary>
+    /// Отправляет сообщение. Ошибки не пробрасывает: оповещение не должно ронять программу.
+    /// silent — без звука (служба сама справилась, ночью будить незачем).
+    /// </summary>
+    public async Task<bool> SendAsync(string text, bool silent = false)
     {
         if (!Enabled)
         {
@@ -88,6 +91,10 @@ internal sealed class TelegramNotifier
                 ["text"] = text.Length > 4000 ? text[..4000] + "…" : text,
                 ["disable_web_page_preview"] = true
             };
+            if (silent)
+            {
+                payload["disable_notification"] = true;
+            }
 
             var sent = await CallAsync("sendMessage", payload) is not null;
             if (sent)

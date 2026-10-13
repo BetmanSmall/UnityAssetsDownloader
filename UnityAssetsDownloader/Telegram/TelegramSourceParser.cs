@@ -195,11 +195,9 @@ internal sealed class TelegramSourceParser
         }
         finally
         {
-            if (page is not null)
-            {
-                await page.CloseAsync();
-                await page.DisposeAsync();
-            }
+            // Не дольше 10 с: 12.10 на сервере вкладка браузера Telegram (прокси умер посреди истории, два ERR_TIMED_OUT)
+            // не закрылась вовсе — PuppeteerSharp ждёт подтверждения без срока, и служба простояла 27 ч.
+            await BrowserKeeper.CloseQuietlyAsync(page);
         }
 
         result.GitLinks = result.GitLinks.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
