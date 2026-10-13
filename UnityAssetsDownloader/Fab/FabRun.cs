@@ -20,6 +20,14 @@ internal sealed partial class UnityAssetAutomationApp
     /// <summary>Сервер: не чаще раза в это время зовём человека, если он в прошлый раз не пришёл.</summary>
     private static readonly TimeSpan FabHumanQuietPeriod = TimeSpan.FromHours(24);
 
+    /// <summary>Сеанс по просьбе человека (--fab-on-call): он уже у экрана, ждём его не 30 мин, а 15 — дольше держать браузер незачем.</summary>
+    private static readonly TimeSpan FabOnCallHumanWait = TimeSpan.FromMinutes(15);
+
+    /// <summary>Итог сеанса Fab по просьбе человека — для короткого сообщения боту в конце.</summary>
+    internal sealed record FabOnCallOutcome(bool Opened, int HumanAsks, int HumanResolved, int Unresolved, int Checked, int Added);
+
+    private FabOnCallOutcome? _fabOnCallOutcome;
+
     /// <summary>
     /// Сервер: сколько последних постов канала читаем в первый раз. Старые ссылки Fab к тому времени уже
     /// разобрали на ПК и Deck (пункт F), а читать всю историю — сотни страниц и заходов на Fab.
@@ -146,6 +154,11 @@ internal sealed partial class UnityAssetAutomationApp
                 await remote.DisposeAsync();
             }
 
+            if (server && _options.FabOnCall)
+            {
+                await SendFabOnCallResultAsync(_fabOnCallOutcome);
+            }
+
             // Память за сеанс Fab. Тихий прогон без браузера не в счёт: там нечего мерить.
             memory.Stop();
             if (memory.HasData && (!server || Stats.FabSessions > sessionsBefore))
@@ -182,6 +195,57 @@ internal sealed partial class UnityAssetAutomationApp
             () => notifier.ClearButtonsAsync(id));
     }
 
+    /// <summary>
+    /// Служба с ботом: зовём человека кнопкой «Открыть окно» и браузер не держим (этап B плана «Окно Fab»). Ночью — без звука
+    /// (BOT_QUIET_HOURS): сообщение подождёт до утра, сервер на Fab всё равно не зайдёт, пока человек не откликнется.
+    /// </summary>
+    private async Task DeferHumanToBotAsync(string title)
+    {
+        if (_notifier is not { Enabled: true } notifier)
+        {
+            return;
+        }
+
+        await notifier.SendWithButtonsAsync(
+            $"⏳ Fab ждёт вас: {title.ToLowerInvariant()}.\n" +
+            "Окно сразу не держу — на сервере мало памяти. Будете готовы — нажмите «🔓 Открыть окно» (или пришлите /fab): сервер " +
+            "откроет Fab и, если понадобится, пришлёт ссылку на окно и кнопку «Готово». Компьютер: tools/fab-window; iPhone: Termius.\n" +
+            "До этого сервер на Fab не заходит; не откликнетесь — позову снова через сутки.",
+            [("🔓 Открыть окно", BotInbox.FabOpenButton)], silent: QuietHours.Now());
+    }
+
+    /// <summary>Короткий итог сеанса по просьбе человека: он нажал кнопку и ждёт ответа, даже если делать было нечего.</summary>
+    private async Task SendFabOnCallResultAsync(FabOnCallOutcome? o)
+    {
+        if (_notifier is not { Enabled: true } notifier)
+        {
+            return;
+        }
+
+        var (text, again) = DescribeFabOnCall(o, FabOnCallHumanWait);
+        if (again)
+        {
+            await notifier.SendWithButtonsAsync(text, [("🔓 Открыть окно", BotInbox.FabOpenButton)]);
+        }
+        else
+        {
+            await notifier.SendAsync(text);
+        }
+    }
+
+    /// <summary>Текст итога сеанса по просьбе; again — показать кнопку «Открыть окно» ещё раз.</summary>
+    internal static (string Text, bool Again) DescribeFabOnCall(FabOnCallOutcome? o, TimeSpan wait) => o switch
+    {
+        null => ("⚠ Окно Fab не открылось (экран или браузер на сервере не запустились) — подробности в логе службы. " +
+                 "Попробуйте /fab позже.", true),
+        { Unresolved: > 0 } => ($"⌛ Окно Fab закрыто: за {wait.TotalMinutes:0} мин «Готово» не пришло, а Fab всё ещё ждёт вас. " +
+                                "Нажмите «🔓 Открыть окно», когда будете готовы.", true),
+        { Opened: false } => ("⚠ Fab не открылся — дело не в галочке (сеть или сам сайт). Подробности в логе службы; " +
+                              "попробуйте /fab позже.", true),
+        { HumanAsks: 0 } => ($"✅ Fab открылся сам — галочка и вход не понадобились. Проверено ассетов: {o.Checked}, добавлено: {o.Added}.", false),
+        _ => ($"✅ Спасибо! Fab снова работает сам. Проверено ассетов: {o.Checked}, добавлено: {o.Added}.", false)
+    };
+
     private async Task RunFabOnScreenAsync(bool loginOnly, Func<Task<RemoteWindow?>>? startRemote, bool server)
     {
         if (_options.Headless && startRemote is null)
@@ -212,12 +276,15 @@ internal sealed partial class UnityAssetAutomationApp
         var gaveUp = new OwnedAssetsCache(fabDirectory, "gave_up.txt",
             $"Ассеты Fab, которые не получилось проверить {FabGiveUpAfter} прогона подряд: бот сообщил, сервер их больше не трогает.");
         var serverState = server ? FabServerState.Load(fabDirectory) : null;
+        // Сеанс по просьбе человека (/fab, кнопка «Открыть окно»): он у экрана — звать можно сразу и Fab открываем всегда.
+        var onCall = server && _options.FabOnCall;
+        _fabOnCallOutcome = null;
         // Человека недавно звали и он не пришёл: на Fab не заходим (Cloudflare, память) до конца суток
-        // или до его ручного входа (--fab-login сбрасывает эту отметку).
-        if (serverState is { HumanAskedUtc: { } askedAt } && !serverState.CanAskHuman(DateTime.UtcNow, FabHumanQuietPeriod))
+        // или до его отклика (кнопка «Открыть окно», /fab; ручной --fab-login тоже сбрасывает эту отметку).
+        if (!onCall && serverState is { HumanAskedUtc: { } askedAt } && !serverState.CanAskHuman(DateTime.UtcNow, FabHumanQuietPeriod))
         {
             _logger.Info($"[Fab] Сервер: человека звали {askedAt.ToLocalTime():dd.MM HH:mm} ({serverState.HumanReason}) — ответа не было. " +
-                         "На Fab пока не заходим: повторим через сутки после того вызова или после ручного входа (--fab-login).");
+                         "На Fab пока не заходим: окно откроется по кнопке «Открыть окно» в боте (или /fab); сами позовём снова через сутки.");
             return;
         }
 
@@ -307,14 +374,14 @@ internal sealed partial class UnityAssetAutomationApp
             var pending = queue.Count(q => !IsKnown(q.Url));
             var ltfDue = serverState.LimitedTimeFreeDue(DateTime.UtcNow, FabLimitedTimeFreeEvery);
             reminderDue = serverState.GiveawayReminderDue(DateTime.UtcNow, FabGiveawayReminderLead);
-            if (pending == 0 && !ltfDue && !reminderDue)
+            if (pending == 0 && !ltfDue && !reminderDue && !onCall)
             {
                 _logger.Info("[Fab] Сервер: новых ассетов Fab из каналов нет, раздачу смотрели недавно — браузер не открываем.");
                 AdvanceFabCursors(cursors, telegramState, unfinished: false, stoppedEarly: false);
                 return;
             }
 
-            _logger.Info($"[Fab] Сервер: к проверке из каналов {pending}; раздачу " +
+            _logger.Info($"[Fab] Сервер{(onCall ? " (по просьбе человека)" : string.Empty)}: к проверке из каналов {pending}; раздачу " +
                          (ltfDue ? "пора посмотреть" : reminderDue ? "скоро кончится — проверим, всё ли забрано" : "смотрели недавно") + ".");
         }
 
@@ -373,6 +440,10 @@ internal sealed partial class UnityAssetAutomationApp
         var reminderChecked = false;
         var newlyGaveUp = new List<(string Title, string Url, string Why)>();
         var unresolvedTotal = 0;
+        var opened = false;
+        var checkedPages = 0;
+        var humanAsks = 0;
+        var humanResolved = 0;
         List<string>? ltfLinks = null;
         string? giveawayUntil = null;
 
@@ -389,12 +460,14 @@ internal sealed partial class UnityAssetAutomationApp
                 HumanWindowHint = remote?.Hint,
                 HumanWindowBotHint = remote?.BotHint,
                 AskHumanByBot = _notifier is { Enabled: true } ? AskHumanByBotAsync : null,
+                // Служба слушает бота — человека зовём кнопкой, браузер не держим. Без бота ждём, как раньше: иначе позвать некак.
+                DeferHumanAsync = server && !onCall && _options.Watch && BotInbox.Active is not null ? DeferHumanToBotAsync : null,
                 DeferManualAdds = server,
-                LoginWait = server ? FabServerHumanWait : FabStore.DefaultLoginWait,
-                ChallengeWait = server ? FabServerHumanWait : FabStore.DefaultChallengeWait,
-                ManualAddWait = server ? FabServerHumanWait : FabStore.DefaultManualAddWait,
+                LoginWait = onCall ? FabOnCallHumanWait : server ? FabServerHumanWait : FabStore.DefaultLoginWait,
+                ChallengeWait = onCall ? FabOnCallHumanWait : server ? FabServerHumanWait : FabStore.DefaultChallengeWait,
+                ManualAddWait = onCall ? FabOnCallHumanWait : server ? FabServerHumanWait : FabStore.DefaultManualAddWait,
                 EnsureHumanWindow = remote is null ? null : remote.StartViewerAsync,
-                CanAskHuman = serverState is null ? null : () => serverState.CanAskHuman(DateTime.UtcNow, FabHumanQuietPeriod),
+                CanAskHuman = serverState is null || onCall ? null : () => serverState.CanAskHuman(DateTime.UtcNow, FabHumanQuietPeriod),
                 OnHumanAsked = serverState is null ? null : reason =>
                 {
                     // Сразу на диск: если процесс убьют посреди ожидания (перезапуск службы), человека не позовут снова в тот же час.
@@ -427,6 +500,7 @@ internal sealed partial class UnityAssetAutomationApp
                     return;
                 }
 
+                opened = true;
                 if (fab.EulaAccepted == false)
                 {
                     _logger.Info("[Fab] Лицензия Fab EULA на этом аккаунте ещё не принята. Первый ассет программа попросит");
@@ -577,6 +651,7 @@ internal sealed partial class UnityAssetAutomationApp
                     }
 
                     index++;
+                    checkedPages = index;
                     _logger.Info($"[Fab {index}/{toCheck}] {url} ({from})");
                     var unresolvedBefore = fab.HumanUnresolved;
                     var claim = await fab.ClaimAsync(url, _options.DryRun);
@@ -728,6 +803,14 @@ internal sealed partial class UnityAssetAutomationApp
                     // Просьбы к человеку, которые оборвались исключением, тоже «без результата»: отметку не стираем.
                     var interrupted = Math.Max(0, fab.HumanAsks - fab.HumanResolved - fab.HumanFailedAsks);
                     unresolvedTotal = fab.HumanUnresolved + interrupted;
+                    humanAsks = fab.HumanAsks;
+                    humanResolved = fab.HumanResolved;
+                    if (onCall)
+                    {
+                        // Здесь, а не в конце метода: ранний выход (Fab не открылся, человек не пришёл) тоже даёт итог боту.
+                        _fabOnCallOutcome = new FabOnCallOutcome(opened, humanAsks, humanResolved, unresolvedTotal, checkedPages,
+                            report.Items.Count(i => i.Status == AssetProcessStatus.Added));
+                    }
                     Stats.FabCloudflareByHuman += fab.ChallengesByHuman;
                     Stats.FabCloudflareSelf += fab.ChallengesSelfPassed;
                     Stats.FabHumanUnresolved += unresolvedTotal;
@@ -860,8 +943,8 @@ internal sealed partial class UnityAssetAutomationApp
             var state = FabServerState.Load(Path.Combine(_profileStore.GetProfileDirectory(_profileName), "fab"));
             if (state.HumanAskedUtc is { } at)
             {
-                return $"⏳ Fab ждёт вас с {at.ToLocalTime():dd.MM HH:mm} ({state.HumanReason}); пока вы не вошли, сервер на Fab не заходит. " +
-                       "Вход вручную — команда --fab-login (в конце вывода ./deploy.sh).";
+                return $"⏳ Fab ждёт вас с {at.ToLocalTime():dd.MM HH:mm} ({state.HumanReason}): нажмите «🔓 Открыть окно» в том " +
+                       "сообщении или пришлите /fab. Пока не откликнетесь, сервер на Fab не заходит.";
             }
         }
         catch (Exception ex)

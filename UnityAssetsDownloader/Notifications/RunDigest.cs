@@ -242,6 +242,12 @@ internal sealed class DailyDigest
     public void Add(RunStats? run, bool crashed)
     {
         Runs++;
+        AddSession(run, crashed);
+    }
+
+    /// <summary>То, что сделал не прогон, а сеанс по просьбе человека (окно Fab): в итоги, но не в число прогонов.</summary>
+    public void AddSession(RunStats? run, bool crashed)
+    {
         if (crashed)
         {
             Crashes++;

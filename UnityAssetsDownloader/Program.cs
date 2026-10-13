@@ -128,6 +128,8 @@ async Task RunWatchLoopAsync()
     var busy = false;
     // Канал ночного добора, пока он идёт, — сторожу (записать зависшую ночь).
     string? nightChannel = null;
+    // Что служба делает сейчас (/status) и просьба человека «открыть окно Fab» (кнопка, /fab) — этап B плана «Окно Fab».
+    var status = new ServiceStatus();
 
     // Прошлый процесс оборвался посреди ночного добора (перезапуск контейнера, перезагрузка, нехватка памяти).
     var leftover = NightBackfillState.Load(nightStatePath);
@@ -153,6 +155,9 @@ async Task RunWatchLoopAsync()
         stop.Cancel();
     });
 
+    // Бот слушает чат всё время службы: команды владельца, кнопка «Открыть окно», пересылка чужих сообщений.
+    await using var inbox = await StartBotInboxAsync();
+
     var nextRegular = DateTime.Now;
     while (!stop.IsCancellationRequested)
     {
@@ -160,10 +165,14 @@ async Task RunWatchLoopAsync()
         AppLogger.Touch();
         Volatile.Write(ref busy, true);
 
+        // Человек нажал «Открыть окно» и ждёт — его просьба раньше расписания.
+        await RunFabOnCallIfRequestedAsync();
+
         if (DateTime.Now >= nextRegular)
         {
             // Расписание от начала прогона: «раз в сутки» значит в одно и то же время.
             var startedAt = DateTime.Now;
+            status.SetBusy("обычный прогон");
             await RunRegularCycleAsync();
             nextRegular = startedAt + interval;
             if (nextRegular <= DateTime.Now)
@@ -172,10 +181,13 @@ async Task RunWatchLoopAsync()
             }
         }
 
+        await RunFabOnCallIfRequestedAsync();
         if (!stop.IsCancellationRequested && NightBackfillState.Load(nightStatePath).IsDue(night, DateTime.Now))
         {
             await RunNightBackfillAsync();
         }
+
+        await RunFabOnCallIfRequestedAsync();
 
         var wake = nextRegular;
         var nightWake = NightBackfillState.Load(nightStatePath).NextWake(night, DateTime.Now);
@@ -190,21 +202,126 @@ async Task RunWatchLoopAsync()
             Console.WriteLine($"[Сервер] Следующий прогон: {nextRegular:yyyy-MM-dd HH:mm}.");
         }
 
+        status.SetSleeping(wake, nextRegular);
         Volatile.Write(ref busy, false);
 
         // Время уже прошло (долгий добор) — сразу на следующий круг. Отрицательную паузу Task.Delay не берёт, а ровно −1 мс
-        // для него значит «ждать вечно».
+        // для него значит «ждать вечно». Просьба человека («Открыть окно») будит раньше.
         var pause = wake - DateTime.Now;
-        if (pause > TimeSpan.Zero)
+        if (pause > TimeSpan.Zero && !await status.SleepAsync(pause, stop.Token))
         {
+            break;
+        }
+    }
+
+    async Task<BotInbox?> StartBotInboxAsync()
+    {
+        if (string.IsNullOrWhiteSpace(options.NotifyBotToken))
+        {
+            return null;
+        }
+
+        // Свой лог без файла: строки бота не должны выглядеть для сторожа как «прогон жив».
+        var botLog = new AppLogger(false, false, null) { TracksActivity = false };
+        var bot = new TelegramNotifier(options.NotifyBotToken, options.NotifyChatId, Path.Combine(options.DataDirectory, "telegram_bot_chat.txt"),
+            () => !string.IsNullOrWhiteSpace(options.TelegramProxy) ? options.TelegramProxy : current?.RememberedTelegramProxy(), botLog);
+        try
+        {
+            return await BotInbox.StartAsync(bot, Console.WriteLine, RequestFab, DescribeStatus);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Сервер] Бот не слушается: {ex.Message}. Команды не работают, остальное — как обычно.");
+            return null;
+        }
+    }
+
+    // /fab и кнопка «Открыть окно» (из потока бота).
+    string RequestFab()
+    {
+        if (!options.FabOnServer)
+        {
+            return "Fab на сервере выключен (FAB=off в .env) — окно открывать незачем.";
+        }
+
+        if (string.IsNullOrEmpty(options.FabVncPassword))
+        {
+            return "⚠ FAB_VNC_PASSWORD не задан — окно открыть нельзя. Запустите на сервере ./deploy.sh: он создаст пароль.";
+        }
+
+        var reply = status.RequestFab();
+        Console.WriteLine($"[Сервер] Просьба открыть окно Fab: {reply}");
+        return reply;
+    }
+
+    // /status (из потока бота).
+    string DescribeStatus()
+    {
+        var lines = new List<string> { $"🟢 Служба {UnityAssetAutomationApp.BuildVersionLine()}: {status.Describe()}." };
+        if (NightBackfillState.Load(nightStatePath).Describe(night) is { } nightNote)
+        {
+            lines.Add(nightNote);
+        }
+
+        lines.Add(current?.FabPendingNote() ?? (options.FabOnServer ? "Fab: человек не нужен." : "Fab на сервере выключен (FAB=off)."));
+        var stalls = DailyDigest.Load(Path.Combine(options.DataDirectory, "bot_digest.json")).Stalls;
+        if (stalls > 0)
+        {
+            lines.Add($"⚠ Зависаний с последней сводки: {stalls} (служба перезапускалась сама).");
+        }
+
+        lines.Add("Команды: /fab — окно Fab, /status — это сообщение.");
+        return string.Join("\n", lines);
+    }
+
+    // Сеанс Fab по просьбе человека (/fab, кнопка «Открыть окно»): серверный этап Fab, но человек уже у экрана.
+    async Task RunFabOnCallIfRequestedAsync()
+    {
+        if (stop.IsCancellationRequested || !status.TakeFabRequest())
+        {
+            return;
+        }
+
+        Console.WriteLine("[Сервер] Окно Fab по просьбе человека.");
+        var fabOptions = CliOptions.Parse(ServiceArgs.FabOnCall(args));
+        UnityAssetAutomationApp? app = null;
+        var crashed = false;
+        try
+        {
+            running = true;
+            Environment.ExitCode = 0;
+            current = app = new UnityAssetAutomationApp(fabOptions);
+            await app.RunAsync();
+        }
+        catch (Exception ex)
+        {
+            crashed = true;
+            await ReportCrashAsync(ex, fabOptions);
             try
             {
-                await Task.Delay(pause, stop.Token);
+                if (app is not null)
+                {
+                    await app.NotifyAsync($"💥 Окно Fab не открылось: {ex.Message}");
+                }
             }
-            catch (TaskCanceledException)
+            catch (Exception notifyEx)
             {
-                break;
+                Console.Error.WriteLine($"[Сервер] Не удалось сообщить боту: {notifyEx.Message}");
             }
+        }
+        finally
+        {
+            running = false;
+            status.FabFinished();
+        }
+
+        // В суточную сводку — что сделал сеанс (прогоном он не считается).
+        if (app is not null && options.DigestInterval is not null)
+        {
+            var digestPath = Path.Combine(options.DataDirectory, "bot_digest.json");
+            var digest = DailyDigest.Load(digestPath);
+            digest.AddSession(app.Stats, crashed);
+            digest.Save(digestPath);
         }
     }
 
@@ -269,6 +386,7 @@ async Task RunWatchLoopAsync()
         state.MarkStarted(night, DateTime.Now, channel);
         state.Save(nightStatePath);
         nightChannel = channel;
+        status.SetBusy($"ночной добор истории ({channel})");
         Console.WriteLine($"[Сервер] Ночной добор истории: канал {channel}, не больше {night.PagesPerNight} страниц ассетов.");
 
         var backfillOptions = CliOptions.Parse(NightBackfillSettings.BackfillArgs(args, channel, night.PagesPerNight));
@@ -582,6 +700,9 @@ internal sealed partial class UnityAssetAutomationApp
 
     /// <summary>Сколько страниц ассетов открыто в магазине за прогон.</summary>
     public int PagesOpened => _storePagesOpened;
+
+    /// <summary>Прокси Telegram, сработавший в прошлый раз (для бота службы: путь до Bot API иногда только через него).</summary>
+    public string? RememberedTelegramProxy() => ReadRememberedProxy();
 
     /// <summary>Сколько добавлено к этому моменту (Stats.Added заполняется в конце прогона) — для сторожа службы.</summary>
     public int AddedSoFar
@@ -9002,6 +9123,12 @@ internal sealed class AppLogger : IDisposable
     /// <summary>Начать отсчёт тишины заново (служба берётся за работу после долгого сна).</summary>
     public static void Touch() => Interlocked.Exchange(ref _lastWriteTicks, DateTime.UtcNow.Ticks);
 
+    /// <summary>
+    /// Строки этого лога — признак, что прогон жив (сторож службы). false — у лога бота службы (BotInbox): он пишет и пока
+    /// прогон висит, и сторож иначе не заметил бы зависание.
+    /// </summary>
+    public bool TracksActivity { get; init; } = true;
+
     public AppLogger(bool verbose, bool traceNetwork, string? logFilePath, string? errorsFilePath = null)
     {
         LogFilePath = string.IsNullOrWhiteSpace(logFilePath) ? null : logFilePath;
@@ -9061,8 +9188,11 @@ internal sealed class AppLogger : IDisposable
         lock (_sync)
         {
             Console.WriteLine(line);
-            Volatile.Write(ref _lastLine, line);
-            Touch();
+            if (TracksActivity)
+            {
+                Volatile.Write(ref _lastLine, line);
+                Touch();
+            }
 
             // Лог не должен ронять программу. После Dispose (прогон закончился, а сообщение
             // о падении ещё уходит боту) пишем только в консоль. 19–21.09 на сервере запись
@@ -9288,6 +9418,13 @@ internal sealed class CliOptions
     public bool FabServerOnce { get; init; }
 
     /// <summary>
+    /// Сеанс Fab по просьбе человека (--fab-on-call, вместе с --fab-server; запускает служба по /fab или кнопке «Открыть окно»):
+    /// человек уже у экрана — окно открывается, как только понадобится, ждём его до 15 мин, «звали недавно» не мешает,
+    /// и Fab открывается, даже если по расписанию заходить незачем. В конце — короткий итог боту.
+    /// </summary>
+    public bool FabOnCall { get; init; }
+
+    /// <summary>
     /// Разведка (--fab-recon https://www.fab.com/listings/…): открыть ассет в окне, где вы сами получите
     /// его с записью сети (DevTools → HAR). Нужна, чтобы научить программу получать раздачи со скидкой 100 %.
     /// </summary>
@@ -9433,6 +9570,7 @@ internal sealed class CliOptions
         var cliFab = false;
         var cliFabLogin = false;
         var cliFabServer = false;
+        var cliFabOnCall = false;
         string? cliFabRecon = null;
         var cliFabGiveaway = false;
         var cliFabUrls = new List<string>();
@@ -9563,6 +9701,10 @@ internal sealed class CliOptions
                     cliFabLogin = true;
                     break;
                 case "--fab-server":
+                    cliFabServer = true;
+                    break;
+                case "--fab-on-call":
+                    cliFabOnCall = true;
                     cliFabServer = true;
                     break;
                 case "--fab-giveaway":
@@ -10070,6 +10212,7 @@ internal sealed class CliOptions
             Fab = cliFab,
             FabLoginOnly = cliFabLogin,
             FabServerOnce = cliFabServer,
+            FabOnCall = cliFabOnCall,
             FabReconUrl = cliFabRecon,
             FabGiveaway = cliFabGiveaway,
             FabUrls = cliFabUrls,

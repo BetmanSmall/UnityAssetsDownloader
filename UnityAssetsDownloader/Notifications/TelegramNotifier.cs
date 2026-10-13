@@ -66,6 +66,9 @@ internal sealed class TelegramNotifier
 
     public bool Enabled => !string.IsNullOrWhiteSpace(_token);
 
+    /// <summary>Папка данных (там же номер чата и путь до Bot API): по ней BotInbox находит свой замок и журнал.</summary>
+    public string DataDirectory => Path.GetDirectoryName(_chatIdFile) ?? ".";
+
     /// <summary>
     /// Отправляет сообщение. Ошибки не пробрасывает: оповещение не должно ронять программу.
     /// silent — без звука (служба сама справилась, ночью будить незачем).
@@ -228,6 +231,22 @@ internal sealed class TelegramNotifier
             return false;
         }
 
+        // Служба слушает бота сама (BotInbox): свой опрос getUpdates здесь отнимал бы у неё сообщения — Telegram отдаёт их
+        // одному читателю. Тогда ждём через неё — в этом процессе или по её журналу из другого (docker compose exec).
+        var since = DateTime.UtcNow.AddSeconds(-5);
+        bool Matches(BotEvent e) => e.IsButton
+            ? e.Text == data
+            : e.AtUtc >= since && words.Contains(e.Text.Trim(), StringComparer.OrdinalIgnoreCase);
+        if (BotInbox.Active is { } inbox)
+        {
+            return await inbox.WaitAsync(Matches, "Закрываю окно, продолжаю.", timeout, cancel) is not null;
+        }
+
+        if (BotInbox.HeldElsewhere(DataDirectory))
+        {
+            return await BotInbox.WaitInJournalAsync(DataDirectory, Matches, timeout, cancel) is not null;
+        }
+
         long offset = 0;
         try
         {
@@ -300,6 +319,52 @@ internal sealed class TelegramNotifier
         return false;
     }
 
+    /// <summary>Одна порция обновлений (длинный опрос до waitSeconds). null — не дошло или Telegram отказал (409: опрашивает другой).</summary>
+    internal async Task<JsonElement?> GetUpdatesAsync(long offset, int waitSeconds)
+    {
+        var updates = await CallAsync(
+            "getUpdates",
+            new Dictionary<string, object> { ["offset"] = offset, ["timeout"] = waitSeconds },
+            TimeSpan.FromSeconds(waitSeconds + 15));
+        return updates is { ValueKind: JsonValueKind.Array } ? updates : null;
+    }
+
+    /// <summary>Переслать владельцу сообщение из чужого чата (как есть: текст, фото, файл). Ошибки не пробрасывает.</summary>
+    internal async Task<bool> ForwardAsync(string fromChatId, long messageId)
+    {
+        try
+        {
+            var chat = await ResolveChatIdAsync();
+            return chat is not null && await CallAsync("forwardMessage", new Dictionary<string, object>
+            {
+                ["chat_id"] = chat,
+                ["from_chat_id"] = fromChatId,
+                ["message_id"] = messageId
+            }) is not null;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"[Бот] Не удалось переслать сообщение: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>Меню команд бота (кнопка «/» в Telegram). Ошибки не пробрасывает.</summary>
+    internal async Task SetCommandsAsync(IReadOnlyList<(string Command, string Description)> commands)
+    {
+        try
+        {
+            await CallAsync("setMyCommands", new Dictionary<string, object>
+            {
+                ["commands"] = commands.Select(c => new Dictionary<string, string> { ["command"] = c.Command, ["description"] = c.Description }).ToArray()
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"[Бот] Меню команд не записалось: {ex.Message}");
+        }
+    }
+
     /// <summary>
     /// Подтвердить Telegram прочитанные обновления (getUpdates с offset): до следующего вызова с большим offset он отдаёт
     /// их снова. Без этого «готово», на котором ожидание закончилось, увидело бы и следующее ожидание.
@@ -343,7 +408,7 @@ internal sealed class TelegramNotifier
         }
     }
 
-    private async Task AnswerCallbackAsync(string? callbackId, string text)
+    internal async Task AnswerCallbackAsync(string? callbackId, string text)
     {
         if (string.IsNullOrEmpty(callbackId))
         {
@@ -370,6 +435,20 @@ internal sealed class TelegramNotifier
         if (!Enabled)
         {
             return null;
+        }
+
+        // Служба слушает бота сама — ждём через неё (см. WaitForButtonAsync).
+        bool Matches(BotEvent e) => !e.IsButton && pattern.IsMatch(e.Text);
+        if (BotInbox.Active is { } inbox)
+        {
+            return await inbox.WaitAsync(Matches, null, timeout, CancellationToken.None) is { } got ? pattern.Match(got.Text).Value : null;
+        }
+
+        if (BotInbox.HeldElsewhere(DataDirectory))
+        {
+            return await BotInbox.WaitInJournalAsync(DataDirectory, Matches, timeout, CancellationToken.None) is { } fromJournal
+                ? pattern.Match(fromJournal.Text).Value
+                : null;
         }
 
         var chat = await ResolveChatIdAsync();
@@ -424,7 +503,7 @@ internal sealed class TelegramNotifier
     /// <summary>
     /// Номер чата: из настроек, из файла или из последнего сообщения, которое написали боту.
     /// </summary>
-    private async Task<string?> ResolveChatIdAsync()
+    internal async Task<string?> ResolveChatIdAsync()
     {
         if (_chatId is not null)
         {
@@ -486,7 +565,7 @@ internal sealed class TelegramNotifier
         return null;
     }
 
-    private static string? ChatIdOf(JsonElement message) =>
+    internal static string? ChatIdOf(JsonElement message) =>
         message.TryGetProperty("chat", out var chat) && chat.TryGetProperty("id", out var id)
             ? id.GetRawText()
             : null;

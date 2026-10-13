@@ -71,6 +71,13 @@ internal sealed partial class FabStore
     public Func<string, TimeSpan, Task<HumanAsk?>>? AskHumanByBot { get; init; }
 
     /// <summary>
+    /// Служба с ботом (этап B плана «Окно Fab»): человека не ждём с открытым браузером — до 30 мин на тесном сервере
+    /// (13.10: контейнер 640 МБ, в системе свободно 26 МБ). Вместо этого зовём его кнопкой «Открыть окно» (аргумент —
+    /// что нужно) и сразу заканчиваем: окно откроет сеанс по его просьбе (--fab-on-call), когда он будет готов.
+    /// </summary>
+    public Func<string, Task>? DeferHumanAsync { get; init; }
+
+    /// <summary>
     /// Сервер: ассеты, которые получает только человек (раздача −100 %), не ждут окна — результат
     /// NeedsHuman, программа идёт дальше. Окно человека — только для входа, галочки и лицензии.
     /// </summary>
@@ -1250,6 +1257,26 @@ internal sealed partial class FabStore
         {
             _logger.Warn($"[Fab] {title.ToLowerInvariant()} — человека недавно уже звали, ответа не было; снова позовём позже.");
             HumanUnresolved++;
+            return false;
+        }
+
+        if (DeferHumanAsync is { } defer)
+        {
+            HumanAsks++;
+            OnHumanAsked?.Invoke(title);
+            _logger.Warn($"[Fab] {title.ToLowerInvariant()} — окно не держим: зовём человека кнопкой «Открыть окно» в боте, " +
+                         "окно откроется по его просьбе.");
+            try
+            {
+                await defer(title);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"[Fab] Сообщение боту не ушло: {ex.Message}");
+            }
+
+            HumanUnresolved++;
+            HumanFailedAsks++;
             return false;
         }
 

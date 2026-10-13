@@ -533,7 +533,8 @@ cat <<EOF
     обновить программу: git pull && ./deploy.sh
     остановить:         ${DC[*]} down
 
-  Войти в Fab (аккаунт Epic Games) — один раз, между прогонами (в логе «Следующий прогон»):
+  Окно Fab (галочка, вход в Epic): проще всего — /fab в боте или кнопка «Открыть окно» в его сообщении.
+  Или вручную — один раз, между прогонами (в логе «Следующий прогон»):
     ${DC[*]} exec -it unity-assets dotnet UnityAssetsDownloader.dll --logs-dir /app/logs --data-dir /app/data --profile $PROFILE --fab-login
     затем на своём компьютере: tools/fab-window (Windows: tools\\fab-window.cmd) — туннель и браузер одним кликом,
     или вручную: ssh -L 127.0.0.1:${FAB_PORT}:127.0.0.1:${FAB_PORT} <ваш сервер> и ссылка из сообщения бота
